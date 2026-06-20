@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
@@ -10,10 +11,24 @@ from .db import init_db, SessionLocal
 from .models import NfeConfig, User
 
 
+async def _agendador_radar():
+    """Laço em segundo plano: varre os alvos de todos os tenants a cada N horas."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(max(settings.radar_intervalo_horas, 1) * 3600)
+        try:
+            await loop.run_in_executor(None, radar.varrer_todos)
+        except Exception:  # noqa: BLE001 — o agendador nunca derruba o app
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    tarefa = asyncio.create_task(_agendador_radar()) if settings.radar_intervalo_horas > 0 else None
     yield
+    if tarefa:
+        tarefa.cancel()
 
 
 app = FastAPI(title="BlingAI Manager — Backend", version="0.2.0", lifespan=lifespan)
@@ -439,6 +454,12 @@ def radar_varrer(payload: dict = Body(...), user: User = Depends(auth.get_curren
     if not sku:
         raise HTTPException(status_code=422, detail="Informe 'sku'.")
     return radar.varrer(user.id, sku)
+
+
+@app.post("/api/radar/varrer-tudo")
+def radar_varrer_tudo(user: User = Depends(auth.get_current_user)):
+    """Varre de uma vez todos os SKUs com alvos ativos do usuário."""
+    return radar.varrer_usuario(user.id)
 
 
 @app.get("/api/radar/historico")

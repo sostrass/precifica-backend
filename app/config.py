@@ -24,5 +24,8 @@ class Settings(BaseSettings):
     # CORS
     frontend_origin: str = "*"
 
+    # Radar — varredura automática em segundo plano (horas; 0 = desligado)
+    radar_intervalo_horas: int = 6
+
 
 settings = Settings()

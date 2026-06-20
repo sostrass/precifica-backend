@@ -120,6 +120,32 @@ def varrer(user_id, sku) -> dict:
     return {"sku": sku, "varridos": len(resultados), "resultados": resultados}
 
 
+def varrer_usuario(user_id) -> dict:
+    """Varre todos os SKUs com alvos ativos de um tenant (botão 'varrer tudo')."""
+    skus = sorted({a["sku"] for a in listar_alvos(user_id) if a["ativo"]})
+    total = 0
+    for sku in skus:
+        try:
+            total += varrer(user_id, sku).get("varridos", 0)
+        except Exception:  # noqa: BLE001 — um SKU que falha não derruba o resto
+            continue
+    return {"skus": len(skus), "varridos": total}
+
+
+def varrer_todos() -> dict:
+    """Varre os alvos ativos de TODOS os tenants — usado pelo agendador em segundo plano."""
+    with SessionLocal() as db:
+        users = [u for (u,) in db.query(RadarAlvo.user_id)
+                 .filter(RadarAlvo.ativo.is_(True)).distinct().all()]
+    total = 0
+    for uid in users:
+        try:
+            total += varrer_usuario(uid).get("varridos", 0)
+        except Exception:  # noqa: BLE001
+            continue
+    return {"tenants": len(users), "varridos": total}
+
+
 def historico(user_id, sku, dias=7) -> dict:
     """Série temporal por concorrente + estatísticas do período (para o gráfico)."""
     desde = datetime.utcnow() - timedelta(days=int(dias))
