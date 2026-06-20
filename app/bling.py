@@ -199,6 +199,24 @@ def atualizar_preco(user_id: int, produto_id: int, preco: float) -> dict:
     return r.json()
 
 
+# Campos editáveis aceitos no PATCH parcial de produto (nomes da API v3 do Bling).
+_CAMPOS_PRODUTO = {"nome", "preco", "precoCusto", "ncm", "pesoBruto",
+                   "pesoLiquido", "descricaoCurta", "gtin"}
+
+
+def atualizar_produto(user_id: int, produto_id: int, campos: dict) -> dict:
+    """PATCH parcial dos campos editáveis do produto (só envia o que mudou)."""
+    corpo = {k: v for k, v in campos.items() if k in _CAMPOS_PRODUTO and v is not None}
+    for k in ("preco", "precoCusto", "pesoBruto", "pesoLiquido"):
+        if k in corpo and corpo[k] != "":
+            corpo[k] = round(float(corpo[k]), 3 if "peso" in k else 2)
+    if not corpo:
+        return {}
+    r = _request(user_id, "PATCH", f"/produtos/{produto_id}", json=corpo)
+    r.raise_for_status()
+    return r.json()
+
+
 def listar_nfe(user_id: int, pagina: int = 1, limite: int = 100,
                situacao: int | None = None) -> dict:
     """Lista NF-e (resumidas). Filtra por situação quando informado (ex.: pendente)."""

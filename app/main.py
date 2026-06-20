@@ -110,10 +110,62 @@ def listar_produtos(pagina: int = 1, limite: int = 100,
 
 @app.get("/api/produtos/{produto_id}")
 def obter_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
+    """Detalhe limpo do produto + avaliação de preço por canal (motor de faixas)."""
     try:
-        return bling.obter_produto(user.id, produto_id)
+        raw = bling.obter_produto(user.id, produto_id).get("data", {})
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+    custo = float(raw.get("precoCusto") or 0)
+    preco = float(raw.get("preco") or 0)
+    cfg = precificacao.obter_config(user.id)
+    canais = []
+    for c in cfg.get("canais", []):
+        if not c.get("ativo"):
+            continue
+        av = precificacao.avaliar_com_cfg(cfg, custo, preco, c["canal"])
+        canais.append({"canal": c["canal"], "nome": c["nome"],
+                       "preco_sugerido": av["preco_sugerido"],
+                       "margem_sugerida": av["margem_sugerida"],
+                       "margem_atual": av["margem_atual"]})
+
+    return {
+        "id": raw.get("id"),
+        "sku": raw.get("codigo"),
+        "nome": raw.get("nome"),
+        "preco": preco,
+        "custo": custo,
+        "ncm": raw.get("ncm"),
+        "gtin": raw.get("gtin"),
+        "peso_bruto": raw.get("pesoBruto"),
+        "peso_liquido": raw.get("pesoLiquido"),
+        "descricao_curta": raw.get("descricaoCurta"),
+        "situacao": raw.get("situacao"),
+        "tipo": raw.get("tipo"),
+        "precificacao": canais,
+    }
+
+
+_MAPA_PRODUTO = {  # nome amigável (front) -> campo da API do Bling
+    "nome": "nome", "preco": "preco", "custo": "precoCusto", "ncm": "ncm",
+    "gtin": "gtin", "peso_bruto": "pesoBruto", "peso_liquido": "pesoLiquido",
+    "descricao_curta": "descricaoCurta",
+}
+
+
+@app.put("/api/produtos/{produto_id}")
+def atualizar_produto(produto_id: int, payload: dict = Body(...),
+                      user: User = Depends(auth.get_current_user)):
+    """Edita campos do produto no Bling (envia só o que veio no corpo)."""
+    campos = {_MAPA_PRODUTO[k]: v for k, v in payload.items()
+              if k in _MAPA_PRODUTO and v is not None}
+    if not campos:
+        raise HTTPException(status_code=422, detail="Nenhum campo editável informado.")
+    try:
+        bling.atualizar_produto(user.id, produto_id, campos)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    return {"ok": True, "atualizados": sorted(campos.keys())}
 
 
 # ------------------------------ Precificação ------------------------------ #
