@@ -116,8 +116,12 @@ def obter_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    custo = float(raw.get("precoCusto") or 0)
+    custo = float(raw.get("precoCusto") or (raw.get("fornecedor") or {}).get("precoCusto") or 0)
     preco = float(raw.get("preco") or 0)
+    ncm = (raw.get("tributacao") or {}).get("ncm") or raw.get("ncm") or ""
+    fotos = [i.get("link") for i in (((raw.get("midia") or {}).get("imagens") or {}).get("externas") or []) if i.get("link")]
+    estoque = (raw.get("estoque") or {}).get("saldoVirtualTotal")
+    dims = raw.get("dimensoes") or {}
     cfg = precificacao.obter_config(user.id)
     canais = []
     for c in cfg.get("canais", []):
@@ -135,20 +139,26 @@ def obter_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
         "nome": raw.get("nome"),
         "preco": preco,
         "custo": custo,
-        "ncm": raw.get("ncm"),
+        "ncm": ncm,
         "gtin": raw.get("gtin"),
         "peso_bruto": raw.get("pesoBruto"),
         "peso_liquido": raw.get("pesoLiquido"),
         "descricao_curta": raw.get("descricaoCurta"),
         "situacao": raw.get("situacao"),
         "tipo": raw.get("tipo"),
+        "marca": raw.get("marca"),
+        "unidade": raw.get("unidade"),
+        "estoque": estoque,
+        "dimensoes": {"largura": dims.get("largura"), "altura": dims.get("altura"),
+                      "profundidade": dims.get("profundidade")} if dims else None,
+        "fotos": fotos,
         "precificacao": canais,
         "qualidade": qualidade.score_cadastro({
             "nome": raw.get("nome"),
             "ean": raw.get("gtin"),
-            "ncm": raw.get("ncm"),
+            "ncm": ncm,
             "peso": raw.get("pesoBruto") or raw.get("pesoLiquido"),
-            "descricao": raw.get("descricaoCurta"),
+            "descricao": raw.get("descricaoComplementar") or raw.get("descricaoCurta"),
         }),
     }
 
@@ -265,7 +275,7 @@ def monitoramento(payload: dict = Body(default={}),
     cfg = precificacao.obter_config(user.id)
     itens = []
     for p in bruto.get("data", []):
-        custo = float(p.get("precoCusto") or 0)
+        custo = float(p.get("precoCusto") or (p.get("fornecedor") or {}).get("precoCusto") or 0)
         preco_atual = float(p.get("preco") or 0)
         av = precificacao.avaliar_com_cfg(cfg, custo, preco_atual, canal)
         margem = av["margem_atual"] if av["margem_atual"] is not None else (av["margem_sugerida"] or 0)
@@ -669,9 +679,18 @@ def nfe_auto_processar(user: User = Depends(auth.get_current_user)):
 
 @app.get("/api/nfe/{nfe_id}")
 def nfe_obter(nfe_id: str, user: User = Depends(auth.get_current_user)):
-    """Detalhe normalizado de uma nota (itens + frete) para edição."""
+    """Detalhe normalizado de uma nota (itens + frete) para o editor de desconto."""
     try:
         return nfe.normalizar_nfe(bling.obter_nfe(user.id, nfe_id))
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/nfe/{nfe_id}/completa")
+def nfe_completa(nfe_id: str, user: User = Depends(auth.get_current_user)):
+    """Visão COMPLETA da nota: destinatário, totais, impostos, transporte, itens e links."""
+    try:
+        return nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id))
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 

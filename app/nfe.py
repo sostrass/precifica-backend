@@ -135,6 +135,96 @@ def normalizar_nfe(raw: dict) -> dict:
     }
 
 
+# Mapa de situações da NF-e no Bling v3 (rótulos legíveis).
+SITUACOES_NFE = {
+    1: "Pendente", 2: "Cancelada", 3: "Aguardando recibo", 4: "Rejeitada",
+    5: "Autorizada", 6: "Emitida DANFE", 7: "Registrada", 8: "Aguardando protocolo",
+    9: "Denegada", 10: "Em digitação", 11: "Bloqueada",
+}
+
+
+def situacao_label(cod) -> str:
+    try:
+        return SITUACOES_NFE.get(int(cod), f"Situação {cod}")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def nota_editavel(cod) -> bool:
+    """Só nota NÃO autorizada (pendente/rejeitada) pode ser alterada. Autorizada é imutável."""
+    try:
+        return int(cod or 0) in (1, 4)
+    except (TypeError, ValueError):
+        return False
+
+
+def detalhar_nfe(raw: dict) -> dict:
+    """Visão COMPLETA da nota (destinatário, totais, impostos, transporte, links).
+
+    Validada contra o payload real do Bling v3 (NF-e modelo 55).
+    """
+    n = raw.get("data", raw) if isinstance(raw, dict) else {}
+    contato = n.get("contato") or {}
+    end = contato.get("endereco") or {}
+    transporte = n.get("transporte") or {}
+    itens = []
+    for it in (n.get("itens") or []):
+        imp = it.get("impostos") or {}
+        itens.append({
+            "codigo": it.get("codigo"),
+            "descricao": it.get("descricao"),
+            "quantidade": _num(it.get("quantidade")),
+            "valor": _num(it.get("valor")),
+            "valor_total": _num(it.get("valorTotal")),
+            "ncm": it.get("classificacaoFiscal"),
+            "cfop": it.get("cfop"),
+            "tributos_aprox": _num(imp.get("valorAproximadoTotalTributos")),
+        })
+    partes = []
+    if end.get("endereco"):
+        partes.append(f"{end.get('endereco')}, {end.get('numero', 's/n')}")
+    if end.get("complemento"):
+        partes.append(end["complemento"])
+    if end.get("bairro"):
+        partes.append(end["bairro"])
+    if end.get("municipio"):
+        partes.append(f"{end.get('municipio')}/{end.get('uf', '')}")
+    if end.get("cep"):
+        partes.append(f"CEP {end['cep']}")
+    sit = n.get("situacao")
+    return {
+        "id": n.get("id"),
+        "numero": n.get("numero"),
+        "serie": n.get("serie"),
+        "situacao": sit,
+        "situacao_label": situacao_label(sit),
+        "editavel": nota_editavel(sit),
+        "data_emissao": n.get("dataEmissao"),
+        "chave_acesso": n.get("chaveAcesso"),
+        "valor_nota": _num(n.get("valorNota")),
+        "valor_frete": _num(n.get("valorFrete")),
+        "simples_nacional": bool(n.get("optanteSimplesNacional")),
+        "pedido_loja": n.get("numeroPedidoLoja"),
+        "link_danfe": n.get("linkDanfe"),
+        "link_pdf": n.get("linkPDF"),
+        "link_xml": n.get("xml"),
+        "destinatario": {
+            "nome": contato.get("nome"),
+            "documento": contato.get("numeroDocumento"),
+            "telefone": contato.get("telefone") or "",
+            "email": contato.get("email") or "",
+            "endereco": ", ".join(partes),
+        },
+        "transporte": {
+            "frete_por_conta": transporte.get("fretePorConta"),
+            "transportador": (transporte.get("transportador") or {}).get("nome") or "—",
+        },
+        "itens": itens,
+        "parcelas": [{"data": p.get("data"), "valor": _num(p.get("valor"))}
+                     for p in (n.get("parcelas") or [])],
+    }
+
+
 def montar_alteracao(raw: dict, edicao: dict) -> dict:
     """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
 
