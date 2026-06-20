@@ -143,6 +143,13 @@ def obter_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
         "situacao": raw.get("situacao"),
         "tipo": raw.get("tipo"),
         "precificacao": canais,
+        "qualidade": qualidade.score_cadastro({
+            "nome": raw.get("nome"),
+            "ean": raw.get("gtin"),
+            "ncm": raw.get("ncm"),
+            "peso": raw.get("pesoBruto") or raw.get("pesoLiquido"),
+            "descricao": raw.get("descricaoCurta"),
+        }),
     }
 
 
@@ -166,6 +173,25 @@ def atualizar_produto(produto_id: int, payload: dict = Body(...),
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
     return {"ok": True, "atualizados": sorted(campos.keys())}
+
+
+# ---------- Diagnóstico: JSON cru do Bling (p/ construir telas sobre dado real) ----------
+@app.get("/api/diagnostico/produto/{produto_id}")
+def diag_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
+    """Payload CRU de um produto no Bling — revela os campos reais (fotos, etc.)."""
+    try:
+        return bling.obter_produto(user.id, produto_id)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/diagnostico/nfe/{nfe_id}")
+def diag_nfe(nfe_id: str, user: User = Depends(auth.get_current_user)):
+    """Payload CRU de uma NF-e no Bling — revela a estrutura real da nota inteira."""
+    try:
+        return bling.obter_nfe(user.id, nfe_id)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 
 # ------------------------------ Precificação ------------------------------ #
