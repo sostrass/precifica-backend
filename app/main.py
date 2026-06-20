@@ -4,7 +4,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import ai, auth, bling, decisao, nfe, precificacao, pricing, qualidade, radar, scraper
+from . import ai, agentes, auth, bling, decisao, nfe, precificacao, pricing, qualidade, radar, scraper
 from .config import settings
 from .db import init_db, SessionLocal
 from .models import NfeConfig, User
@@ -346,6 +346,25 @@ def estudio_imagem(payload: dict = Body(...),
     """
     return ai.gerar_imagem(user.id, payload.get("prompt", ""),
                            payload.get("negativo", ""), payload.get("modelo"))
+
+
+# ------------------------------- Agentes ---------------------------------- #
+@app.get("/api/agentes")
+def agentes_listar(user: User = Depends(auth.get_current_user)):
+    """Lista os agentes disponíveis e as ferramentas de cada um."""
+    return {"agentes": agentes.listar()}
+
+
+@app.post("/api/agentes/{agente}/mensagem")
+def agentes_mensagem(agente: str, payload: dict = Body(...),
+                     user: User = Depends(auth.get_current_user)):
+    """Conversa com um agente. Body: {mensagem, historico?:[{autor,texto}]}.
+
+    Os agentes propõem e calculam via ferramentas determinísticas — não alteram
+    preço no canal nem nota no Bling.
+    """
+    return agentes.conversar(user.id, agente, payload.get("mensagem", ""),
+                             historico=payload.get("historico"))
 
 
 # ================= Precificação por canal (faixas de preço) =============== #
