@@ -9,6 +9,7 @@ Fatos oficiais (developer.bling.com.br):
 """
 
 import base64
+import secrets
 import threading
 import time
 from datetime import datetime, timedelta
@@ -19,7 +20,7 @@ import requests
 
 from .config import settings
 from .db import SessionLocal
-from .models import OAuthToken
+from .models import OAuthToken, OAuthState
 
 API_BASE = "https://api.bling.com.br/Api/v3"
 AUTHORIZE_URL = "https://www.bling.com.br/Api/v3/oauth/authorize"
@@ -57,15 +58,17 @@ def _basic_auth_header() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# OAuth — o 'state' carrega (assinado) o id do usuário, para o callback saber
-# a qual tenant associar o token. Sem estado em memória (funciona multi-instância).
+# OAuth — o 'state' (anti-CSRF) é guardado no BANCO: token curto, uso único,
+# TTL de 30 min. Imune a redeploy e a troca de JWT_SECRET (não depende deles).
 # --------------------------------------------------------------------------- #
+STATE_TTL_MIN = 30
+
+
 def get_authorize_url(user_id: int) -> str:
-    state = jwt.encode(
-        {"uid": user_id, "type": "bling_state",
-         "exp": datetime.utcnow() + timedelta(minutes=10)},
-        settings.jwt_secret, algorithm="HS256",
-    )
+    state = secrets.token_urlsafe(24)
+    with SessionLocal() as db:
+        db.add(OAuthState(state=state, user_id=int(user_id)))
+        db.commit()
     params = {"response_type": "code", "client_id": settings.bling_client_id, "state": state}
     if settings.bling_redirect_uri:
         params["redirect_uri"] = settings.bling_redirect_uri
@@ -73,13 +76,19 @@ def get_authorize_url(user_id: int) -> str:
 
 
 def user_id_from_state(state: str) -> int:
-    try:
-        payload = jwt.decode(state, settings.jwt_secret, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        raise BlingAuthError("State inválido ou expirado.")
-    if payload.get("type") != "bling_state":
-        raise BlingAuthError("State inválido.")
-    return int(payload["uid"])
+    if not state:
+        raise BlingAuthError("State ausente.")
+    with SessionLocal() as db:
+        row = db.get(OAuthState, state)
+        if row is None:
+            raise BlingAuthError("State inválido ou expirado. Tente conectar novamente.")
+        idade = datetime.utcnow() - (row.criado_em or datetime.utcnow())
+        uid = int(row.user_id)
+        db.delete(row)            # uso único: consome o state na hora
+        db.commit()
+        if idade > timedelta(minutes=STATE_TTL_MIN):
+            raise BlingAuthError("State expirado. Tente conectar novamente.")
+    return uid
 
 
 def _save_token(user_id: int, data: dict):

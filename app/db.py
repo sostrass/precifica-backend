@@ -38,6 +38,10 @@ def run_migrations():
 
     tabelas = set(inspect(engine).get_table_names())
     if "alembic_version" not in tabelas and "users" in tabelas:
-        command.stamp(cfg, "head")   # banco anterior ao Alembic: só carimba como atual
+        # Banco anterior ao Alembic: já tem o esquema inicial. Carimba na revisão
+        # INICIAL (não em head) e então sobe as migrações seguintes — assim as
+        # tabelas novas (ex.: oauth_state) são criadas sem recriar as antigas.
+        command.stamp(cfg, "5bbde79adba9")
+        command.upgrade(cfg, "head")
     else:
         command.upgrade(cfg, "head")  # banco novo cria tudo; versionado aplica pendentes

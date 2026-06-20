@@ -114,3 +114,17 @@ class PrecificacaoConfig(Base):
 
     canais = Column(JSON, default=list)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class OAuthState(Base):
+    """State do OAuth do Bling, guardado no banco (uso único, TTL curto).
+
+    Padrão correto de CSRF para OAuth: imune a redeploy e a troca de JWT_SECRET,
+    e sem risco de truncamento (token curto em vez de um JWT longo no state).
+    """
+
+    __tablename__ = "oauth_state"
+
+    state = Column(String, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    criado_em = Column(DateTime, default=datetime.utcnow, nullable=False)
