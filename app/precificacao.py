@@ -223,3 +223,51 @@ def precificar(user_id, custo, margem=None, apenas_ativos=True):
             resultados.append(r)
     return {"custo": float(custo), "base": _r2(base), "margem": m,
             "imposto": cfg["imposto"], "cartao": cfg["cartao"], "canais": resultados}
+
+
+# --------------------------------------------------------------------------- #
+# AVALIAÇÃO p/ Catálogo/Dashboard: margem REAL no preço atual + preço sugerido
+# (mesma config de faixas — a casa toda fala a mesma língua de preço)
+# --------------------------------------------------------------------------- #
+def _faixa_para_preco(faixas, preco):
+    """Retorna a faixa cujo intervalo (prev, ate] contém o preço."""
+    fx = _ordenar(faixas)
+    prev = 0.0
+    for f in fx:
+        hi = float("inf") if f.get("ate") is None else float(f["ate"])
+        if prev < preco <= hi:
+            return f
+        prev = hi
+    return fx[-1] if fx else {"ate": None, "comissao": 0.0, "fixo": 0.0, "fixo_pct": 0.0}
+
+
+def _canal_cfg(cfg, canal=None):
+    canais = cfg.get("canais") or []
+    if canal:
+        c = next((x for x in canais if x.get("canal") == canal), None)
+        if c:
+            return c
+    return next((x for x in canais if x.get("ativo")), canais[0] if canais else None)
+
+
+def avaliar_com_cfg(cfg, custo, preco_atual=0.0, canal=None) -> dict:
+    """Sem ler o banco (recebe a config). Devolve preço sugerido + margem real no preço atual."""
+    base = float(custo) + cfg["embalagem"] + cfg["frete"]
+    c = _canal_cfg(cfg, canal)
+    if not c:
+        return {"canal": canal, "preco_sugerido": None, "margem_sugerida": None, "margem_atual": None}
+    sug = precificar_canal(base, c["faixas"], cfg["imposto"], cfg["cartao"], cfg["margem_padrao"])
+    margem_atual = None
+    if preco_atual and float(preco_atual) > 0:
+        faixa = _faixa_para_preco(c["faixas"], float(preco_atual))
+        margem_atual = _raio_x(base, float(preco_atual), faixa, cfg["imposto"], cfg["cartao"])["margem_real"]
+    return {
+        "canal": c["canal"],
+        "preco_sugerido": sug["preco"] if sug else None,
+        "margem_sugerida": sug["raio_x"]["margem_real"] if sug else None,
+        "margem_atual": margem_atual,
+    }
+
+
+def avaliar(user_id, custo, preco_atual=0.0, canal=None) -> dict:
+    return avaliar_com_cfg(obter_config(user_id), custo, preco_atual, canal)

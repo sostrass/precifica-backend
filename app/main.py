@@ -122,21 +122,17 @@ def precificar_lote(payload: dict = Body(...), user: User = Depends(auth.get_cur
       aplicar: bool   # se true, grava no Bling
     }
     """
-    custos = payload.get("custos_globais", {})
-    taxas = payload.get("taxas_por_canal", {})
     canal = payload.get("canal", "mercadolivre")
     aplicar = bool(payload.get("aplicar", False))
+    cfg = precificacao.obter_config(user.id)
     resultados = []
     for item in payload.get("itens", []):
-        calc = pricing.precificar({"custo": item.get("custo", 0),
-                                   "embalagem": item.get("embalagem"),
-                                   "frete": item.get("frete")}, custos, taxas)
-        info = calc["canais"].get(canal, {})
-        preco = info.get("preco")
+        av = precificacao.avaliar_com_cfg(cfg, float(item.get("custo", 0) or 0), 0, canal)
+        preco = av["preco_sugerido"]
         linha = {
             "produto_id": item.get("produto_id"),
             "preco": preco,
-            "margem_liquida": info.get("margem_liquida"),
+            "margem_liquida": av["margem_sugerida"],
             "aplicado": False,
         }
         if aplicar and preco and item.get("produto_id"):
@@ -166,8 +162,6 @@ def monitoramento(payload: dict = Body(default={}),
     Body opcional: {custos_globais, taxas_por_canal?, canal, pagina, limite}
     O front pinta os badges a partir do 'status' (enum), não de texto.
     """
-    custos = payload.get("custos_globais", {})
-    taxas = payload.get("taxas_por_canal", {})
     canal = payload.get("canal", "mercadolivre")
     try:
         bruto = bling.listar_produtos(user.id, pagina=payload.get("pagina", 1),
@@ -175,19 +169,20 @@ def monitoramento(payload: dict = Body(default={}),
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
+    cfg = precificacao.obter_config(user.id)
     itens = []
     for p in bruto.get("data", []):
         custo = float(p.get("precoCusto") or 0)
-        calc = pricing.precificar({"custo": custo}, custos, taxas)
-        info = calc["canais"].get(canal, {})
-        margem = info.get("margem_liquida", 0)
+        preco_atual = float(p.get("preco") or 0)
+        av = precificacao.avaliar_com_cfg(cfg, custo, preco_atual, canal)
+        margem = av["margem_atual"] if av["margem_atual"] is not None else (av["margem_sugerida"] or 0)
         itens.append({
             "id": p.get("id"),
             "sku": p.get("codigo"),
             "nome": p.get("nome"),
             "custo": custo,
-            "preco_atual": float(p.get("preco") or 0),
-            "preco_sugerido": info.get("preco"),
+            "preco_atual": preco_atual,
+            "preco_sugerido": av["preco_sugerido"],
             "margem_liquida": margem,
             "status": _status(margem),
         })
