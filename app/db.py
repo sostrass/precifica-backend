@@ -18,3 +18,26 @@ Base = declarative_base()
 def init_db():
     from . import models  # noqa: F401  (garante que os modelos sejam registrados)
     Base.metadata.create_all(bind=engine)
+
+
+def run_migrations():
+    """Sobe o schema com Alembic, seguro para banco novo OU já existente.
+
+    - Banco novo (sem tabelas)        -> upgrade head (cria tudo).
+    - Banco já existente sem Alembic  -> stamp head (marca como atual, NÃO recria nada).
+    - Banco já versionado             -> upgrade head (aplica migrations pendentes).
+    """
+    import os
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import inspect
+
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # onde está o alembic.ini
+    cfg = Config(os.path.join(raiz, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(raiz, "alembic"))
+
+    tabelas = set(inspect(engine).get_table_names())
+    if "alembic_version" not in tabelas and "users" in tabelas:
+        command.stamp(cfg, "head")   # banco anterior ao Alembic: só carimba como atual
+    else:
+        command.upgrade(cfg, "head")  # banco novo cria tudo; versionado aplica pendentes

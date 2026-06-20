@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from . import ai, agentes, auth, bling, decisao, nfe, precificacao, pricing, qualidade, radar, scraper
 from .config import settings
-from .db import init_db, SessionLocal
+from .db import run_migrations, SessionLocal
 from .models import NfeConfig, User
 
 
@@ -24,7 +24,7 @@ async def _agendador_radar():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    run_migrations()
     tarefa = asyncio.create_task(_agendador_radar()) if settings.radar_intervalo_horas > 0 else None
     yield
     if tarefa:
@@ -460,6 +460,13 @@ def radar_varrer(payload: dict = Body(...), user: User = Depends(auth.get_curren
 def radar_varrer_tudo(user: User = Depends(auth.get_current_user)):
     """Varre de uma vez todos os SKUs com alvos ativos do usuário."""
     return radar.varrer_usuario(user.id)
+
+
+@app.get("/api/radar/alertas")
+def radar_alertas(dias: int = 7, sku: str | None = None, limiar_pct: float = 5.0,
+                  user: User = Depends(auth.get_current_user)):
+    """Feed de mudanças que pedem ação (quedas, altas, novos mínimos) a partir dos snapshots."""
+    return radar.alertas(user.id, dias=dias, limiar_pct=limiar_pct, sku=sku)
 
 
 @app.get("/api/radar/historico")

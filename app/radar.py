@@ -181,6 +181,79 @@ def historico(user_id, sku, dias=7) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# ALERTAS — destaca mudanças que pedem ação (puro sobre snapshots, testável)
+# --------------------------------------------------------------------------- #
+_SEV_ORDEM = {"alta": 0, "media": 1, "baixa": 2}
+
+
+def alertas(user_id, dias=7, limiar_pct=5.0, sku=None) -> dict:
+    """Varre o histórico recente e devolve o que mudou: quedas, altas e novos mínimos.
+
+    O agendador varre em silêncio; isto traduz os snapshots em avisos acionáveis.
+    Não chama a rede — só lê o que já foi coletado.
+    """
+    desde = datetime.utcnow() - timedelta(days=int(dias))
+    with SessionLocal() as db:
+        q = db.query(RadarAlvo).filter(RadarAlvo.user_id == user_id,
+                                       RadarAlvo.ativo.is_(True))
+        if sku:
+            q = q.filter(RadarAlvo.sku == sku)
+        alvos = q.all()
+        alvo_map = {a.id: a for a in alvos}
+        ids = list(alvo_map.keys()) or [-1]
+        snaps = (db.query(RadarSnapshot)
+                 .filter(RadarSnapshot.user_id == user_id,
+                         RadarSnapshot.alvo_id.in_(ids),
+                         RadarSnapshot.coletado_em >= desde)
+                 .order_by(RadarSnapshot.coletado_em.asc()).all())
+
+    por_alvo = {}
+    for s in snaps:
+        preco = s.preco_oferta if s.preco_oferta is not None else s.preco_normal
+        if preco is None or float(preco) <= 0:
+            continue
+        por_alvo.setdefault(s.alvo_id, []).append((s.coletado_em, float(preco)))
+
+    limiar = float(limiar_pct) / 100.0
+    out = []
+    for alvo_id, pts in por_alvo.items():
+        a = alvo_map.get(alvo_id)
+        nome = a.nome if a else "?"
+        precos = [p for (_, p) in pts]
+        quando, atual = pts[-1]
+        base = {"alvo_id": alvo_id, "nome": nome,
+                "marketplace": a.marketplace if a else None,
+                "sku": a.sku if a else None,
+                "preco": _r2(atual), "em": quando.isoformat() + "Z", "_ts": quando}
+
+        if len(precos) >= 2 and precos[-2] > 0:
+            var = (precos[-1] - precos[-2]) / precos[-2]
+            pct = round(var * 100, 1)
+            if var <= -limiar:
+                sev = "alta" if abs(var) >= 0.10 else "media"
+                out.append({**base, "tipo": "queda", "severidade": sev, "variacao_pct": pct,
+                            "mensagem": f"{nome} baixou {abs(pct)}% — agora R$ {_r2(atual)}"})
+            elif var >= limiar:
+                out.append({**base, "tipo": "alta", "severidade": "baixa", "variacao_pct": pct,
+                            "mensagem": f"{nome} subiu {pct}% — agora R$ {_r2(atual)}"})
+
+        if len(precos) >= 3 and atual <= min(precos):
+            out.append({**base, "tipo": "menor", "severidade": "media", "variacao_pct": None,
+                        "mensagem": f"{nome} no menor preço em {int(dias)} dias — R$ {_r2(atual)}"})
+
+    out.sort(key=lambda x: x["_ts"], reverse=True)                 # mais recente primeiro
+    out.sort(key=lambda x: _SEV_ORDEM.get(x["severidade"], 9))     # e severidade no topo (estável)
+    for x in out:
+        x.pop("_ts", None)
+
+    resumo = {"total": len(out),
+              "alta": sum(1 for x in out if x["severidade"] == "alta"),
+              "media": sum(1 for x in out if x["severidade"] == "media"),
+              "baixa": sum(1 for x in out if x["severidade"] == "baixa")}
+    return {"dias": int(dias), "alertas": out, "resumo": resumo}
+
+
+# --------------------------------------------------------------------------- #
 # RADAR + DECISÃO (liga o histórico ao motor de decisão)
 # --------------------------------------------------------------------------- #
 def precos_atuais(user_id, sku) -> list:
