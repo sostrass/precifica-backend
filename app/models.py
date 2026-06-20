@@ -1,7 +1,7 @@
 from datetime import datetime, date
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Date, Float, Boolean, ForeignKey, UniqueConstraint
+    Column, Integer, String, DateTime, Date, Float, Boolean, ForeignKey, UniqueConstraint, JSON
 )
 
 from .db import Base
@@ -88,3 +88,29 @@ class RadarSnapshot(Base):
     preco_normal = Column(Float, nullable=True)
     preco_oferta = Column(Float, nullable=True)
     coletado_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class PrecificacaoConfig(Base):
+    """Configuração de precificação por tenant: custos globais + taxas por canal.
+
+    A coluna `canais` guarda (JSON) a lista de canais, cada um com suas FAIXAS de preço:
+    [{canal, nome, ativo, faixas:[{ate, comissao, fixo, fixo_pct}]}].
+    `ate` = teto da faixa (None = sem teto / catch-all).
+    """
+
+    __tablename__ = "precificacao_config"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+
+    # custos globais em % (incidem sobre o preço de venda)
+    imposto = Column(Float, default=12.0, nullable=False)
+    cartao = Column(Float, default=2.5, nullable=False)
+    # custos por unidade em R$ (somados ao custo do produto)
+    embalagem = Column(Float, default=0.0, nullable=False)
+    frete = Column(Float, default=0.0, nullable=False)
+    # margem líquida desejada padrão (%)
+    margem_padrao = Column(Float, default=20.0, nullable=False)
+
+    canais = Column(JSON, default=list)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

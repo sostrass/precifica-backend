@@ -4,7 +4,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import ai, auth, bling, decisao, nfe, pricing, qualidade, radar, scraper
+from . import ai, auth, bling, decisao, nfe, precificacao, pricing, qualidade, radar, scraper
 from .config import settings
 from .db import init_db, SessionLocal
 from .models import NfeConfig, User
@@ -346,6 +346,38 @@ def estudio_imagem(payload: dict = Body(...),
     """
     return ai.gerar_imagem(user.id, payload.get("prompt", ""),
                            payload.get("negativo", ""), payload.get("modelo"))
+
+
+# ================= Precificação por canal (faixas de preço) =============== #
+@app.get("/api/precificacao/config")
+def precificacao_get_config(user: User = Depends(auth.get_current_user)):
+    """Custos globais + taxas por canal com faixas (cria padrão na primeira vez)."""
+    return precificacao.obter_config(user.id)
+
+
+@app.put("/api/precificacao/config")
+def precificacao_put_config(payload: dict = Body(...),
+                            user: User = Depends(auth.get_current_user)):
+    """Salva custos globais e/ou canais. Body: {imposto?, cartao?, embalagem?, frete?,
+    margem_padrao?, canais?:[{canal,nome,ativo,faixas:[{ate,comissao,fixo,fixo_pct}]}]}"""
+    return precificacao.salvar_config(user.id, payload)
+
+
+@app.post("/api/precificacao/restaurar")
+def precificacao_restaurar(user: User = Depends(auth.get_current_user)):
+    """Restaura os padrões pesquisados (sobrescreve a config atual)."""
+    return precificacao.restaurar_padrao(user.id)
+
+
+@app.post("/api/precificacao/calcular")
+def precificacao_calcular(payload: dict = Body(...),
+                          user: User = Depends(auth.get_current_user)):
+    """Preço sugerido por canal a partir do custo. Body: {custo, margem?, apenas_ativos?}"""
+    if payload.get("custo") is None:
+        raise HTTPException(status_code=422, detail="Informe 'custo'.")
+    return precificacao.precificar(user.id, float(payload["custo"]),
+                                   margem=payload.get("margem"),
+                                   apenas_ativos=payload.get("apenas_ativos", True))
 
 
 # ======================= Radar (histórico de mercado) ===================== #
