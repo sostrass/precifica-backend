@@ -76,6 +76,7 @@ def get_authorize_url(user_id: int) -> str:
 
 
 def user_id_from_state(state: str) -> int:
+    """Valida o state (NÃO consome). Chame consume_state() após o sucesso da troca."""
     if not state:
         raise BlingAuthError("State ausente.")
     with SessionLocal() as db:
@@ -84,11 +85,19 @@ def user_id_from_state(state: str) -> int:
             raise BlingAuthError("State inválido ou expirado. Tente conectar novamente.")
         idade = datetime.utcnow() - (row.criado_em or datetime.utcnow())
         uid = int(row.user_id)
-        db.delete(row)            # uso único: consome o state na hora
-        db.commit()
-        if idade > timedelta(minutes=STATE_TTL_MIN):
-            raise BlingAuthError("State expirado. Tente conectar novamente.")
+    if idade > timedelta(minutes=STATE_TTL_MIN):
+        consume_state(state)
+        raise BlingAuthError("State expirado. Tente conectar novamente.")
     return uid
+
+
+def consume_state(state: str) -> None:
+    """Apaga o state (uso único) — só depois que a troca do code deu certo."""
+    with SessionLocal() as db:
+        row = db.get(OAuthState, state)
+        if row is not None:
+            db.delete(row)
+            db.commit()
 
 
 def _save_token(user_id: int, data: dict):

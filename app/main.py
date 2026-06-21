@@ -86,8 +86,9 @@ def bling_login(user: User = Depends(auth.get_current_user)):
 @app.get("/auth/bling/callback")
 def bling_callback(code: str = Query(...), state: str = Query(...)):
     try:
-        uid = bling.user_id_from_state(state)
-        bling.exchange_code(uid, code)
+        uid = bling.user_id_from_state(state)   # valida (não consome)
+        bling.exchange_code(uid, code)          # se falhar, o state segue válido p/ retry
+        bling.consume_state(state)              # consome só no sucesso (uso único)
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "mensagem": "Conta Bling autorizada com sucesso."}
@@ -186,6 +187,33 @@ def atualizar_produto(produto_id: int, payload: dict = Body(...),
 
 
 # ---------- Diagnóstico: JSON cru do Bling (p/ construir telas sobre dado real) ----------
+@app.get("/api/diagnostico/sistema")
+def diag_sistema(user: User = Depends(auth.get_current_user)):
+    """Revela qual banco está em uso (SQLite efêmero x Postgres persistente) e o estado das migrações."""
+    from sqlalchemy import text
+    from .db import engine
+    from .models import OAuthState
+    banco = engine.url.get_backend_name()  # 'sqlite' ou 'postgresql'
+    ver, n_states = None, -1
+    with SessionLocal() as db:
+        try:
+            ver = db.execute(text("select version_num from alembic_version")).scalar()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            n_states = db.query(OAuthState).count()
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "banco": banco,
+        "persistente": banco != "sqlite",
+        "alerta": None if banco != "sqlite" else
+                  "Backend em SQLite efêmero: dados e conexão somem a cada restart. Defina DATABASE_URL para o Postgres.",
+        "alembic_versao": ver,
+        "oauth_states_no_banco": n_states,
+    }
+
+
 @app.get("/api/diagnostico/produto/{produto_id}")
 def diag_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
     """Payload CRU de um produto no Bling — revela os campos reais (fotos, etc.)."""
