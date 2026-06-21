@@ -58,6 +58,20 @@ def calcular(pedidos: list, produtos: list | None = None) -> dict:
             risco.append({"sku": pr.get("codigo"), "nome": pr.get("nome"),
                           "saldo": saldo, "minimo": minimo})
 
+    # Aging: produtos COM estoque que não venderam no período (capital parado)
+    vendidos = {str(k) for k in vendas_sku}
+    parados = []
+    for pr in produtos:
+        sku = pr.get("codigo")
+        est = pr.get("estoque") or {}
+        saldo = _f(est.get("saldoVirtualTotal"))
+        preco = _f(pr.get("preco"))
+        if sku and str(sku) not in vendidos and saldo > 0:
+            parados.append({"sku": sku, "nome": pr.get("nome"), "saldo": saldo,
+                            "preco": preco, "capital": round(saldo * preco, 2)})
+    parados.sort(key=lambda x: x["capital"], reverse=True)
+    capital_parado = round(sum(p["capital"] for p in parados), 2)
+
     return {
         "gmv": round(gmv, 2),
         "pedidos": n,
@@ -68,4 +82,7 @@ def calcular(pedidos: list, produtos: list | None = None) -> dict:
         "mais_vendidos": mais_vendidos,
         "tendencia": [{"data": k, "valor": round(por_dia[k], 2)} for k in sorted(por_dia)],
         "risco_ruptura": risco[:20],
+        "parados": parados[:20],
+        "qtd_parados": len(parados),
+        "capital_parado": capital_parado,
     }

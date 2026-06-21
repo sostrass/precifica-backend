@@ -225,10 +225,35 @@ def listar_produtos(user_id: int, pagina: int = 1, limite: int = 100,
     return r.json()
 
 
-def obter_produto(user_id: int, produto_id: int) -> dict:
-    r = _request(user_id, "GET", f"/produtos/{produto_id}")
+def obter_produto(user_id: int, produto_id: int, id_loja=None) -> dict:
+    params = {"idLoja": id_loja} if id_loja else None
+    r = _request(user_id, "GET", f"/produtos/{produto_id}", params=params)
     r.raise_for_status()
     return r.json()
+
+
+def probe_multiloja(user_id: int, produto_id: int, lojas: list) -> dict:
+    """Testa se a API pública expõe preço por canal via ?idLoja=. Para cada loja, lê o produto
+    naquele contexto e compara o preço com a base. Se diferir, achamos a fonte por canal."""
+    base = (obter_produto(user_id, produto_id) or {}).get("data", {}) or {}
+    base_preco = _preco_br(base.get("preco")) if isinstance(base.get("preco"), str) else float(base.get("preco") or 0)
+    resultados = []
+    for lj in lojas:
+        item = {"id_loja": lj, "ok": False}
+        try:
+            d = (obter_produto(user_id, produto_id, id_loja=lj) or {}).get("data", {}) or {}
+            p = _preco_br(d.get("preco")) if isinstance(d.get("preco"), str) else float(d.get("preco") or 0)
+            item.update({
+                "ok": True, "preco": p, "difere_da_base": abs(p - base_preco) > 0.001,
+                "tem_loja": "loja" in d or "vinculo" in d or "idProdutoLoja" in d,
+                "campos_extras": [k for k in d.keys() if k not in base.keys()][:10],
+            })
+        except Exception as e:
+            item["erro"] = str(e)[:120]
+        resultados.append(item)
+    achou = any(r.get("difere_da_base") for r in resultados)
+    return {"produto_id": produto_id, "base_preco": round(base_preco, 2),
+            "expoe_preco_por_canal": achou, "lojas": resultados}
 
 
 def atualizar_preco(user_id: int, produto_id: int, preco: float) -> dict:
@@ -266,6 +291,89 @@ def listar_nfe(user_id: int, pagina: int = 1, limite: int = 100,
     r = _request(user_id, "GET", "/nfe", params=params)
     r.raise_for_status()
     return r.json()
+
+
+# Vínculos multiloja: o Bling guarda o preço POR CANAL em "vinculosLojas"
+# (cada loja/marketplace com seu próprio preço). Mapa tipoIntegracao -> canal da config.
+MAPA_INTEGRACAO = {
+    "mercadolivre": "mercadolivre", "shopee": "shopee", "amazon": "amazon",
+    "magalu": "magalu", "americanas": "americanas", "via": "via",
+}
+
+
+def _preco_br(v) -> float:
+    """'38,54' -> 38.54 ; '1.234,50' -> 1234.50."""
+    if v in (None, "", 0):
+        return 0.0
+    try:
+        return float(str(v).replace(".", "").replace(",", "."))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_vinculos_multiloja(arr: list) -> list:
+    """Normaliza vinculosLojas em [{idLoja, nome, integracao, canal, id_anuncio, preco, publicado, ...}]."""
+    out = []
+    for v in arr or []:
+        integ = (v.get("tipoIntegracao") or "").strip()
+        preco = _preco_br(v.get("preco"))
+        id_anuncio = v.get("idProdutoLoja") or None
+        if id_anuncio in (0, "0"):
+            id_anuncio = None
+        ad = str(v.get("adStatus") or "").strip()
+        out.append({
+            "id_loja": v.get("idLoja"),
+            "nome": v.get("nomeLoja") or integ,
+            "integracao": integ,
+            "canal": MAPA_INTEGRACAO.get(integ.lower()),
+            "id_anuncio": id_anuncio,
+            "preco": preco,
+            "preco_promocional": _preco_br(v.get("precoPromocional")),
+            "link": v.get("linkExterno") or None,
+            "ad_status": ad or None,
+            "publicado": bool(id_anuncio),          # tem anúncio nesse canal
+            "ativo": bool(id_anuncio) and preco > 0,  # anúncio + preço = ativo de fato
+        })
+    return out
+
+
+# Lojas desta conta (id -> canal), descobertas no painel. Usadas pra ler preço por idLoja.
+LOJAS_CONTA = {
+    "203414926": {"nome": "Mercado Livre", "integracao": "MercadoLivre"},
+    "204884434": {"nome": "Shein", "integracao": "Shein"},
+    "203923623": {"nome": "Shopee", "integracao": "Shopee"},
+    "205946980": {"nome": "Shopee - NOVO", "integracao": "Shopee"},
+    "205916963": {"nome": "TikTok Shop", "integracao": "TikTok"},
+    "205693668": {"nome": "Nuvemshop", "integracao": "Nuvemshop"},
+}
+
+
+def vinculos_multiloja(user_id: int, produto_id) -> list:
+    """Preço/status por canal. 1) tenta o payload do produto (vinculosLojas);
+    2) fallback: lê por ?idLoja= (auto-validável — só inclui lojas com preço próprio ≠ base)."""
+    try:
+        raw = (obter_produto(user_id, produto_id) or {}).get("data", {}) or {}
+    except BlingAuthError:
+        return []
+    for chave in ("vinculosLojas", "lojas", "produtosLojas"):
+        if isinstance(raw.get(chave), list) and raw[chave]:
+            return parse_vinculos_multiloja(raw[chave])
+    # fallback por idLoja
+    base_preco = _preco_br(raw.get("preco")) if isinstance(raw.get("preco"), str) else float(raw.get("preco") or 0)
+    out = []
+    for lj, meta in LOJAS_CONTA.items():
+        try:
+            d = (obter_produto(user_id, produto_id, id_loja=lj) or {}).get("data", {}) or {}
+        except Exception:
+            continue
+        p = _preco_br(d.get("preco")) if isinstance(d.get("preco"), str) else float(d.get("preco") or 0)
+        if p > 0 and abs(p - base_preco) > 0.001:  # preço próprio do canal
+            integ = meta["integracao"]
+            out.append({"id_loja": lj, "nome": meta["nome"], "integracao": integ,
+                        "canal": MAPA_INTEGRACAO.get(integ.lower()), "id_anuncio": None,
+                        "preco": p, "preco_promocional": 0.0, "link": None,
+                        "ad_status": None, "publicado": True, "ativo": True})
+    return out
 
 
 def listar_tabelas_precos(user_id: int) -> dict:

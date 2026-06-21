@@ -213,18 +213,39 @@ def diag_precos(produto_id, user: User = Depends(auth.get_current_user)):
 
 @app.get("/api/produtos/{produto_id}/sincronizacao")
 def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user)):
-    """Preço-alvo por canal (preserva o líquido) e status vs. o que está registrado.
-    Os preços registrados por canal são lidos quando a fonte for confirmada (ver diagnóstico)."""
+    """Preço-alvo por canal (preserva o líquido) vs. preço registrado no Bling por marketplace.
+    Lê os vínculos multiloja. Canais não configurados aparecem só com o registrado + flag de
+    prejuízo (preço abaixo do líquido)."""
     try:
         raw = (bling.obter_produto(user.id, produto_id) or {}).get("data", {}) or {}
+        vinc = bling.vinculos_multiloja(user.id, produto_id)
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
     base = float(raw.get("preco") or 0)
     cfg = precificacao.obter_config(user.id)
-    precos_atuais = {}  # origem por canal a confirmar via /api/diagnostico/precos
-    canais = precificacao.divergencias(cfg, base, precos_atuais)
+    precos = {v["canal"]: v["preco"] for v in vinc if v.get("canal") and v["preco"] > 0}
+    canais = precificacao.divergencias(cfg, base, precos)
+    vinculos = [{
+        "nome": v["nome"], "integracao": v["integracao"], "canal": v.get("canal"),
+        "id_anuncio": v.get("id_anuncio"), "preco_registrado": v["preco"], "link": v.get("link"),
+        "publicado": v.get("publicado"), "ativo": v.get("ativo"),
+        "prejuizo": bool(v["preco"] > 0 and base > 0 and v["preco"] < base),
+    } for v in vinc]
     return {"produto_id": raw.get("id"), "sku": raw.get("codigo"),
-            "base_venda": round(base, 2), "canais": canais}
+            "base_venda": round(base, 2), "canais": canais,
+            "vinculos": vinculos, "fonte_lida": bool(vinc)}
+
+
+@app.get("/api/diagnostico/multiloja/{produto_id}")
+def diagnostico_multiloja(produto_id, lojas: str = "", user: User = Depends(auth.get_current_user)):
+    """Testa se a API pública do Bling expõe preço por canal via ?idLoja=.
+    'lojas' = IDs separados por vírgula. Sem isso, usa as lojas conhecidas desta conta."""
+    padrao = ["203414926", "204884434", "203923623", "205946980", "205916963", "205693668"]
+    ids = [s.strip() for s in lojas.split(",") if s.strip()] or padrao
+    try:
+        return bling.probe_multiloja(user.id, produto_id, ids)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 
 @app.get("/api/produtos/{produto_id}/posicionamento")
