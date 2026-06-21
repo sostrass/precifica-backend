@@ -160,3 +160,95 @@ def buscar_precos(urls: list[str], pausa_seg: float = 1.0) -> list[dict]:
         if i < len(urls) - 1 and pausa_seg:
             time.sleep(pausa_seg)
     return resultados
+
+
+# --------------------------------------------------------------------------- #
+# VARREDURA DE POSICIONAMENTO — acha o produto no marketplace pela descrição,
+# coleta os preços dos concorrentes e classifica onde seu preço cai.
+# Mercado Livre: API pública de busca. Shopee/Amazon: stub honesto (exigem
+# API/credencial do seller). Nada é alterado aqui — só leitura.
+# --------------------------------------------------------------------------- #
+import statistics
+
+_DIM_RE = re.compile(r"\b\d+(?:[.,]\d+)?(?:\s*[x×]\s*\d+(?:[.,]\d+)?)+\s*(?:cm|mm|m)?\b", re.IGNORECASE)
+_UNIT_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:cm|mm|kg|g|ml|l)\b", re.IGNORECASE)
+
+
+def _termo_busca(nome: str) -> str:
+    """Limpa medidas/ruído do nome para uma busca mais relevante (mantém números úteis, ex.: '30 caixas')."""
+    t = _DIM_RE.sub(" ", nome or "")    # clusters tipo 22.5x17.5x6cm
+    t = _UNIT_RE.sub(" ", t)            # número+unidade soltos (6cm, 0.3kg)
+    t = re.sub(r"\s+", " ", t).strip()
+    return (t or (nome or "")).strip()
+
+
+def buscar_mercadolivre(termo: str, limite: int = 30) -> list[dict]:
+    """Anúncios concorrentes no Mercado Livre (API pública de busca, sem auth)."""
+    if not termo:
+        return []
+    try:
+        r = requests.get("https://api.mercadolibre.com/sites/MLB/search",
+                         params={"q": termo, "limit": min(int(limite), 50)},
+                         headers=_HEADERS, timeout=20)
+        r.raise_for_status()
+        dados = r.json()
+    except (requests.RequestException, ValueError):
+        return []
+    out = []
+    for it in dados.get("results", []) or []:
+        seller = it.get("seller") or {}
+        out.append({
+            "titulo": it.get("title"),
+            "preco": it.get("price"),
+            "link": it.get("permalink"),
+            "vendedor": seller.get("nickname") or seller.get("id"),
+            "vendidos": it.get("sold_quantity"),
+            "thumb": it.get("thumbnail"),
+        })
+    return out
+
+
+def posicionar(meu_preco: float, precos: list) -> dict:
+    """Classifica meu preço frente aos concorrentes (min, mediana, max, percentil)."""
+    validos = sorted(float(p) for p in precos if p and float(p) > 0)
+    if not validos:
+        return {"posicao": "sem_dados", "concorrentes": 0}
+    mn, mx, med, n = validos[0], validos[-1], statistics.median(validos), len(validos)
+    mp = float(meu_preco or 0)
+    mais_baratos = sum(1 for p in validos if p < mp)
+    percentil = round(mais_baratos / n * 100)
+    if mp <= 0:
+        posicao = "sem_preco"
+    elif mp < mn:
+        posicao = "mais_barato"
+    elif mp > mx:
+        posicao = "acima_mercado"
+    elif mp > med * 1.03:
+        posicao = "acima_media"
+    else:
+        posicao = "competitivo"
+    return {
+        "posicao": posicao, "meu_preco": round(mp, 2),
+        "min": round(mn, 2), "mediana": round(med, 2), "max": round(mx, 2),
+        "concorrentes": n, "percentil_mais_barato_que_voce": percentil,
+        "dif_mediana_pct": round((mp - med) / med * 100, 1) if med else 0.0,
+    }
+
+
+def posicionamento(nome: str, meu_preco: float, canal: str = "mercado_livre", limite: int = 30) -> dict:
+    """Varredura completa: termo -> busca no canal -> posicionamento + link sugerido."""
+    termo = _termo_busca(nome)
+    if canal == "mercado_livre":
+        anuncios = buscar_mercadolivre(termo, limite)
+    elif canal in ("shopee", "amazon"):
+        return {"canal": canal, "termo": termo, "indisponivel": True,
+                "motivo": f"Busca no {canal.title()} exige API/credencial do seller — adapter ainda é stub."}
+    else:
+        anuncios = []
+    precos = [a["preco"] for a in anuncios if a.get("preco")]
+    return {
+        "canal": canal, "termo": termo, "meu_preco": round(float(meu_preco or 0), 2),
+        "link_sugerido": anuncios[0]["link"] if anuncios else None,
+        "posicionamento": posicionar(meu_preco, precos),
+        "concorrentes": anuncios[:8],
+    }

@@ -5,7 +5,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, decisao, nfe, precificacao, pricing, qualidade, radar, scraper
+from . import ai, agentes, auth, bling, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper
 from .config import settings
 from .db import run_migrations, SessionLocal
 from .models import NfeConfig, User
@@ -84,11 +84,11 @@ def bling_login(user: User = Depends(auth.get_current_user)):
 
 
 @app.get("/auth/bling/callback")
-def bling_callback(code: str = Query(...), state: str = Query(...)):
+def bling_callback(code: str = Query(...), state: str = Query(None)):
     try:
-        uid = bling.user_id_from_state(state)   # valida (não consome)
-        bling.exchange_code(uid, code)          # se falhar, o state segue válido p/ retry
-        bling.consume_state(state)              # consome só no sucesso (uso único)
+        uid, st = bling.resolver_state(state)   # casa o exato ou a única pendente
+        bling.exchange_code(uid, code)          # se falhar, o state segue p/ retry
+        bling.consume_state(st)                 # consome só no sucesso
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True, "mensagem": "Conta Bling autorizada com sucesso."}
@@ -145,6 +145,12 @@ def obter_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
         "peso_bruto": raw.get("pesoBruto"),
         "peso_liquido": raw.get("pesoLiquido"),
         "descricao_curta": raw.get("descricaoCurta"),
+        "descricao_complementar": raw.get("descricaoComplementar"),
+        "campos_customizados": [
+            {"id": c.get("idCampoCustomizado"), "vinculo": c.get("idVinculo"),
+             "rotulo": c.get("item") or "", "valor": c.get("valor")}
+            for c in (raw.get("camposCustomizados") or [])
+        ],
         "situacao": raw.get("situacao"),
         "tipo": raw.get("tipo"),
         "marca": raw.get("marca"),
@@ -167,7 +173,7 @@ def obter_produto(produto_id: int, user: User = Depends(auth.get_current_user)):
 _MAPA_PRODUTO = {  # nome amigável (front) -> campo da API do Bling
     "nome": "nome", "preco": "preco", "custo": "precoCusto", "ncm": "ncm",
     "gtin": "gtin", "peso_bruto": "pesoBruto", "peso_liquido": "pesoLiquido",
-    "descricao_curta": "descricaoCurta",
+    "descricao_curta": "descricaoCurta", "descricao_complementar": "descricaoComplementar",
 }
 
 
@@ -187,6 +193,102 @@ def atualizar_produto(produto_id: int, payload: dict = Body(...),
 
 
 # ---------- Diagnóstico: JSON cru do Bling (p/ construir telas sobre dado real) ----------
+@app.get("/api/diagnostico/precos/{produto_id}")
+def diag_precos(produto_id, user: User = Depends(auth.get_current_user)):
+    """Payload CRU do produto + tabelas de preço — revela onde o Bling guarda o preço por canal."""
+    try:
+        prod = (bling.obter_produto(user.id, produto_id) or {}).get("data", {})
+        try:
+            tabelas = bling.listar_tabelas_precos(user.id)
+        except Exception as e:  # noqa: BLE001
+            tabelas = {"erro": str(e)}
+        return {"produto_id": produto_id,
+                "preco_base": prod.get("preco"),
+                "tem_variacoes": bool(prod.get("variacoes")),
+                "chaves_produto": sorted(prod.keys()),
+                "tabelas_precos": tabelas}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/produtos/{produto_id}/sincronizacao")
+def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user)):
+    """Preço-alvo por canal (preserva o líquido) e status vs. o que está registrado.
+    Os preços registrados por canal são lidos quando a fonte for confirmada (ver diagnóstico)."""
+    try:
+        raw = (bling.obter_produto(user.id, produto_id) or {}).get("data", {}) or {}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    base = float(raw.get("preco") or 0)
+    cfg = precificacao.obter_config(user.id)
+    precos_atuais = {}  # origem por canal a confirmar via /api/diagnostico/precos
+    canais = precificacao.divergencias(cfg, base, precos_atuais)
+    return {"produto_id": raw.get("id"), "sku": raw.get("codigo"),
+            "base_venda": round(base, 2), "canais": canais}
+
+
+@app.get("/api/produtos/{produto_id}/posicionamento")
+def produto_posicionamento(produto_id, canal: str = "mercado_livre",
+                           user: User = Depends(auth.get_current_user)):
+    """Varredura de posicionamento: acha o produto no canal e classifica o preço vs mercado."""
+    try:
+        raw = (bling.obter_produto(user.id, produto_id) or {}).get("data", {}) or {}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    return scraper.posicionamento(raw.get("nome") or "", raw.get("preco") or 0, canal=canal)
+
+
+@app.get("/api/produtos/{produto_id}/conselho")
+def produto_conselho(produto_id, user: User = Depends(auth.get_current_user)):
+    """Convoca o Conselho de IA para o produto: falas dos agentes + plano com ações."""
+    try:
+        return agentes.conselho(user.id, produto_id)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/kpis")
+def kpis_dashboard(dias: int = 30, user: User = Depends(auth.get_current_user)):
+    """KPIs do período: GMV, ticket, venda por canal, mais vendidos, tendência, risco de ruptura."""
+    try:
+        pedidos = bling.listar_pedidos_periodo(user.id, dias=dias)
+        produtos = (bling.listar_produtos(user.id, limite=100).get("data") or [])
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    return {"dias": dias, **kpis.calcular(pedidos, produtos)}
+
+
+@app.get("/api/diagnostico/pedidos")
+def diag_pedidos(user: User = Depends(auth.get_current_user)):
+    """Payload CRU dos pedidos de venda — revela se a listagem traz itens (mais vendidos)."""
+    try:
+        return bling.listar_pedidos(user.id, limite=3)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/api/ia/campo")
+def ia_campo(payload: dict, user: User = Depends(auth.get_current_user)):
+    """Reescreve ou cria o conteúdo de um campo com IA. Body: {campo, texto, instrucao?, nome?}."""
+    campo = (payload.get("campo") or "descrição").strip()
+    texto = (payload.get("texto") or "").strip()
+    instrucao = (payload.get("instrucao") or "").strip()
+    nome = (payload.get("nome") or "").strip()
+    base = texto if texto else f"(vazio — crie do zero a partir do produto: {nome or 'produto de armarinho'})"
+    prompt = (
+        "Você é copywriter de e-commerce para marketplaces brasileiros (Mercado Livre, Shopee, Amazon). "
+        f"Reescreva o campo '{campo}' do anúncio, otimizando para busca e conversão, mantendo a informação "
+        "correta, em HTML simples quando fizer sentido. Responda SOMENTE com o texto final, sem comentários.\n"
+        + (f"Instrução do usuário: {instrucao}\n" if instrucao else "")
+        + (f"Produto: {nome}\n" if nome else "")
+        + f"Conteúdo atual:\n{base}"
+    )
+    try:
+        return {"texto": ai._gerar_texto(user.id, prompt)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"IA indisponível: {e}")
+
+
 @app.get("/api/diagnostico/sistema")
 def diag_sistema(user: User = Depends(auth.get_current_user)):
     """Revela qual banco está em uso (SQLite efêmero x Postgres persistente) e o estado das migrações."""

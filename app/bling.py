@@ -75,19 +75,41 @@ def get_authorize_url(user_id: int) -> str:
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
 
-def user_id_from_state(state: str) -> int:
-    """Valida o state (NÃO consome). Chame consume_state() após o sucesso da troca."""
-    if not state:
-        raise BlingAuthError("State ausente.")
+def resolver_state(state: str):
+    """Identifica o tenant a partir do state do callback.
+
+    O ideal é casar o state exato (CSRF). Mas o fluxo de consentimento do Bling
+    NÃO preserva o state que enviamos — devolve um próprio. Então, se o exato não
+    bater, caímos para a única conexão pendente recente (inequívoca). Devolve
+    (user_id, state_para_consumir).
+    """
+    agora = datetime.utcnow()
+    limite = agora - timedelta(minutes=STATE_TTL_MIN)
     with SessionLocal() as db:
-        row = db.get(OAuthState, state)
+        row = db.get(OAuthState, state) if state else None
+        origem = "exato"
         if row is None:
-            raise BlingAuthError("State inválido ou expirado. Tente conectar novamente.")
-        idade = datetime.utcnow() - (row.criado_em or datetime.utcnow())
-        uid = int(row.user_id)
+            recentes = (db.query(OAuthState)
+                        .filter(OAuthState.criado_em >= limite)
+                        .order_by(OAuthState.criado_em.desc()).all())
+            if len(recentes) == 1:
+                row = recentes[0]      # único pendente: o Bling trocou o state, mas é este
+                origem = "fallback"
+            elif len(recentes) > 1:
+                raise BlingAuthError("Várias conexões pendentes. Tente conectar novamente (uma de cada vez).")
+        if row is None:
+            raise BlingAuthError("State inválido ou expirado. Clique em Conectar Bling no app e conclua em até 30 min.")
+        idade = agora - (row.criado_em or agora)
+        uid, st = int(row.user_id), row.state
     if idade > timedelta(minutes=STATE_TTL_MIN):
-        consume_state(state)
+        consume_state(st)
         raise BlingAuthError("State expirado. Tente conectar novamente.")
+    return uid, st
+
+
+def user_id_from_state(state: str) -> int:
+    """Compat: valida e devolve só o user_id (sem consumir)."""
+    uid, _ = resolver_state(state)
     return uid
 
 
@@ -219,7 +241,7 @@ def atualizar_preco(user_id: int, produto_id: int, preco: float) -> dict:
 
 # Campos editáveis aceitos no PATCH parcial de produto (nomes da API v3 do Bling).
 _CAMPOS_PRODUTO = {"nome", "preco", "precoCusto", "ncm", "pesoBruto",
-                   "pesoLiquido", "descricaoCurta", "gtin"}
+                   "pesoLiquido", "descricaoCurta", "descricaoComplementar", "gtin"}
 
 
 def atualizar_produto(user_id: int, produto_id: int, campos: dict) -> dict:
@@ -244,6 +266,47 @@ def listar_nfe(user_id: int, pagina: int = 1, limite: int = 100,
     r = _request(user_id, "GET", "/nfe", params=params)
     r.raise_for_status()
     return r.json()
+
+
+def listar_tabelas_precos(user_id: int) -> dict:
+    """Tabelas de preço do Bling — onde, normalmente, ficam os preços por canal."""
+    r = _request(user_id, "GET", "/tabelas-de-precos")
+    r.raise_for_status()
+    return r.json()
+
+
+def listar_pedidos(user_id: int, pagina: int = 1, limite: int = 100,
+                   data_inicial: str | None = None, data_final: str | None = None) -> dict:
+    params = {"pagina": pagina, "limite": limite}
+    if data_inicial:
+        params["dataInicial"] = data_inicial
+    if data_final:
+        params["dataFinal"] = data_final
+    r = _request(user_id, "GET", "/pedidos/vendas", params=params)
+    r.raise_for_status()
+    return r.json()
+
+
+def obter_pedido(user_id: int, pedido_id) -> dict:
+    r = _request(user_id, "GET", f"/pedidos/vendas/{pedido_id}")
+    r.raise_for_status()
+    return r.json()
+
+
+def listar_pedidos_periodo(user_id: int, dias: int = 30, max_paginas: int = 8) -> list:
+    """Todos os pedidos de venda dos últimos N dias (pagina até esvaziar)."""
+    from datetime import date, timedelta
+    fim = date.today()
+    ini = fim - timedelta(days=dias)
+    todos = []
+    for p in range(1, max_paginas + 1):
+        data = listar_pedidos(user_id, pagina=p, limite=100,
+                              data_inicial=ini.isoformat(), data_final=fim.isoformat())
+        lote = data.get("data", []) or []
+        todos.extend(lote)
+        if len(lote) < 100:
+            break
+    return todos
 
 
 def obter_nfe(user_id: int, nfe_id) -> dict:

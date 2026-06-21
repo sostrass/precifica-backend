@@ -146,6 +146,60 @@ def _faixa_dict(f):
 
 
 # --------------------------------------------------------------------------- #
+# MODELO BASE-VENDA: a base é o PREÇO DE VENDA (líquido que a empresa quer
+# receber, com o ganho já embutido). O cliente final paga comissão, imposto,
+# cartão, taxa fixa e embalagem por cima.
+#   preço = (base_venda + taxa_fixa + embalagem) / (1 − comissão − imposto − cartão)
+# A faixa depende do preço final, então iteramos como no markup reverso.
+# --------------------------------------------------------------------------- #
+def _preco_venda_na_faixa(base_venda, faixa, imposto, cartao, embalagem):
+    pct = float(faixa.get("comissao", 0)) + float(faixa.get("fixo_pct", 0)) + imposto + cartao
+    den = 1.0 - pct / 100.0
+    if den <= 0:
+        return None
+    return (base_venda + float(faixa.get("fixo", 0)) + embalagem) / den
+
+
+def _raio_x_venda(base_venda, preco, faixa, imposto, cartao, embalagem):
+    comissao = float(faixa.get("comissao", 0))
+    fixo = float(faixa.get("fixo", 0))
+    fixo_pct = float(faixa.get("fixo_pct", 0))
+    taxa_canal = preco * comissao / 100.0
+    fixo_total = fixo + preco * fixo_pct / 100.0
+    imp = preco * imposto / 100.0
+    cart = preco * cartao / 100.0
+    liquido = preco - taxa_canal - fixo_total - imp - cart - embalagem
+    return {"liquido": _r2(liquido), "taxa_canal": _r2(taxa_canal), "fixo": _r2(fixo_total),
+            "impostos": _r2(imp), "cartao": _r2(cart), "embalagem": _r2(embalagem),
+            "margem_liquida": round(liquido / preco * 100.0, 1) if preco else 0.0}
+
+
+def precificar_venda_canal(base_venda, faixas, imposto, cartao, embalagem):
+    """Preço de LISTA por canal que preserva o líquido. Escolhe a faixa pelo preço final."""
+    fx = _ordenar(faixas)
+    prev = 0.0
+    fallback = None
+    for f in fx:
+        hi = float("inf") if f.get("ate") is None else float(f["ate"])
+        preco = _preco_venda_na_faixa(base_venda, f, imposto, cartao, embalagem)
+        if preco is None:
+            prev = hi
+            continue
+        if prev < preco <= hi:
+            return {"preco": _r2(preco), "consistente": True, "faixa": _faixa_dict(f),
+                    "raio_x": _raio_x_venda(base_venda, _r2(preco), f, imposto, cartao, embalagem)}
+        dist = (prev - preco) if preco <= prev else (preco - hi)
+        if fallback is None or dist < fallback[0]:
+            fallback = (dist, preco, f)
+        prev = hi
+    if fallback is None:
+        return None
+    _, preco, f = fallback
+    return {"preco": _r2(preco), "consistente": False, "faixa": _faixa_dict(f),
+            "raio_x": _raio_x_venda(base_venda, _r2(preco), f, imposto, cartao, embalagem)}
+
+
+# --------------------------------------------------------------------------- #
 # CONFIG POR TENANT (persistência)
 # --------------------------------------------------------------------------- #
 def _config_dict(cfg):
@@ -251,23 +305,62 @@ def _canal_cfg(cfg, canal=None):
 
 
 def avaliar_com_cfg(cfg, custo, preco_atual=0.0, canal=None) -> dict:
-    """Sem ler o banco (recebe a config). Devolve preço sugerido + margem real no preço atual."""
-    base = float(custo) + cfg["embalagem"] + cfg["frete"]
+    """Modelo BASE-VENDA: a base é o preço de venda (líquido alvo). Devolve o preço
+    de LISTA por canal (gross-up) que preserva esse líquido. Mantém as chaves que o
+    front consome. (O parâmetro 'custo' é ignorado neste modelo — fica por compat.)"""
+    base_venda = float(preco_atual or 0)
     c = _canal_cfg(cfg, canal)
-    if not c:
-        return {"canal": canal, "preco_sugerido": None, "margem_sugerida": None, "margem_atual": None}
-    sug = precificar_canal(base, c["faixas"], cfg["imposto"], cfg["cartao"], cfg["margem_padrao"])
-    margem_atual = None
-    if preco_atual and float(preco_atual) > 0:
-        faixa = _faixa_para_preco(c["faixas"], float(preco_atual))
-        margem_atual = _raio_x(base, float(preco_atual), faixa, cfg["imposto"], cfg["cartao"])["margem_real"]
+    if not c or base_venda <= 0:
+        return {"canal": (c or {}).get("canal", canal), "preco_sugerido": None,
+                "margem_sugerida": None, "margem_atual": None, "liquido": _r2(base_venda) if base_venda else None}
+    sug = precificar_venda_canal(base_venda, c["faixas"], cfg["imposto"], cfg["cartao"], cfg["embalagem"])
+    if not sug:
+        return {"canal": c["canal"], "preco_sugerido": None, "margem_sugerida": None,
+                "margem_atual": None, "liquido": _r2(base_venda)}
+    margem = sug["raio_x"]["margem_liquida"]  # líquido / preço de lista
     return {
         "canal": c["canal"],
-        "preco_sugerido": sug["preco"] if sug else None,
-        "margem_sugerida": sug["raio_x"]["margem_real"] if sug else None,
-        "margem_atual": margem_atual,
+        "preco_sugerido": sug["preco"],     # preço de LISTA no canal (cliente paga as taxas)
+        "liquido": _r2(base_venda),         # líquido preservado para a empresa
+        "margem_sugerida": margem,
+        "margem_atual": margem,             # idem até sincronizarmos o preço real do canal
+        "raio_x": sug["raio_x"],
     }
 
 
 def avaliar(user_id, custo, preco_atual=0.0, canal=None) -> dict:
     return avaliar_com_cfg(obter_config(user_id), custo, preco_atual, canal)
+
+
+# --------------------------------------------------------------------------- #
+# SINCRONIZAÇÃO POR CANAL — compara o preço-ALVO (gross-up que preserva o
+# líquido) com o preço REGISTRADO no canal. `precos_atuais` = {canal: preço}.
+# Sem o registrado de um canal, devolve o alvo com status 'sem_registro'.
+# --------------------------------------------------------------------------- #
+def divergencias(cfg, base_venda, precos_atuais=None) -> list:
+    precos_atuais = precos_atuais or {}
+    out = []
+    for c in cfg.get("canais", []):
+        if not c.get("ativo"):
+            continue
+        av = avaliar_com_cfg(cfg, 0, base_venda, c["canal"])
+        alvo = av.get("preco_sugerido")
+        if alvo is None:
+            continue
+        reg = precos_atuais.get(c["canal"])
+        if reg is None:
+            status, dif, dif_pct = "sem_registro", None, None
+            reg_val = None
+        else:
+            reg_val = float(reg)
+            dif = _r2(alvo - reg_val)
+            dif_pct = round(dif / reg_val * 100, 1) if reg_val else 0.0
+            status = "sincronizado" if abs(dif) < 0.01 else "divergente"
+        out.append({
+            "canal": c["canal"], "nome": c["nome"],
+            "preco_alvo": alvo, "liquido": av.get("liquido"),
+            "margem": av.get("margem_sugerida"),
+            "preco_registrado": _r2(reg_val) if reg_val is not None else None,
+            "diferenca": dif, "diferenca_pct": dif_pct, "status": status,
+        })
+    return out

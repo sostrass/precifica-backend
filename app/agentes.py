@@ -13,7 +13,8 @@ quando ele decide usar uma, o SDK executa e devolve o resultado pro modelo.
 from fastapi import HTTPException
 
 from .config import settings
-from . import ai, decisao, precificacao, qualidade, radar
+from . import ai, bling, decisao, precificacao, qualidade, radar
+import re
 
 
 AGENTES = {
@@ -168,3 +169,95 @@ def conversar(user_id: int, agente_id: str, mensagem: str, historico=None) -> di
 
     return {"agente": agente_id, "resposta": texto,
             "ferramentas_usadas": list(dict.fromkeys(usadas))}
+
+
+# --------------------------------------------------------------------------- #
+# CONSELHO DE IA — diretoria que delibera sobre um produto e devolve um plano.
+# Os achados são FUNDAMENTADOS em dados reais (motor de preço, saúde do
+# cadastro, mídia) — nada de número "de cabeça". A IA (Gemini) entra na hora
+# de gerar conteúdo, via /api/ia/campo, quando você aplica uma melhoria.
+# Nenhuma ação é executada aqui; o conselho PROPÕE, o usuário aplica.
+# --------------------------------------------------------------------------- #
+def _texto_puro(html: str) -> str:
+    return re.sub(r"<[^>]+>", " ", html or "").strip()
+
+
+def conselho(user_id: int, produto_id) -> dict:
+    raw = (bling.obter_produto(user_id, produto_id) or {}).get("data", {}) or {}
+    nome = raw.get("nome") or ""
+    preco = float(raw.get("preco") or 0)
+    ncm = (raw.get("tributacao") or {}).get("ncm") or raw.get("ncm") or ""
+    fotos = [i.get("link") for i in (((raw.get("midia") or {}).get("imagens") or {}).get("externas") or []) if i.get("link")]
+    descricao = raw.get("descricaoComplementar") or raw.get("descricaoCurta") or ""
+    desc_len = len(_texto_puro(descricao))
+
+    saude = qualidade.score_cadastro({
+        "nome": nome, "ean": raw.get("gtin"), "ncm": ncm,
+        "peso": raw.get("pesoBruto") or raw.get("pesoLiquido"),
+        "descricao": descricao,
+    })
+    cfg = precificacao.obter_config(user_id)
+    canais = []
+    for c in cfg.get("canais", []):
+        if not c.get("ativo"):
+            continue
+        av = precificacao.avaliar_com_cfg(cfg, 0, preco, c["canal"])
+        if av.get("preco_sugerido") is not None:
+            canais.append({"canal": c["canal"], "nome": c["nome"], **av})
+
+    falas, plano = [], []
+
+    # Diretor comercial — preço base-venda por canal
+    if canais and preco > 0:
+        m = canais[0]
+        falas.append({"agente": "Comercial", "papel": "Diretor comercial",
+                      "texto": f"Base de venda R$ {preco:.2f} (líquido seu). No {m['nome']} o anúncio deve sair a "
+                               f"R$ {m['preco_sugerido']:.2f} para preservar esse líquido."})
+        for c in canais:
+            plano.append({"tipo": "preço", "agente": "Comercial",
+                          "titulo": f"Aplicar preço no {c['nome']}",
+                          "detalhe": f"R$ {c['preco_sugerido']:.2f} · líquido R$ {preco:.2f} · margem {c['margem_sugerida']}%",
+                          "acao": {"campos": {"preco": c["preco_sugerido"]}}})
+    elif preco <= 0:
+        falas.append({"agente": "Comercial", "papel": "Diretor comercial",
+                      "texto": "Produto sem preço de venda definido — defina a base para o conselho precificar os canais."})
+
+    # Diretor de catálogo (QA) — saúde do cadastro
+    gaps = [it for it in saude.get("itens", []) if not it.get("ok")]
+    if gaps:
+        falas.append({"agente": "QA", "papel": "Diretor de catálogo",
+                      "texto": f"Saúde do cadastro {saude.get('score')}/100. Pendências: "
+                               + ", ".join(it["label"] for it in gaps) + "."})
+        for it in gaps:
+            plano.append({"tipo": "cadastro", "agente": "QA", "titulo": it["label"],
+                          "detalhe": it.get("dica") or "Complete no cadastro.", "acao": None})
+    else:
+        falas.append({"agente": "QA", "papel": "Diretor de catálogo",
+                      "texto": f"Cadastro completo ({saude.get('score')}/100)."})
+
+    # Diretor de mídia
+    if not fotos:
+        falas.append({"agente": "Mídia", "papel": "Diretor de mídia", "texto": "Sem fotos cadastradas — prioridade alta."})
+        plano.append({"tipo": "mídia", "agente": "Mídia", "titulo": "Adicionar fotos",
+                      "detalhe": "Nenhuma imagem no produto.", "acao": None})
+    else:
+        falas.append({"agente": "Mídia", "papel": "Diretor de mídia",
+                      "texto": f"{len(fotos)} foto(s). Revise a capa para fundo limpo e padrão."})
+
+    # Diretor de conteúdo
+    if desc_len < 200:
+        falas.append({"agente": "Conteúdo", "papel": "Diretor de conteúdo",
+                      "texto": f"Descrição com {desc_len} caracteres — reescrever para busca e conversão."})
+        plano.append({"tipo": "descrição", "agente": "Conteúdo", "titulo": "Reescrever descrição com IA",
+                      "detalhe": "Otimizar palavras-chave e leitura.", "acao": {"ia_campo": "descrição complementar"}})
+    else:
+        falas.append({"agente": "Conteúdo", "papel": "Diretor de conteúdo",
+                      "texto": f"Descrição com {desc_len} caracteres — boa base; dá para enriquecer com palavras-chave."})
+
+    # Gerente geral — consolida
+    falas.append({"agente": "Gerente", "papel": "Gerente geral",
+                  "texto": f"Consolidado: {len(plano)} melhoria(s) priorizada(s)." if plano
+                           else "Produto saudável — nenhuma ação necessária agora."})
+
+    return {"produto": {"id": raw.get("id"), "nome": nome, "sku": raw.get("codigo")},
+            "saude": saude.get("score"), "falas": falas, "plano": plano}
