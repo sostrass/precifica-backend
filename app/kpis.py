@@ -8,10 +8,64 @@ a listagem resumida do Bling pode não incluir itens — nesse caso fica vazio.
 
 
 def _f(v) -> float:
+    if isinstance(v, str):
+        s = v.strip()
+        if "," in s:  # formato BR: 1.234,56
+            s = s.replace(".", "").replace(",", ".")
+        v = s
     try:
         return float(v or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _itens_pedido(p: dict) -> list:
+    its = p.get("itens") or []
+    return its if isinstance(its, list) else []
+
+
+def vendas_por_sku(pedidos: list) -> dict:
+    """{sku: {unidades, receita, descricao}} a partir dos itens dos pedidos."""
+    out = {}
+    for p in pedidos:
+        for it in _itens_pedido(p):
+            q = _f(it.get("quantidade")) or 1
+            v = _f(it.get("valor")) * q
+            prod = it.get("produto") or {}
+            sku = prod.get("codigo") or it.get("codigo") or it.get("descricao") or "?"
+            s = out.setdefault(str(sku), {"descricao": it.get("descricao") or str(sku), "unidades": 0.0, "receita": 0.0})
+            s["unidades"] += q
+            s["receita"] += v
+    return out
+
+
+def curva_abc(pedidos: list) -> dict:
+    """Classifica cada SKU em A/B/C por participação na receita (Pareto 80/15/5).
+    Devolve {sku: {classe, receita, unidades, pct, pct_acumulado, posicao}}."""
+    vendas = vendas_por_sku(pedidos)
+    total = sum(v["receita"] for v in vendas.values()) or 1.0
+    ordenado = sorted(vendas.items(), key=lambda kv: kv[1]["receita"], reverse=True)
+    out, acum = {}, 0.0
+    for i, (sku, v) in enumerate(ordenado, start=1):
+        pct = v["receita"] / total * 100
+        antes = acum          # acumulado ANTES deste SKU define a faixa
+        acum += pct
+        classe = "A" if antes < 80 else ("B" if antes < 95 else "C")
+        out[sku] = {"classe": classe, "receita": round(v["receita"], 2),
+                    "unidades": v["unidades"], "pct": round(pct, 2),
+                    "pct_acumulado": round(acum, 2), "posicao": i, "total_skus": len(ordenado)}
+    return out
+
+
+def analise_demanda(pedidos: list, sku: str, saldo: float, dias: int) -> dict:
+    """Velocidade de venda e cobertura de estoque de um SKU no período."""
+    v = vendas_por_sku(pedidos).get(str(sku), {"unidades": 0.0, "receita": 0.0})
+    unidades = v["unidades"]
+    por_dia = unidades / dias if dias else 0.0
+    cobertura = (saldo / por_dia) if por_dia > 0 else None  # dias até zerar
+    return {"unidades": unidades, "receita": round(v["receita"], 2),
+            "por_dia": round(por_dia, 2), "cobertura_dias": round(cobertura, 1) if cobertura is not None else None,
+            "saldo": saldo}
 
 
 def calcular(pedidos: list, produtos: list | None = None) -> dict:

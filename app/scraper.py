@@ -54,6 +54,23 @@ def _preco_via_ml_api(url: str) -> float | None:
         return None
 
 
+def preco_ml_por_id(mlb_id: str) -> dict | None:
+    """Preço/status ao vivo de um anúncio do Mercado Livre pelo ID (ex.: 'MLB4525774643')."""
+    digitos = re.sub(r"\D", "", str(mlb_id or ""))
+    if not digitos:
+        return None
+    try:
+        r = requests.get(f"https://api.mercadolibre.com/items/MLB{digitos}", timeout=20)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        return {"preco": float(d["price"]) if d.get("price") is not None else None,
+                "status": d.get("status"), "estoque": d.get("available_quantity"),
+                "vendidos": d.get("sold_quantity"), "link": d.get("permalink")}
+    except (requests.RequestException, ValueError, KeyError):
+        return None
+
+
 def _preco_de_jsonld(soup) -> float | None:
     """O 'santo graal': structured data do Google Shopping (offers.price)."""
     for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):

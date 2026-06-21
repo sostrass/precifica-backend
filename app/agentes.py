@@ -13,8 +13,9 @@ quando ele decide usar uma, o SDK executa e devolve o resultado pro modelo.
 from fastapi import HTTPException
 
 from .config import settings
-from . import ai, bling, decisao, precificacao, qualidade, radar
+from . import ai, bling, decisao, kpis, precificacao, qualidade, radar, scraper
 import re
+import time
 
 
 AGENTES = {
@@ -182,19 +183,42 @@ def _texto_puro(html: str) -> str:
     return re.sub(r"<[^>]+>", " ", html or "").strip()
 
 
+# Cache de análise de vendas (ABC + demanda) por usuário — evita refetch a cada conselho.
+_CACHE_VENDAS = {}     # user_id -> (timestamp, dias, abc_dict, pedidos)
+_TTL_VENDAS = 1800     # 30 min
+
+
+def analise_vendas(user_id: int, dias: int = 90):
+    """Busca pedidos do período (com cache TTL) e devolve (abc_dict, pedidos)."""
+    agora = time.time()
+    c = _CACHE_VENDAS.get(user_id)
+    if c and c[1] == dias and agora - c[0] < _TTL_VENDAS:
+        return c[2], c[3]
+    try:
+        pedidos = bling.listar_pedidos_periodo(user_id, dias=dias, max_paginas=8)
+    except Exception:
+        pedidos = []
+    abc = kpis.curva_abc(pedidos)
+    _CACHE_VENDAS[user_id] = (agora, dias, abc, pedidos)
+    return abc, pedidos
+
+
 def conselho(user_id: int, produto_id) -> dict:
     raw = (bling.obter_produto(user_id, produto_id) or {}).get("data", {}) or {}
     nome = raw.get("nome") or ""
     preco = float(raw.get("preco") or 0)
     ncm = (raw.get("tributacao") or {}).get("ncm") or raw.get("ncm") or ""
+    gtin = raw.get("gtin") or ""
+    peso = raw.get("pesoBruto") or raw.get("pesoLiquido")
     fotos = [i.get("link") for i in (((raw.get("midia") or {}).get("imagens") or {}).get("externas") or []) if i.get("link")]
     descricao = raw.get("descricaoComplementar") or raw.get("descricaoCurta") or ""
     desc_len = len(_texto_puro(descricao))
+    est = raw.get("estoque") or {}
+    saldo = float(est.get("saldoVirtualTotal") or 0)
+    minimo = float(est.get("minimo") or 0)
 
     saude = qualidade.score_cadastro({
-        "nome": nome, "ean": raw.get("gtin"), "ncm": ncm,
-        "peso": raw.get("pesoBruto") or raw.get("pesoLiquido"),
-        "descricao": descricao,
+        "nome": nome, "ean": gtin, "ncm": ncm, "peso": peso, "descricao": descricao,
     })
     cfg = precificacao.obter_config(user_id)
     canais = []
@@ -205,59 +229,177 @@ def conselho(user_id: int, produto_id) -> dict:
         if av.get("preco_sugerido") is not None:
             canais.append({"canal": c["canal"], "nome": c["nome"], **av})
 
-    falas, plano = [], []
+    # canais reais no Bling (preço/ativo por marketplace)
+    try:
+        vinc = bling.vinculos_multiloja(user_id, produto_id)
+    except Exception:
+        vinc = []
 
-    # Diretor comercial — preço base-venda por canal
+    plano = []
+    diretores = []
+
+    def D(nome_d, papel, icone, subs):
+        diretores.append({"nome": nome_d, "papel": papel, "icone": icone, "subagentes": subs})
+
+    # ---- DIRETOR COMERCIAL: Precificação + Posicionamento ----
+    sub_com = []
     if canais and preco > 0:
         m = canais[0]
-        falas.append({"agente": "Comercial", "papel": "Diretor comercial",
-                      "texto": f"Base de venda R$ {preco:.2f} (líquido seu). No {m['nome']} o anúncio deve sair a "
-                               f"R$ {m['preco_sugerido']:.2f} para preservar esse líquido."})
+        sub_com.append({"nome": "Precificação", "status": "ok",
+                        "texto": f"Base R$ {preco:.2f} (líquido seu). No {m['nome']} o anúncio deve sair a R$ {m['preco_sugerido']:.2f} para preservar o líquido."})
         for c in canais:
-            plano.append({"tipo": "preço", "agente": "Comercial",
-                          "titulo": f"Aplicar preço no {c['nome']}",
+            plano.append({"tipo": "preço", "agente": "Comercial", "titulo": f"Aplicar preço no {c['nome']}",
                           "detalhe": f"R$ {c['preco_sugerido']:.2f} · líquido R$ {preco:.2f} · margem {c['margem_sugerida']}%",
                           "acao": {"campos": {"preco": c["preco_sugerido"]}}})
     elif preco <= 0:
-        falas.append({"agente": "Comercial", "papel": "Diretor comercial",
-                      "texto": "Produto sem preço de venda definido — defina a base para o conselho precificar os canais."})
+        sub_com.append({"nome": "Precificação", "status": "acao",
+                        "texto": "Produto sem preço de venda — defina a base para o conselho precificar os canais."})
+    sub_com.append({"nome": "Posicionamento", "status": "info",
+                    "texto": "Comparação com concorrentes disponível na aba Mercado (busca ao vivo no Mercado Livre)."})
+    D("Comercial", "Diretor comercial", "dollar", sub_com)
 
-    # Diretor de catálogo (QA) — saúde do cadastro
+    # ---- DIRETOR DE CATÁLOGO (QA): Auditor + Compliance ----
     gaps = [it for it in saude.get("itens", []) if not it.get("ok")]
-    if gaps:
-        falas.append({"agente": "QA", "papel": "Diretor de catálogo",
-                      "texto": f"Saúde do cadastro {saude.get('score')}/100. Pendências: "
-                               + ", ".join(it["label"] for it in gaps) + "."})
-        for it in gaps:
-            plano.append({"tipo": "cadastro", "agente": "QA", "titulo": it["label"],
-                          "detalhe": it.get("dica") or "Complete no cadastro.", "acao": None})
-    else:
-        falas.append({"agente": "QA", "papel": "Diretor de catálogo",
-                      "texto": f"Cadastro completo ({saude.get('score')}/100)."})
+    sub_cat = [{"nome": "Auditor", "status": "alerta" if gaps else "ok",
+                "texto": f"Saúde do cadastro {saude.get('score')}/100." + (f" Pendências: {', '.join(it['label'] for it in gaps)}." if gaps else " Cadastro completo.")}]
+    comp_falta = [k for k, v in (("EAN/GTIN", gtin), ("NCM", ncm), ("Peso", peso)) if not v]
+    sub_cat.append({"nome": "Compliance", "status": "acao" if comp_falta else "ok",
+                    "texto": (f"Falta para emitir/anunciar: {', '.join(comp_falta)}." if comp_falta else "Fiscais e dimensões OK (EAN, NCM, peso).")})
+    for it in gaps:
+        plano.append({"tipo": "cadastro", "agente": "QA", "titulo": it["label"],
+                      "detalhe": it.get("dica") or "Complete no cadastro.", "acao": None})
+    D("Catálogo", "Diretor de catálogo (QA)", "shield", sub_cat)
 
-    # Diretor de mídia
+    # ---- DIRETOR DE MÍDIA ----
+    sub_mid = [{"nome": "Imagens", "status": "acao" if not fotos else "ok",
+                "texto": "Sem fotos cadastradas — prioridade alta." if not fotos else f"{len(fotos)} foto(s). Revise a capa: fundo limpo e produto centralizado."}]
     if not fotos:
-        falas.append({"agente": "Mídia", "papel": "Diretor de mídia", "texto": "Sem fotos cadastradas — prioridade alta."})
-        plano.append({"tipo": "mídia", "agente": "Mídia", "titulo": "Adicionar fotos",
-                      "detalhe": "Nenhuma imagem no produto.", "acao": None})
-    else:
-        falas.append({"agente": "Mídia", "papel": "Diretor de mídia",
-                      "texto": f"{len(fotos)} foto(s). Revise a capa para fundo limpo e padrão."})
+        plano.append({"tipo": "mídia", "agente": "Mídia", "titulo": "Adicionar fotos", "detalhe": "Nenhuma imagem no produto.", "acao": None})
+    D("Mídia", "Diretor de mídia", "image", sub_mid)
 
-    # Diretor de conteúdo
+    # ---- DIRETOR DE CONTEÚDO: Copywriter + SEO ----
+    sub_con = []
     if desc_len < 200:
-        falas.append({"agente": "Conteúdo", "papel": "Diretor de conteúdo",
-                      "texto": f"Descrição com {desc_len} caracteres — reescrever para busca e conversão."})
+        sub_con.append({"nome": "Copywriter", "status": "acao", "texto": f"Descrição com {desc_len} caracteres — curta para conversão."})
         plano.append({"tipo": "descrição", "agente": "Conteúdo", "titulo": "Reescrever descrição com IA",
                       "detalhe": "Otimizar palavras-chave e leitura.", "acao": {"ia_campo": "descrição complementar"}})
     else:
-        falas.append({"agente": "Conteúdo", "papel": "Diretor de conteúdo",
-                      "texto": f"Descrição com {desc_len} caracteres — boa base; dá para enriquecer com palavras-chave."})
+        sub_con.append({"nome": "Copywriter", "status": "ok", "texto": f"Descrição com {desc_len} caracteres — boa base."})
+    titulo_len = len(nome)
+    if titulo_len < 40 or titulo_len > 130:
+        sub_con.append({"nome": "SEO", "status": "alerta", "texto": f"Título com {titulo_len} caracteres — ideal 40–130 com material e medida para busca."})
+        plano.append({"tipo": "título", "agente": "Conteúdo", "titulo": "Recriar título com IA",
+                      "detalhe": "Incluir material, medida e termos de busca.", "acao": {"ia_campo": "título do anúncio"}})
+    else:
+        sub_con.append({"nome": "SEO", "status": "ok", "texto": f"Título com {titulo_len} caracteres — bom tamanho para busca."})
+    D("Conteúdo", "Diretor de conteúdo", "file", sub_con)
 
-    # Gerente geral — consolida
-    falas.append({"agente": "Gerente", "papel": "Gerente geral",
-                  "texto": f"Consolidado: {len(plano)} melhoria(s) priorizada(s)." if plano
-                           else "Produto saudável — nenhuma ação necessária agora."})
+    # ---- DIRETOR DE MARKETPLACE: Cobertura + Saúde + Sync + Divergências Bling×marketplace ----
+    sub_mkt = []
+    if vinc:
+        ativos = [v for v in vinc if v.get("ativo")]
+        sub_mkt.append({"nome": "Cobertura", "status": "ok" if ativos else "alerta",
+                        "texto": f"Ativo em {len(ativos)} de {len(vinc)} canal(is): {', '.join(v['nome'] for v in ativos) or '—'}."})
+        precos = {v["canal"]: v["preco"] for v in vinc if v.get("canal") and v["preco"] > 0}
+        divs = precificacao.divergencias(cfg, preco, precos)
+        divergentes = [d for d in divs if d["status"] == "divergente"]
+        prejuizo = [v for v in vinc if v["preco"] > 0 and preco > 0 and v["preco"] < preco]
+
+        # Saúde dos canais: % saudáveis (ativo + preço ≥ líquido + alinhado ao alvo)
+        canal_por_nome = {d["canal"]: d for d in divs}
+        saudaveis = 0
+        for v in vinc:
+            ok_preco = v["preco"] >= preco if preco > 0 else True
+            d = canal_por_nome.get(v.get("canal"))
+            ok_sync = (d is None) or d["status"] != "divergente"
+            if v.get("ativo") and ok_preco and ok_sync:
+                saudaveis += 1
+        pct_saude = round(saudaveis / len(vinc) * 100) if vinc else 0
+        st_saude = "ok" if pct_saude >= 80 else ("alerta" if pct_saude >= 50 else "acao")
+        sub_mkt.append({"nome": "Saúde dos canais", "status": st_saude,
+                        "texto": f"{saudaveis}/{len(vinc)} canais saudáveis ({pct_saude}%)."
+                                 + (f" Problemas: {', '.join(v['nome'] for v in vinc if not (v.get('ativo') and (v['preco'] >= preco if preco>0 else True)))[:120]}." if pct_saude < 100 else "")})
+
+        if prejuizo:
+            sub_mkt.append({"nome": "Sync", "status": "acao",
+                            "texto": f"PREJUÍZO em {', '.join(v['nome'] for v in prejuizo)} (preço abaixo do líquido R$ {preco:.2f})."})
+        elif divergentes:
+            sub_mkt.append({"nome": "Sync", "status": "alerta",
+                            "texto": f"Preço divergente em {', '.join(d['nome'] for d in divergentes)} — corrigir para o alvo."})
+        else:
+            sub_mkt.append({"nome": "Sync", "status": "ok", "texto": "Preços por canal alinhados ao alvo."})
+
+        # Divergências Bling × marketplace: compara o preço do Bling com o preço AO VIVO no canal
+        checados, divergencias_live = 0, []
+        for v in vinc:
+            ann = v.get("id_anuncio")
+            if v.get("integracao", "").lower() == "mercadolivre" and ann and str(ann).upper().startswith("MLB"):
+                live = scraper.preco_ml_por_id(ann)
+                if live and live.get("preco") is not None:
+                    checados += 1
+                    if abs(live["preco"] - v["preco"]) > 0.01:
+                        divergencias_live.append(f"{v['nome']}: Bling R$ {v['preco']:.2f} × ML R$ {live['preco']:.2f}")
+        if checados:
+            sub_mkt.append({"nome": "Bling × marketplace", "status": "acao" if divergencias_live else "ok",
+                            "texto": ("Desalinhado — " + "; ".join(divergencias_live)) if divergencias_live
+                                     else f"Preço do Bling bate com o anúncio ao vivo ({checados} verificado(s))."})
+        else:
+            sub_mkt.append({"nome": "Bling × marketplace", "status": "info",
+                            "texto": "Comparação ao vivo precisa do ID do anúncio (leitura completa por canal / Mercado Livre)."})
+    else:
+        sub_mkt.append({"nome": "Cobertura", "status": "info",
+                        "texto": "Sem leitura de canais ainda — rode 'Testar leitura por canal' na aba Sincronizar."})
+    D("Marketplace", "Diretor de marketplace", "target", sub_mkt)
+
+    # ---- DIRETOR DE OPERAÇÕES: Curva ABC + Demanda + Ruptura (histórico de vendas) ----
+    sub_ops = []
+    sku = raw.get("codigo")
+    abc, pedidos = analise_vendas(user_id)
+    cls = abc.get(str(sku)) if sku else None
+    if cls:
+        rotulo = {"A": "Curva A — top de faturamento", "B": "Curva B — intermediário", "C": "Curva C — cauda longa"}[cls["classe"]]
+        st_abc = "ok" if cls["classe"] == "A" else ("info" if cls["classe"] == "B" else "alerta")
+        sub_ops.append({"nome": "Curva ABC", "status": st_abc,
+                        "texto": f"{rotulo}. #{cls['posicao']} de {cls['total_skus']} · {cls['pct']}% da receita (90 dias)."})
+        dem = kpis.analise_demanda(pedidos, sku, saldo, 90)
+        if dem["por_dia"] > 0:
+            cob = dem["cobertura_dias"]
+            st_dem = "acao" if (cob is not None and cob < 15) else ("alerta" if (cob is not None and cob < 30) else "ok")
+            sub_ops.append({"nome": "Demanda", "status": st_dem,
+                            "texto": f"{dem['unidades']:.0f} un em 90 dias ({dem['por_dia']}/dia). "
+                                     + (f"Cobertura {cob} dias com o estoque atual." if cob is not None else "Estoque cobre o ritmo.")})
+        else:
+            sub_ops.append({"nome": "Demanda", "status": "alerta",
+                            "texto": "Sem vendas nos últimos 90 dias — produto parado (capital empatado)."})
+    elif pedidos:
+        sub_ops.append({"nome": "Curva ABC", "status": "alerta",
+                        "texto": "Sem vendas no período — fora da curva (não faturou nos últimos 90 dias)."})
+    else:
+        sub_ops.append({"nome": "Curva ABC", "status": "info",
+                        "texto": "Sem histórico de pedidos lido (verifique a conexão do Bling)."})
+
+    if minimo > 0 and saldo <= minimo:
+        sub_ops.append({"nome": "Ruptura", "status": "acao", "texto": f"Estoque {saldo:.0f} ≤ mínimo {minimo:.0f} — reponha."})
+        plano.append({"tipo": "estoque", "agente": "Operações", "titulo": "Repor estoque", "detalhe": f"Saldo {saldo:.0f} / mínimo {minimo:.0f}.", "acao": None})
+    elif saldo <= 0:
+        sub_ops.append({"nome": "Ruptura", "status": "alerta", "texto": "Sem saldo em estoque."})
+    else:
+        sub_ops.append({"nome": "Ruptura", "status": "ok", "texto": f"Estoque {saldo:.0f} un — sem risco imediato."})
+    D("Operações", "Diretor de operações", "boxes", sub_ops)
+
+    # ---- GERENTE GERAL consolida ----
+    criticos = sum(1 for d in diretores for s in d["subagentes"] if s["status"] == "acao")
+    resumo = (f"{len(plano)} ação(ões) priorizada(s); {criticos} crítica(s)." if plano
+              else "Produto saudável — nada crítico agora.")
+    gerente = {"nome": "Gerente Geral", "papel": "Consolidação", "icone": "crown",
+               "subagentes": [{"nome": "Síntese", "status": "acao" if criticos else "ok", "texto": resumo}]}
+
+    # falas planas (compatibilidade)
+    falas = []
+    for d in diretores + [gerente]:
+        for s in d["subagentes"]:
+            falas.append({"agente": d["nome"], "papel": d["papel"], "sub": s["nome"], "texto": s["texto"]})
 
     return {"produto": {"id": raw.get("id"), "nome": nome, "sku": raw.get("codigo")},
-            "saude": saude.get("score"), "falas": falas, "plano": plano}
+            "saude": saude.get("score"), "diretores": diretores + [gerente],
+            "falas": falas, "plano": plano}
