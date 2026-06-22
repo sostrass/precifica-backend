@@ -1,14 +1,14 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper
+from . import ai, agentes, auth, bling, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, webhooks
 from .config import settings
-from .db import run_migrations, SessionLocal
-from .models import NfeConfig, User
+from .db import run_migrations, SessionLocal, Base, engine
+from .models import NfeConfig, User, WebhookEvento
 
 
 async def _agendador_radar():
@@ -25,6 +25,11 @@ async def _agendador_radar():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
+    # garante a tabela de eventos de webhook (aditivo, não mexe nas existentes)
+    try:
+        WebhookEvento.__table__.create(bind=engine, checkfirst=True)
+    except Exception:  # noqa: BLE001
+        pass
     tarefa = asyncio.create_task(_agendador_radar()) if settings.radar_intervalo_horas > 0 else None
     yield
     if tarefa:
@@ -97,6 +102,59 @@ def bling_callback(code: str = Query(...), state: str = Query(None)):
 @app.get("/auth/bling/status")
 def bling_status(user: User = Depends(auth.get_current_user)):
     return bling.token_status(user.id)
+
+
+# ------------------------------- Webhooks --------------------------------- #
+@app.post("/webhooks/bling/{token}")
+async def receber_webhook(token: str, request: Request):
+    """Recebe os eventos do Bling (push). Responde 200 SEMPRE e rápido — se falhar
+    por 3 dias o Bling desabilita o webhook. Erros internos são engolidos (logados)."""
+    user_id = webhooks.verificar_token(token)
+    if not user_id:
+        # token inválido: ainda assim 200 para o Bling não desabilitar por engano de rota
+        return {"ok": False}
+    try:
+        corpo = await request.json()
+    except Exception:  # noqa: BLE001
+        corpo = {}
+    try:
+        db = SessionLocal()
+        try:
+            reg = webhooks.registrar_evento(db, user_id, corpo)
+            if reg:
+                webhooks.processar(user_id, reg.recurso, reg.acao, corpo.get("data") or {})
+                reg.processado = True
+                db.commit()
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 — nunca devolve erro ao Bling
+        pass
+    return {"ok": True}
+
+
+@app.get("/api/webhooks/url")
+def webhook_url(request: Request, user: User = Depends(auth.get_current_user)):
+    """URL única e assinada deste tenant para colar no Bling (Configuração de servidores)."""
+    base = str(request.base_url).rstrip("/")
+    token = webhooks.gerar_token(user.id)
+    return {"url": f"{base}/webhooks/bling/{token}",
+            "recursos": ["produtos", "pedidos de vendas", "notas fiscais eletrônicas", "estoque"]}
+
+
+@app.get("/api/webhooks/eventos")
+def webhook_eventos(limite: int = 30, user: User = Depends(auth.get_current_user)):
+    """Últimos eventos recebidos do Bling (pra conferir que está chegando)."""
+    db = SessionLocal()
+    try:
+        q = (db.query(WebhookEvento).filter_by(user_id=user.id)
+             .order_by(WebhookEvento.recebido_em.desc()).limit(min(limite, 100)).all())
+        return {"eventos": [{
+            "event": e.event, "recurso": e.recurso, "acao": e.acao,
+            "entidade_id": e.entidade_id, "processado": e.processado,
+            "recebido_em": e.recebido_em.isoformat() if e.recebido_em else None,
+        } for e in q]}
+    finally:
+        db.close()
 
 
 # ------------------------------- Produtos --------------------------------- #

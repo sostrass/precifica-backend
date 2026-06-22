@@ -128,3 +128,21 @@ class OAuthState(Base):
     state = Column(String, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     criado_em = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class WebhookEvento(Base):
+    """Log dos eventos recebidos do Bling via webhook (push em tempo real)."""
+
+    __tablename__ = "webhook_eventos"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    event = Column(String, nullable=True)        # ex.: "produto.updated"
+    recurso = Column(String, nullable=True, index=True)  # ex.: "produto"
+    acao = Column(String, nullable=True)         # ex.: "updated"
+    event_id = Column(String, nullable=True, index=True)  # dedupe
+    company_id = Column(String, nullable=True)
+    entidade_id = Column(String, nullable=True)  # data.id
+    payload = Column(JSON, nullable=True)
+    processado = Column(Boolean, default=False)
+    recebido_em = Column(DateTime, default=datetime.utcnow, index=True)
