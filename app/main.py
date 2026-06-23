@@ -944,6 +944,17 @@ def produto_conselho(produto_id, user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=401, detail=str(e))
 
 
+def _status(margem) -> str:
+    """Classifica a margem líquida em faixa de saúde. Usado pelo dashboard e pelo monitoramento.
+    Critério alinhado ao pricing.py (saudável a partir de 15%)."""
+    m = float(margem or 0)
+    if m >= 15:
+        return "lucro_ideal"
+    if m >= 5:
+        return "atencao"
+    return "critico"
+
+
 @app.get("/api/kpis")
 def kpis_dashboard(dias: int = 30, user: User = Depends(auth.get_current_user)):
     """KPIs do período: GMV, ticket, venda por canal, mais vendidos, tendência, risco de ruptura."""
@@ -952,7 +963,56 @@ def kpis_dashboard(dias: int = 30, user: User = Depends(auth.get_current_user)):
         produtos = (bling.listar_produtos(user.id, limite=100).get("data") or [])
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
-    return {"dias": dias, **kpis.calcular(pedidos, produtos)}
+    resultado = {"dias": dias, **kpis.calcular(pedidos, produtos)}
+    # traduz o ID da loja para o nome da loja (ex.: 205946980 -> "Shopee NOVO")
+    try:
+        mapa = bling.lojas_da_conta(user.id)  # {id_loja: {nome, integracao}}
+        for c in resultado.get("por_canal", []):
+            meta = mapa.get(str(c.get("loja")))
+            if meta and meta.get("nome"):
+                c["loja"] = meta["nome"]
+            elif str(c.get("loja")) == "sem_loja":
+                c["loja"] = "Venda direta"
+    except Exception:
+        pass
+    return resultado
+
+
+@app.get("/api/dashboard/carteira")
+def dashboard_carteira(canal: str = "mercadolivre", user: User = Depends(auth.get_current_user)):
+    """Margem líquida por produto sobre o catálogo COMPLETO (cache), não a API live.
+    Devolve resumo agregado (todos os produtos) + uma amostra de itens para o heatmap/watchlist."""
+    produtos = catalogo.todos(user.id)
+    cfg = precificacao.obter_config(user.id)
+    cont = {"lucro_ideal": 0, "atencao": 0, "critico": 0}
+    soma = 0.0
+    n = 0
+    itens = []
+    for p in produtos:
+        custo = float(p.get("custo") or 0)
+        preco = float(p.get("preco") or 0)
+        if preco <= 0:
+            continue
+        av = precificacao.avaliar_com_cfg(cfg, custo, preco, canal)
+        margem = av["margem_atual"] if av["margem_atual"] is not None else (av["margem_sugerida"] or 0)
+        st = _status(margem)
+        cont[st] = cont.get(st, 0) + 1
+        soma += margem
+        n += 1
+        itens.append({"sku": p.get("sku"), "nome": p.get("nome"), "custo": custo,
+                      "preco_atual": preco, "preco_sugerido": av["preco_sugerido"],
+                      "margem_liquida": margem, "status": st})
+    for it in itens:
+        it["pot"] = (round((it["preco_sugerido"] - it["preco_atual"]) / it["preco_atual"] * 100, 1)
+                     if it["preco_atual"] and it["preco_sugerido"] else None)
+    piores = sorted([i for i in itens if i["status"] != "lucro_ideal"],
+                    key=lambda x: x["margem_liquida"])[:6]
+    melhores = sorted([i for i in itens if i["pot"] is not None and i["pot"] > 1],
+                      key=lambda x: x["pot"], reverse=True)[:6]
+    resumo = {"total": n, "ideal": cont["lucro_ideal"], "atencao": cont["atencao"],
+              "critico": cont["critico"], "margem_media": round(soma / n, 1) if n else 0,
+              "piores": piores, "melhores": melhores, "canal": canal}
+    return {"resumo": resumo, "itens": itens[:200]}
 
 
 @app.get("/api/diagnostico/pedidos")

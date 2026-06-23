@@ -146,3 +146,14 @@ def listar(user_id: int, busca: str = "", pagina: int = 1, limite: int = 50,
                            "situacao": r.situacao} for r in itens]}
     finally:
         db.close()
+
+
+def todos(user_id: int) -> list:
+    """Todos os produtos do cache (lightweight) para cálculos do dashboard."""
+    db = SessionLocal()
+    try:
+        rows = db.query(ProdutoCache).filter_by(user_id=user_id).all()
+        return [{"sku": r.sku, "nome": r.nome, "preco": r.preco or 0.0,
+                 "custo": r.custo or 0.0, "saldo": r.saldo or 0.0} for r in rows]
+    finally:
+        db.close()
