@@ -1,9 +1,10 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, webhooks
@@ -92,6 +93,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def _erro_global(request: Request, exc: Exception):
+    """Qualquer erro inesperado volta como JSON legível COM cabeçalho CORS, em vez do
+    net::ERR_FAILED opaco que o navegador mostra quando um 500 vem sem CORS."""
+    origem = request.headers.get("origin")
+    headers = {"Access-Control-Allow-Origin": origem or "*",
+               "Access-Control-Allow-Credentials": "true"}
+    return JSONResponse(status_code=500,
+                        content={"detail": f"Erro interno: {type(exc).__name__}: {exc}"},
+                        headers=headers)
 
 
 # ------------------------------- Modelos ---------------------------------- #
