@@ -10,7 +10,21 @@ if url.startswith("postgres://"):
 
 connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
 
-engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+if url.startswith("sqlite"):
+    engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+else:
+    # Postgres (Railway): conexões ociosas são derrubadas; recycle evita travas em
+    # conexão morta. Pool com folga para o threadpool e timeout curto para falhar
+    # rápido em vez de pendurar a requisição quando o pool esgota.
+    engine = create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=15,
+        pool_recycle=280,
+        connect_args=connect_args,
+    )
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 

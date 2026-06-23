@@ -180,8 +180,9 @@ def _processar_evento_async(user_id: int, evento_db_id: int):
 
 @app.post("/webhooks/bling/{token}")
 async def receber_webhook(token: str, request: Request, background_tasks: BackgroundTasks):
-    """Recebe os eventos do Bling (push). Grava rápido, responde 200 NA HORA e processa
-    em background (fila) — se falhar por 3 dias o Bling desabilita o webhook."""
+    """Recebe os eventos do Bling (push). Responde 200 NA HORA e joga TODO o trabalho
+    de banco/rede para o threadpool (background) — nada de I/O síncrono no event loop,
+    senão o Bling (que dispara muitos webhooks) congela o servidor inteiro."""
     user_id = webhooks.verificar_token(token)
     if not user_id:
         return {"ok": False}
@@ -189,17 +190,23 @@ async def receber_webhook(token: str, request: Request, background_tasks: Backgr
         corpo = await request.json()
     except Exception:  # noqa: BLE001
         corpo = {}
-    try:
-        db = SessionLocal()
-        try:
-            reg = webhooks.registrar_evento(db, user_id, corpo)  # gravação rápida + dedupe
-            if reg:
-                background_tasks.add_task(_processar_evento_async, user_id, reg.id)
-        finally:
-            db.close()
-    except Exception:  # noqa: BLE001 — nunca devolve erro ao Bling
-        pass
+    background_tasks.add_task(_registrar_e_processar, user_id, corpo)
     return {"ok": True}
+
+
+def _registrar_e_processar(user_id: int, corpo: dict):
+    """Roda no threadpool (fora do event loop): grava o evento e processa em seguida."""
+    reg_id = None
+    db = SessionLocal()
+    try:
+        reg = webhooks.registrar_evento(db, user_id, corpo)  # gravação rápida + dedupe
+        reg_id = reg.id if reg else None
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        db.close()
+    if reg_id:
+        _processar_evento_async(user_id, reg_id)
 
 
 @app.get("/api/webhooks/url")
