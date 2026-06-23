@@ -51,7 +51,8 @@ def _ordenar(db, user_id: int, itens: list, criterio: str) -> list:
 
 
 def status(user_id: int) -> dict:
-    """Estado atual do motor para o painel."""
+    """Estado atual do motor para o painel. SÓ banco — rápido e sem chamar a Shopee
+    (resolver nome via API aqui travava os workers; nomes são sincronizados à parte)."""
     db = SessionLocal()
     try:
         cfg = _config(db, user_id)
@@ -60,30 +61,9 @@ def status(user_id: int) -> dict:
         ativos = [i for i in itens if i.boost_ate and i.boost_ate > agora]
         fila = [i for i in itens if not (i.boost_ate and i.boost_ate > agora) and not i.fixo]
         fila = _ordenar(db, user_id, fila, cfg.criterio)
-        # resolve nomes/imagens reais (best-effort) para itens cujo nome ficou como ID
-        precisa = [i.item_id for i in itens if not i.nome or str(i.nome).lstrip("#") == str(i.item_id)]
-        meta = {}
-        if precisa:
-            try:
-                meta = shopee.nomes_itens(user_id, precisa)
-                # persiste o nome resolvido para as próximas vezes
-                for i in itens:
-                    m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
-                    if m and m.get("nome"):
-                        i.nome = m["nome"]
-                db.commit()
-            except Exception:  # noqa: BLE001
-                db.rollback()
 
         def _nome(i):
-            if i.nome and str(i.nome).lstrip("#") != str(i.item_id):
-                return i.nome
-            m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
-            return (m or {}).get("nome") or f"#{i.item_id}"
-
-        def _img(i):
-            m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
-            return (m or {}).get("imagem")
+            return i.nome if (i.nome and str(i.nome).lstrip("#") != str(i.item_id)) else f"#{i.item_id}"
 
         return {
             "ativo": cfg.ativo, "criterio": cfg.criterio,
@@ -91,16 +71,37 @@ def status(user_id: int) -> dict:
             "max_simultaneos": cfg.max_simultaneos,
             "total": len(itens), "fixos": sum(1 for i in itens if i.fixo),
             "impulsionando": [{
-                "item_id": i.item_id, "nome": _nome(i), "imagem": _img(i), "fixo": i.fixo,
+                "item_id": i.item_id, "nome": _nome(i), "fixo": i.fixo,
                 "termina_em": i.boost_ate.isoformat() if i.boost_ate else None,
                 "impulsos": i.impulsos,
             } for i in ativos],
             "fila": [{
-                "item_id": i.item_id, "nome": _nome(i), "imagem": _img(i), "prioridade": i.prioridade,
+                "item_id": i.item_id, "nome": _nome(i), "prioridade": i.prioridade,
                 "ultimo_boost": i.ultimo_boost.isoformat() if i.ultimo_boost else None,
                 "impulsos": i.impulsos,
             } for i in fila],
         }
+    finally:
+        db.close()
+
+
+def sincronizar_nomes(user_id: int) -> dict:
+    """Resolve e persiste os nomes reais dos itens do boost (best-effort, sob demanda).
+    Chamado por um endpoint próprio, NUNCA dentro do status."""
+    db = SessionLocal()
+    try:
+        itens = db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()
+        precisa = [i.item_id for i in itens if not i.nome or str(i.nome).lstrip("#") == str(i.item_id)]
+        if not precisa:
+            return {"atualizados": 0, "total": len(itens)}
+        meta = shopee.nomes_itens(user_id, precisa)  # 1 chamada Shopee
+        n = 0
+        for i in itens:
+            m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
+            if m and m.get("nome"):
+                i.nome = m["nome"]; n += 1
+        db.commit()
+        return {"atualizados": n, "total": len(itens)}
     finally:
         db.close()
 

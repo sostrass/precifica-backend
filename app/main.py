@@ -487,6 +487,18 @@ def shopee_boost_rodar(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/api/shopee/boost/sincronizar_nomes")
+def shopee_boost_sincronizar_nomes(user: User = Depends(auth.get_current_user)):
+    """Resolve os nomes reais dos produtos do boost (1 chamada Shopee, sob demanda).
+    Separado do status para nunca travar o painel."""
+    try:
+        return shopee_boost.sincronizar_nomes(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 # ---- Avaliações ----
 @app.get("/api/shopee/avaliacoes")
 def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "",
