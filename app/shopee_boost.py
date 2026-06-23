@@ -69,14 +69,19 @@ def status(user_id: int) -> dict:
             "ativo": cfg.ativo, "criterio": cfg.criterio,
             "janela_inicio": cfg.janela_inicio, "janela_fim": cfg.janela_fim,
             "max_simultaneos": cfg.max_simultaneos,
+            "auto_selecao": bool(getattr(cfg, "auto_selecao", False)),
+            "auto_estrategia": getattr(cfg, "auto_estrategia", "estoque_parado") or "estoque_parado",
+            "auto_maximo": getattr(cfg, "auto_maximo", 30) or 30,
+            "qtd_auto": sum(1 for i in itens if getattr(i, "auto", False)),
+            "qtd_manual": sum(1 for i in itens if not getattr(i, "auto", False)),
             "total": len(itens), "fixos": sum(1 for i in itens if i.fixo),
             "impulsionando": [{
-                "item_id": i.item_id, "nome": _nome(i), "fixo": i.fixo,
+                "item_id": i.item_id, "nome": _nome(i), "fixo": i.fixo, "auto": getattr(i, "auto", False),
                 "termina_em": i.boost_ate.isoformat() if i.boost_ate else None,
                 "impulsos": i.impulsos,
             } for i in ativos],
             "fila": [{
-                "item_id": i.item_id, "nome": _nome(i), "prioridade": i.prioridade,
+                "item_id": i.item_id, "nome": _nome(i), "prioridade": i.prioridade, "auto": getattr(i, "auto", False),
                 "ultimo_boost": i.ultimo_boost.isoformat() if i.ultimo_boost else None,
                 "impulsos": i.impulsos,
             } for i in fila],
@@ -139,5 +144,74 @@ def ciclo(user_id: int) -> dict:
             e.impulsos = (e.impulsos or 0) + 1
         db.commit()
         return {"acao": "impulsionado", "itens": ids, "termina_em": fim.isoformat()}
+    finally:
+        db.close()
+
+
+def auto_selecionar(user_id: int, estrategia: str | None = None) -> dict:
+    """Os agentes escolhem os produtos do boost SOZINHOS, por estratégia — sem seleção manual.
+    estrategia: 'estoque_parado' (mais saldo, para girar o que não vende) | 'margem' (mais lucrativos).
+    Preserva os itens adicionados manualmente e os fixos; só substitui os automáticos."""
+    from . import catalogo, precificacao
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        estr = estrategia or cfg.auto_estrategia or "estoque_parado"
+        teto = max(5, min(cfg.auto_maximo or 30, 50))
+
+        cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+        if not cat:
+            return {"acao": "sem_catalogo", "selecionados": 0,
+                    "msg": "Sincronize o catálogo completo (aba Catálogo) para a auto-seleção funcionar."}
+
+        # anúncios da Shopee com SKU (1 a 2 páginas)
+        shop_itens = []
+        try:
+            for off in (0, 100):
+                r = shopee.listar_itens(user_id, offset=off, limite=100)
+                lst = (r.get("response") or {}).get("item") or []
+                shop_itens.extend(lst)
+                if len(lst) < 100:
+                    break
+        except shopee.ShopeeError as e:
+            return {"acao": "erro", "erro": str(e), "selecionados": 0}
+
+        cfg_preco = precificacao.obter_config(user_id)
+        cands = []
+        for it in shop_itens:
+            sku = it.get("item_sku") or it.get("sku")
+            base = cat.get(sku)
+            if not base:
+                continue
+            saldo = float(base.get("saldo") or 0)
+            if saldo <= 0:  # sem estoque não dá pra impulsionar
+                continue
+            custo = float(base.get("custo") or 0)
+            preco = float(base.get("preco") or 0)
+            margem = 0.0
+            if preco > 0:
+                av = precificacao.avaliar_com_cfg(cfg_preco, custo, preco, "shopee")
+                margem = av["margem_atual"] if av["margem_atual"] is not None else (av["margem_sugerida"] or 0)
+            cands.append({"item_id": str(it.get("item_id")), "nome": it.get("item_name") or sku,
+                          "saldo": saldo, "margem": margem})
+
+        cands.sort(key=lambda x: x["margem"] if estr == "margem" else x["saldo"], reverse=True)
+        escolhidos = cands[:teto]
+
+        # substitui só os automáticos; preserva manuais/fixos
+        for a in db.query(ShopeeBoostItem).filter_by(user_id=user_id, auto=True).all():
+            db.delete(a)
+        db.flush()
+        manuais = {i.item_id for i in db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()}
+        n = 0
+        for c in escolhidos:
+            if c["item_id"] in manuais:
+                continue
+            db.add(ShopeeBoostItem(user_id=user_id, item_id=c["item_id"], nome=c["nome"],
+                                   auto=True, prioridade=0))
+            n += 1
+        cfg.auto_estrategia = estr
+        db.commit()
+        return {"acao": "ok", "estrategia": estr, "selecionados": n, "candidatos": len(cands)}
     finally:
         db.close()

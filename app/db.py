@@ -34,6 +34,41 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
+def garantir_colunas_extras():
+    """Adiciona colunas novas em tabelas já existentes de forma idempotente (Postgres e SQLite),
+    sem depender de uma migration Alembic manual. Seguro rodar a cada boot."""
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    alvos = {
+        "shopee_boost_config": [
+            ("auto_selecao", "BOOLEAN DEFAULT FALSE"),
+            ("auto_estrategia", "VARCHAR DEFAULT 'estoque_parado'"),
+            ("auto_maximo", "INTEGER DEFAULT 30"),
+        ],
+        "shopee_boost_item": [
+            ("auto", "BOOLEAN DEFAULT FALSE"),
+        ],
+        "shopee_promo_config": [
+            ("base_comparacao", "VARCHAR DEFAULT 'dia'"),
+        ],
+        "shopee_venda_snapshot": [
+            ("pedidos_6h", "INTEGER DEFAULT 0"),
+            ("bucket", "INTEGER DEFAULT 0"),
+        ],
+    }
+    try:
+        with engine.begin() as conn:
+            for tabela, cols in alvos.items():
+                if not insp.has_table(tabela):
+                    continue
+                existentes = {c["name"] for c in insp.get_columns(tabela)}
+                for nome, tipo in cols:
+                    if nome not in existentes:
+                        conn.execute(text(f"ALTER TABLE {tabela} ADD COLUMN {nome} {tipo}"))
+    except Exception:  # noqa: BLE001 — nunca derruba o boot por causa disso
+        pass
+
+
 def run_migrations():
     """Sobe o schema com Alembic, seguro para banco novo OU já existente.
 

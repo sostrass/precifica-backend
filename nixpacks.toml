@@ -1,0 +1,15 @@
+# Build no Railway com o Chromium do Playwright instalado, para o scraper PRÓPRIO
+# (descoberta de concorrentes por termo em Shopee/TikTok/Shein) funcionar.
+#
+# Se este caminho falhar no Railway (Playwright em nixpacks às vezes é chato),
+# use o Dockerfile descrito em DEPLOY_SCRAPER.md — é o caminho mais robusto.
+
+[variables]
+# Mantém o browser num caminho estável, lido no build E em runtime.
+PLAYWRIGHT_BROWSERS_PATH = "/app/.playwright"
+
+[phases.build]
+cmds = [
+  "python -m playwright install-deps chromium",
+  "PLAYWRIGHT_BROWSERS_PATH=/app/.playwright python -m playwright install chromium",
+]

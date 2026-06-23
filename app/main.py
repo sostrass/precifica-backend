@@ -7,9 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_promo_auto, shopee_reviews, webhooks
 from .config import settings
-from .db import run_migrations, SessionLocal, Base, engine
+from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
 
 
@@ -26,17 +26,32 @@ async def _agendador_radar():
 
 async def _agendador_boost():
     """Laço do auto-boost da Shopee: a cada 10min checa quem tem vaga e impulsiona
-    os próximos da fila (reimpulsiona quando os 4h de um lote acabam)."""
+    os próximos da fila (reimpulsiona quando os 4h de um lote acabam). Quando a
+    auto-seleção está ligada, reabastece a fila automática periodicamente."""
     loop = asyncio.get_event_loop()
+    ciclos = 0
     while True:
         await asyncio.sleep(600)  # 10 minutos
+        ciclos += 1
         try:
-            from .models import ShopeeBoostConfig
+            from .models import ShopeeBoostConfig, ShopeeBoostItem
             db = SessionLocal()
             try:
-                ativos = [c.user_id for c in db.query(ShopeeBoostConfig).filter_by(ativo=True).all()]
+                cfgs = db.query(ShopeeBoostConfig).filter_by(ativo=True).all()
+                ativos = [c.user_id for c in cfgs]
+                # quem precisa reabastecer a fila automática (a cada ~12h ou se esvaziou)
+                reabastecer = []
+                for c in cfgs:
+                    if not getattr(c, "auto_selecao", False):
+                        continue
+                    n_auto = (db.query(ShopeeBoostItem)
+                              .filter_by(user_id=c.user_id, auto=True).count())
+                    if n_auto == 0 or ciclos % 72 == 0:
+                        reabastecer.append(c.user_id)
             finally:
                 db.close()
+            for uid in reabastecer:
+                await loop.run_in_executor(None, shopee_boost.auto_selecionar, uid, None)
             for uid in ativos:
                 await loop.run_in_executor(None, shopee_boost.ciclo, uid)
         except Exception:  # noqa: BLE001 — nunca derruba o app
@@ -63,24 +78,74 @@ async def _agendador_catalogo():
 
 
 @asynccontextmanager
+async def _agendador_reviews():
+    """Modo automático das avaliações: a cada hora responde sozinho as notas
+    configuradas (ex.: 4 e 5 estrelas), deixando notas baixas para revisão manual."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(3600)  # 1 hora
+        try:
+            from .models import ShopeeReviewConfig
+            db = SessionLocal()
+            try:
+                autos = [c.user_id for c in db.query(ShopeeReviewConfig).filter_by(modo="auto").all()]
+            finally:
+                db.close()
+            for uid in autos:
+                await loop.run_in_executor(None, shopee_reviews.auto_responder, uid)
+        except Exception:  # noqa: BLE001 — nunca derruba o app
+            pass
+
+
+async def _agendador_promo():
+    """Motor de promoções: a cada 6h tira uma foto das vendas (para detectar queda)
+    e, para quem está em modo automático, roda o ciclo (agendado ou por queda)."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(6 * 3600)  # 6 horas
+        try:
+            from .models import ShopeePromoConfig, ShopeeConta
+            db = SessionLocal()
+            try:
+                # tira foto das vendas de toda loja conectada
+                lojas = [c.user_id for c in db.query(ShopeeConta).all()]
+                autos = [c.user_id for c in db.query(ShopeePromoConfig)
+                         .filter_by(ativo=True, modo="auto").all()]
+            finally:
+                db.close()
+            for uid in lojas:
+                await loop.run_in_executor(None, shopee_promo_auto.snapshot_vendas, uid)
+            for uid in autos:
+                await loop.run_in_executor(None, shopee_promo_auto.auto_ciclo, uid)
+        except Exception:  # noqa: BLE001 — nunca derruba o app
+            pass
+
+
 async def lifespan(app: FastAPI):
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     try:
         from .models import (ProdutoSync, ProdutoCache, CatalogoSync,
-                             ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig)
+                             ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
+                             ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog)
         for M in (WebhookEvento, ProdutoSync, ProdutoCache, CatalogoSync,
-                  ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig):
+                  ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
+                  ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog):
             M.__table__.create(bind=engine, checkfirst=True)
     except Exception:  # noqa: BLE001
         pass
+    garantir_colunas_extras()  # colunas novas em tabelas já existentes (auto-seleção do boost)
     tarefa = asyncio.create_task(_agendador_radar()) if settings.radar_intervalo_horas > 0 else None
     tarefa_boost = asyncio.create_task(_agendador_boost())
+    tarefa_reviews = asyncio.create_task(_agendador_reviews())
+    tarefa_promo = asyncio.create_task(_agendador_promo())
     tarefa_cat = asyncio.create_task(_agendador_catalogo()) if settings.catalogo_resync_horas > 0 else None
     yield
     if tarefa:
         tarefa.cancel()
     tarefa_boost.cancel()
+    tarefa_reviews.cancel()
+    tarefa_promo.cancel()
     if tarefa_cat:
         tarefa_cat.cancel()
 
@@ -434,11 +499,25 @@ def shopee_boost_config(payload: dict = Body(...), user: User = Depends(auth.get
         if "janela_inicio" in payload: c.janela_inicio = int(payload["janela_inicio"])
         if "janela_fim" in payload: c.janela_fim = int(payload["janela_fim"])
         if "max_simultaneos" in payload: c.max_simultaneos = min(int(payload["max_simultaneos"]), 5)
+        if "auto_selecao" in payload: c.auto_selecao = bool(payload["auto_selecao"])
+        if "auto_estrategia" in payload: c.auto_estrategia = payload["auto_estrategia"]
+        if "auto_maximo" in payload: c.auto_maximo = max(5, min(int(payload["auto_maximo"]), 50))
         c.atualizado_em = datetime.utcnow()
         db.commit()
         return {"ok": True}
     finally:
         db.close()
+
+
+@app.post("/api/shopee/boost/auto_selecionar")
+def shopee_boost_auto_selecionar(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Os agentes escolhem os produtos do boost automaticamente, por estratégia."""
+    try:
+        return shopee_boost.auto_selecionar(user.id, payload.get("estrategia"))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.post("/api/shopee/boost/itens")
@@ -557,6 +636,85 @@ def shopee_avaliacoes_responder(payload: dict = Body(...),
         return {"ok": True, "texto": texto}
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/avaliacoes/config")
+def shopee_review_config_get(user: User = Depends(auth.get_current_user)):
+    return shopee_reviews.obter_config(user.id)
+
+
+@app.put("/api/shopee/avaliacoes/config")
+def shopee_review_config_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    return shopee_reviews.salvar_config(user.id, payload)
+
+
+@app.post("/api/shopee/avaliacoes/sugerir")
+def shopee_review_sugerir(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Gera um rascunho de resposta no padrão da loja — SEM enviar. Para o modo manual.
+    Body: {nota, comentario, produto?, nome?, tom?}."""
+    try:
+        texto = shopee_reviews.sugerir(
+            user.id, payload.get("nota", 5), payload.get("comentario", ""),
+            payload.get("produto"), payload.get("nome"), payload.get("tom"))
+        return {"texto": texto}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"IA falhou: {e}")
+
+
+@app.post("/api/shopee/avaliacoes/auto_responder")
+def shopee_review_auto(user: User = Depends(auth.get_current_user)):
+    """Roda o modo automático agora: responde as avaliações sem resposta cujas notas
+    estão configuradas em auto_estrelas (as demais ficam para revisão manual)."""
+    try:
+        return shopee_reviews.auto_responder(user.id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ----------------------- Motor de promoções automáticas ------------------- #
+@app.get("/api/shopee/promo/config")
+def shopee_promo_config_get(user: User = Depends(auth.get_current_user)):
+    return shopee_promo_auto.obter_config(user.id)
+
+
+@app.put("/api/shopee/promo/config")
+def shopee_promo_config_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    return shopee_promo_auto.salvar_config(user.id, payload)
+
+
+@app.post("/api/shopee/promo/propor")
+def shopee_promo_propor(user: User = Depends(auth.get_current_user)):
+    """Monta as propostas de promoção (não cria nada) — o agente escolhe os produtos
+    e calcula o desconto seguro dentro das regras."""
+    try:
+        return shopee_promo_auto.propor(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/promo/aplicar")
+def shopee_promo_aplicar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Cria as promoções a partir das propostas aprovadas. Body: {propostas, tipo?}."""
+    propostas = payload.get("propostas") or []
+    if not propostas:
+        raise HTTPException(status_code=422, detail="Envie as propostas a aplicar.")
+    try:
+        return shopee_promo_auto.aplicar(user.id, propostas, payload.get("tipo"), "manual")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/promo/queda")
+def shopee_promo_queda(user: User = Depends(auth.get_current_user)):
+    """Estado da detecção de queda de vendas (linha de base x atual)."""
+    return shopee_promo_auto.detectar_queda(user.id)
+
+
+@app.get("/api/shopee/promo/historico")
+def shopee_promo_historico(user: User = Depends(auth.get_current_user)):
+    return {"itens": shopee_promo_auto.historico(user.id)}
 
 
 # ---- Pedidos & financeiro ----
@@ -1009,6 +1167,12 @@ def produto_posicionamento(produto_id, canal: str = "mercado_livre",
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
     return scraper.posicionamento(raw.get("nome") or "", raw.get("preco") or 0, canal=canal)
+
+
+@app.get("/api/marketplaces/capacidades")
+def marketplaces_capacidades(user: User = Depends(auth.get_current_user)):
+    """O que dá pra monitorar em cada marketplace (ML, Shopee, TikTok, Shein) e como ativar."""
+    return scraper.capacidades()
 
 
 @app.get("/api/produtos/{produto_id}/conselho")

@@ -235,6 +235,7 @@ class ShopeeBoostItem(Base):
     ultimo_boost = Column(DateTime, nullable=True)    # quando foi impulsionado por último
     boost_ate = Column(DateTime, nullable=True)       # fim das 4h do boost atual
     impulsos = Column(Integer, default=0)             # contador de quantas vezes
+    auto = Column(Boolean, default=False)             # entrou pela auto-seleção (vs manual)
     criado_em = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("user_id", "item_id", name="uq_boost_user_item"),)
@@ -251,4 +252,86 @@ class ShopeeBoostConfig(Base):
     janela_fim = Column(Integer, default=0)           # hora 0-23 (0 = sempre)
     criterio = Column(String, default="prioridade")   # prioridade | margem | giro | abc
     max_simultaneos = Column(Integer, default=5)      # teto da Shopee
+    auto_selecao = Column(Boolean, default=False)     # agentes escolhem os produtos sozinhos
+    auto_estrategia = Column(String, default="estoque_parado")  # estoque_parado | margem
+    auto_maximo = Column(Integer, default=30)         # quantos manter na fila automática
     atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+
+class ShopeeReviewConfig(Base):
+    """Como a IA lê e responde as avaliações da Shopee — no padrão da loja.
+    modo=manual: a IA sugere e você revisa/edita antes de enviar.
+    modo=auto: o agente responde sozinho as notas configuradas em auto_estrelas."""
+
+    __tablename__ = "shopee_review_config"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    modo = Column(String, default="manual")            # manual | auto
+    tom = Column(String, default="caloroso")           # caloroso | profissional | descontraido
+    limite_chars = Column(Integer, default=450)        # teto do tamanho da resposta
+    assinatura = Column(String, default="")            # ex.: "Equipe Sóstrass" (entra no fim)
+    saudacao = Column(String, default="")              # ex.: "Oi, {nome}!" — opcional
+    instrucoes = Column(String, default="")            # regras livres da loja
+    oferecer_chat = Column(Boolean, default=True)      # em nota baixa, oferecer resolver pelo chat
+    usar_nome = Column(Boolean, default=True)          # citar o nome do comprador
+    usar_emoji = Column(Boolean, default=True)         # permitir emojis leves
+    auto_estrelas = Column(JSON, default=lambda: [4, 5])  # quais notas o agente responde sozinho
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+
+class ShopeePromoConfig(Base):
+    """Regras do motor de promoções automáticas (Shopee).
+    modo=sugerir: o agente monta propostas e você aprova.
+    modo=auto: o agente cria desconto/flash sozinho dentro das regras."""
+
+    __tablename__ = "shopee_promo_config"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    ativo = Column(Boolean, default=False)
+    modo = Column(String, default="auto")               # auto | sugerir  (padrão: agentes fazem)
+    gatilho = Column(String, default="agendado")        # agendado | queda
+    base_comparacao = Column(String, default="dia")     # dia | horario  (como medir a queda)
+    estrategia = Column(String, default="estoque_parado")  # estoque_parado | margem_alta
+    tipo = Column(String, default="desconto")           # desconto | flash | ambos
+    desconto_max = Column(Integer, default=15)          # teto do desconto (%)
+    piso_margem = Column(Float, default=10.0)           # nunca descontar abaixo desta margem (%)
+    max_produtos = Column(Integer, default=20)          # itens por campanha
+    estoque_minimo = Column(Integer, default=3)         # só promove com estoque >= isso
+    reserva_estoque = Column(Integer, default=1)        # no flash, segura N unidades fora da oferta
+    duracao_dias = Column(Integer, default=3)           # duração da campanha de desconto
+    intervalo_dias = Column(Integer, default=7)         # no gatilho agendado
+    queda_limiar = Column(Integer, default=30)          # % de queda de pedidos que dispara
+    ultimo_ciclo = Column(DateTime, nullable=True)
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+
+class ShopeeVendaSnapshot(Base):
+    """Fotografia periódica de pedidos para detectar queda de vendas — total do dia
+    e da janela de 6h, com a faixa de horário (bucket) para comparar mesmo horário."""
+
+    __tablename__ = "shopee_venda_snapshot"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    pedidos_24h = Column(Integer, default=0)       # pedidos nas últimas 24h
+    pedidos_6h = Column(Integer, default=0)        # pedidos na janela de 6h
+    bucket = Column(Integer, default=0)            # faixa do dia: 0=madrugada 1=manhã 2=tarde 3=noite
+    criado_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ShopeePromoLog(Base):
+    """Histórico do que o motor criou (auditoria)."""
+
+    __tablename__ = "shopee_promo_log"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    tipo = Column(String)            # desconto | flash
+    ref_id = Column(String)          # discount_id ou flash_sale_id
+    nome = Column(String)
+    qtd_itens = Column(Integer, default=0)
+    desconto_pct = Column(Integer, default=0)
+    motivo = Column(String)          # agendado | queda | manual
+    criado_em = Column(DateTime, default=datetime.utcnow, index=True)

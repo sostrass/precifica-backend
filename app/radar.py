@@ -110,7 +110,7 @@ def varrer(user_id, sku) -> dict:
     alvos = [a for a in listar_alvos(user_id, sku) if a["ativo"]]
     resultados = []
     for a in alvos:
-        achado = scraper.buscar_preco(a["url"])
+        achado = scraper.preco_de_url(a["url"], a.get("marketplace"))
         preco = achado.get("preco")
         if preco is not None:
             registrar_snapshot(user_id, a["id"], preco_oferta=preco)

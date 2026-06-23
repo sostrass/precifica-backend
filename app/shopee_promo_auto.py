@@ -1,0 +1,405 @@
+"""Motor de promoções automáticas pelos agentes (Shopee).
+
+O agente:
+  1. escolhe produtos sozinho (estoque parado ou margem alta),
+  2. calcula um desconto SEGURO que respeita o piso de margem e o teto de desconto,
+  3. cria campanha de desconto e/ou oferta relâmpago,
+  4. roda por agenda OU quando detecta queda de vendas.
+
+Modos:
+  - 'sugerir': monta propostas e devolve para você aprovar (padrão, mais seguro).
+  - 'auto': cria as promoções sozinho dentro das regras.
+
+Trava de segurança central: NUNCA descontar abaixo do piso de margem configurado.
+"""
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta
+
+from . import shopee, precificacao
+from .db import SessionLocal
+from .models import (ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog)
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+def _config(db, user_id: int) -> ShopeePromoConfig:
+    c = db.query(ShopeePromoConfig).filter_by(user_id=user_id).first()
+    if not c:
+        c = ShopeePromoConfig(user_id=user_id)
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+    return c
+
+
+def _serializar(c: ShopeePromoConfig) -> dict:
+    return {
+        "ativo": bool(c.ativo), "modo": c.modo or "auto",
+        "gatilho": c.gatilho or "agendado", "base_comparacao": c.base_comparacao or "dia",
+        "estrategia": c.estrategia or "estoque_parado",
+        "tipo": c.tipo or "desconto", "desconto_max": c.desconto_max or 15,
+        "piso_margem": float(c.piso_margem if c.piso_margem is not None else 10.0),
+        "max_produtos": c.max_produtos or 20, "estoque_minimo": c.estoque_minimo or 3,
+        "reserva_estoque": c.reserva_estoque if c.reserva_estoque is not None else 1,
+        "duracao_dias": c.duracao_dias or 3, "intervalo_dias": c.intervalo_dias or 7,
+        "queda_limiar": c.queda_limiar or 30,
+        "ultimo_ciclo": c.ultimo_ciclo.isoformat() if c.ultimo_ciclo else None,
+    }
+
+
+def obter_config(user_id: int) -> dict:
+    db = SessionLocal()
+    try:
+        return _serializar(_config(db, user_id))
+    finally:
+        db.close()
+
+
+def salvar_config(user_id: int, p: dict) -> dict:
+    db = SessionLocal()
+    try:
+        c = _config(db, user_id)
+        if "ativo" in p: c.ativo = bool(p["ativo"])
+        if p.get("modo") in ("sugerir", "auto"): c.modo = p["modo"]
+        if p.get("gatilho") in ("agendado", "queda"): c.gatilho = p["gatilho"]
+        if p.get("base_comparacao") in ("dia", "horario"): c.base_comparacao = p["base_comparacao"]
+        if p.get("estrategia") in ("estoque_parado", "margem_alta"): c.estrategia = p["estrategia"]
+        if p.get("tipo") in ("desconto", "flash", "ambos"): c.tipo = p["tipo"]
+        if "desconto_max" in p: c.desconto_max = max(1, min(int(p["desconto_max"]), 50))
+        if "piso_margem" in p: c.piso_margem = max(0.0, min(float(p["piso_margem"]), 90.0))
+        if "max_produtos" in p: c.max_produtos = max(1, min(int(p["max_produtos"]), 100))
+        if "estoque_minimo" in p: c.estoque_minimo = max(0, int(p["estoque_minimo"]))
+        if "reserva_estoque" in p: c.reserva_estoque = max(0, int(p["reserva_estoque"]))
+        if "duracao_dias" in p: c.duracao_dias = max(1, min(int(p["duracao_dias"]), 30))
+        if "intervalo_dias" in p: c.intervalo_dias = max(1, min(int(p["intervalo_dias"]), 60))
+        if "queda_limiar" in p: c.queda_limiar = max(5, min(int(p["queda_limiar"]), 90))
+        c.atualizado_em = datetime.utcnow()
+        db.commit()
+        return _serializar(c)
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------- #
+# Motor de margem real (sobre o preço de lista, descontadas as taxas Shopee)
+# --------------------------------------------------------------------------- #
+def _faixa_shopee(cfg_prec: dict, preco: float):
+    canais = cfg_prec.get("canais") or []
+    canal = next((c for c in canais if (c.get("canal") or "").lower() == "shopee"), None)
+    if not canal:
+        return None
+    faixas = sorted(canal.get("faixas") or [],
+                    key=lambda f: (f.get("ate") is None, f.get("ate") or 0))
+    for f in faixas:
+        ate = f.get("ate")
+        if ate is None or preco <= ate:
+            return f
+    return faixas[-1] if faixas else None
+
+
+def margem_no_preco(cfg_prec: dict, preco: float, custo: float):
+    """Margem líquida (% sobre o preço de lista) ao vender por `preco` na Shopee."""
+    preco = float(preco or 0)
+    if preco <= 0:
+        return None
+    f = _faixa_shopee(cfg_prec, preco)
+    if f is None:
+        return None
+    pct = (float(f.get("comissao", 0)) + float(f.get("fixo_pct", 0))
+           + float(cfg_prec.get("imposto", 0)) + float(cfg_prec.get("cartao", 0))) / 100.0
+    fixos = float(f.get("fixo", 0)) + float(cfg_prec.get("embalagem", 0))
+    liquido = preco * (1 - pct) - fixos
+    lucro = liquido - float(custo or 0)
+    return lucro / preco * 100.0
+
+
+def _desconto_seguro(cfg_prec: dict, preco: float, custo: float, teto: int, piso: float) -> int:
+    """Maior desconto inteiro (1..teto) que mantém a margem >= piso. 0 = não dá pra descontar."""
+    melhor = 0
+    for d in range(1, int(teto) + 1):
+        m = margem_no_preco(cfg_prec, preco * (1 - d / 100.0), custo)
+        if m is None or m < piso:
+            break  # a margem só piora com mais desconto
+        melhor = d
+    return melhor
+
+
+# --------------------------------------------------------------------------- #
+# Seleção de produtos + propostas
+# --------------------------------------------------------------------------- #
+def _candidatos(user_id: int, cfg) -> list:
+    from . import catalogo
+    cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    if not cat:
+        return []
+    shop_itens = []
+    for off in (0, 100):
+        try:
+            r = shopee.listar_itens(user_id, offset=off, limite=100)
+        except shopee.ShopeeError:
+            break
+        lst = (r.get("response") or {}).get("item") or []
+        shop_itens.extend(lst)
+        if len(lst) < 100:
+            break
+
+    cfg_prec = precificacao.obter_config(user_id)
+    teto, piso = cfg.desconto_max or 15, float(cfg.piso_margem if cfg.piso_margem is not None else 10.0)
+    est_min = cfg.estoque_minimo or 0
+    out = []
+    for it in shop_itens:
+        sku = it.get("item_sku") or it.get("sku")
+        base = cat.get(sku)
+        if not base:
+            continue
+        estoque = int(float(base.get("saldo") or 0))
+        if estoque < max(1, est_min):
+            continue
+        preco = float(base.get("preco") or 0)
+        custo = float(base.get("custo") or 0)
+        if preco <= 0:
+            continue
+        margem_cheia = margem_no_preco(cfg_prec, preco, custo)
+        if margem_cheia is None or margem_cheia < piso:
+            continue  # já está no/abaixo do piso: não há espaço para desconto
+        d = _desconto_seguro(cfg_prec, preco, custo, teto, piso)
+        if d <= 0:
+            continue
+        preco_promo = round(preco * (1 - d / 100.0), 2)
+        out.append({
+            "item_id": str(it.get("item_id")), "nome": it.get("item_name") or sku, "sku": sku,
+            "estoque": estoque, "preco_atual": round(preco, 2), "preco_promo": preco_promo,
+            "desconto_pct": d, "margem_promo": round(margem_no_preco(cfg_prec, preco_promo, custo), 1),
+            "margem_cheia": round(margem_cheia, 1),
+        })
+
+    if (cfg.estrategia or "estoque_parado") == "margem_alta":
+        out.sort(key=lambda x: x["margem_promo"], reverse=True)
+    else:
+        out.sort(key=lambda x: x["estoque"], reverse=True)
+    return out[: cfg.max_produtos or 20]
+
+
+def propor(user_id: int) -> dict:
+    """Monta as propostas de promoção (não cria nada). Para revisão no modo sugerir."""
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        snap = _serializar(cfg)
+    finally:
+        db.close()
+    propostas = _candidatos(user_id, _ConfigView(snap))
+    if not propostas:
+        return {"acao": "vazio", "propostas": [],
+                "msg": "Nenhum produto elegível dentro das regras (estoque, piso de margem). "
+                       "Confira se o catálogo está sincronizado e o piso de margem não está alto demais."}
+    return {"acao": "ok", "propostas": propostas, "config": snap}
+
+
+class _ConfigView:
+    """Adaptador leve para usar o dict de config onde o código espera atributos."""
+    def __init__(self, d: dict):
+        self.__dict__.update(d)
+
+
+# --------------------------------------------------------------------------- #
+# Aplicar (criar de fato) — desconto e/ou flash
+# --------------------------------------------------------------------------- #
+def _registrar_log(user_id, tipo, ref_id, nome, qtd, desconto, motivo):
+    db = SessionLocal()
+    try:
+        db.add(ShopeePromoLog(user_id=user_id, tipo=tipo, ref_id=str(ref_id or ""),
+                              nome=nome, qtd_itens=qtd, desconto_pct=desconto, motivo=motivo))
+        db.commit()
+    finally:
+        db.close()
+
+
+def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str = "manual") -> dict:
+    """Cria as promoções a partir das propostas. tipo: desconto | flash | ambos (default = config)."""
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        snap = _serializar(cfg)
+    finally:
+        db.close()
+    tipo = tipo or snap["tipo"]
+    if not propostas:
+        return {"acao": "vazio", "criadas": []}
+
+    d_medio = round(sum(p.get("desconto_pct", 0) for p in propostas) / len(propostas))
+    criadas = []
+    erros = []
+
+    if tipo in ("desconto", "ambos"):
+        try:
+            inicio = int(time.time()) + 300
+            fim = inicio + max(1, snap["duracao_dias"]) * 86400
+            itens = shopee.itens_desconto_por_pct(user_id, [
+                {"item_id": p["item_id"], "desconto_pct": p["desconto_pct"], "preco": p["preco_atual"]}
+                for p in propostas])
+            nome = f"Auto · {datetime.now().strftime('%d/%m %H:%M')}"
+            r = shopee.criar_desconto(user_id, nome, inicio, fim, itens)
+            did = (r.get("response") or {}).get("discount_id")
+            _registrar_log(user_id, "desconto", did, nome, len(itens), d_medio, motivo)
+            criadas.append({"tipo": "desconto", "id": did, "itens": len(itens), "nome": nome})
+        except shopee.ShopeeError as e:
+            erros.append(f"desconto: {e}")
+
+    if tipo in ("flash", "ambos"):
+        try:
+            slots = shopee.flash_slots(user_id, dias=2)
+            lista = (slots.get("response") or {}).get("timeslot_list") or slots.get("response") or []
+            slot = None
+            if isinstance(lista, list) and lista:
+                slot = lista[0].get("timeslot_id") if isinstance(lista[0], dict) else None
+            if slot:
+                reserva = snap["reserva_estoque"]
+                itens_flash = [{"item_id": p["item_id"], "preco": p["preco_promo"],
+                                "stock": max(1, p["estoque"] - reserva)} for p in propostas]
+                r = shopee.criar_flash(user_id, slot, itens_flash)
+                fid = (r.get("response") or {}).get("flash_sale_id")
+                _registrar_log(user_id, "flash", fid, "Flash auto", len(itens_flash), d_medio, motivo)
+                criadas.append({"tipo": "flash", "id": fid, "itens": len(itens_flash)})
+            else:
+                erros.append("flash: nenhum horário (slot) disponível agora")
+        except shopee.ShopeeError as e:
+            erros.append(f"flash: {e}")
+
+    return {"acao": "ok" if criadas else "erro", "criadas": criadas, "erros": erros}
+
+
+# --------------------------------------------------------------------------- #
+# Detecção de queda de vendas
+# --------------------------------------------------------------------------- #
+BUCKETS = ["madrugada (0-6h)", "manhã (6-12h)", "tarde (12-18h)", "noite (18-24h)"]
+_MIN_AMOSTRAS = 4      # amostras mínimas antes de avaliar
+_MIN_VOLUME = 3        # base mínima de pedidos p/ não disparar em ruído de número pequeno
+
+
+def _bucket_agora() -> int:
+    # horário do Brasil (UTC-3) para a faixa do dia fazer sentido
+    return ((datetime.utcnow() - timedelta(hours=3)).hour) // 6
+
+
+def snapshot_vendas(user_id: int) -> dict:
+    """Foto das vendas: pedidos nas últimas 24h e na janela de 6h, com a faixa do dia."""
+    try:
+        p24 = shopee.contar_pedidos_horas(user_id, 24)
+        p6 = shopee.contar_pedidos_horas(user_id, 6)
+    except shopee.ShopeeError as e:
+        return {"erro": str(e)}
+    bucket = _bucket_agora()
+    db = SessionLocal()
+    try:
+        db.add(ShopeeVendaSnapshot(user_id=user_id, pedidos_24h=p24, pedidos_6h=p6, bucket=bucket))
+        db.commit()
+    finally:
+        db.close()
+    return {"pedidos_24h": p24, "pedidos_6h": p6, "bucket": bucket}
+
+
+def detectar_queda(user_id: int, limiar: int | None = None) -> dict:
+    """Compara as vendas recentes com a linha de base.
+    base_comparacao='dia': total de 24h x média dos dias anteriores (robusto).
+    base_comparacao='horario': janela de 6h x média da MESMA faixa de horário nos dias anteriores."""
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        lim = limiar if limiar is not None else (cfg.queda_limiar or 30)
+        base_cmp = cfg.base_comparacao or "dia"
+        desde = datetime.utcnow() - timedelta(days=14)
+        amostras = (db.query(ShopeeVendaSnapshot)
+                    .filter(ShopeeVendaSnapshot.user_id == user_id,
+                            ShopeeVendaSnapshot.criado_em >= desde)
+                    .order_by(ShopeeVendaSnapshot.criado_em.desc()).all())
+    finally:
+        db.close()
+
+    if len(amostras) < _MIN_AMOSTRAS:
+        return {"queda": False, "motivo": "coletando", "amostras": len(amostras), "base_modo": base_cmp,
+                "msg": "Ainda coletando histórico de vendas (precisa de algumas amostras)."}
+
+    if base_cmp == "horario":
+        atual_snap = amostras[0]
+        b = atual_snap.bucket or 0
+        mesmos = [a.pedidos_6h for a in amostras[1:] if (a.bucket or 0) == b]
+        if len(mesmos) < 2:
+            return {"queda": False, "motivo": "coletando_horario", "base_modo": "horario",
+                    "rotulo": BUCKETS[b], "amostras": len(amostras),
+                    "msg": f"Coletando histórico da faixa {BUCKETS[b]} (precisa de mais dias nesse horário)."}
+        atual = atual_snap.pedidos_6h
+        base = sum(mesmos) / len(mesmos)
+        rotulo = BUCKETS[b]
+    else:
+        atual = amostras[0].pedidos_24h
+        base_vals = [a.pedidos_24h for a in amostras[1:9]]
+        base = sum(base_vals) / len(base_vals) if base_vals else 0
+        rotulo = "dia"
+
+    if base < _MIN_VOLUME:
+        return {"queda": False, "motivo": "volume_baixo", "atual": atual, "base": round(base, 1),
+                "base_modo": base_cmp, "rotulo": rotulo, "amostras": len(amostras),
+                "msg": "Volume ainda baixo pra disparar com segurança (evita falso alarme)."}
+
+    pct = (base - atual) / base * 100.0
+    return {"queda": pct >= lim, "atual": atual, "base": round(base, 1),
+            "queda_pct": round(pct, 1), "limiar": lim, "amostras": len(amostras),
+            "base_modo": base_cmp, "rotulo": rotulo}
+
+
+# --------------------------------------------------------------------------- #
+# Ciclo automático (chamado pelo agendador)
+# --------------------------------------------------------------------------- #
+def auto_ciclo(user_id: int) -> dict:
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        if not cfg.ativo or cfg.modo != "auto":
+            return {"acao": "ocioso"}
+        gatilho = cfg.gatilho or "agendado"
+        intervalo = cfg.intervalo_dias or 7
+        ultimo = cfg.ultimo_ciclo
+        snap = _serializar(cfg)
+    finally:
+        db.close()
+
+    motivo = None
+    if gatilho == "agendado":
+        if ultimo and (datetime.utcnow() - ultimo) < timedelta(days=intervalo):
+            return {"acao": "aguardando_intervalo"}
+        motivo = "agendado"
+    else:  # queda
+        q = detectar_queda(user_id)
+        if not q.get("queda"):
+            return {"acao": "sem_queda", "detalhe": q}
+        motivo = "queda"
+
+    propostas = _candidatos(user_id, _ConfigView(snap))
+    if not propostas:
+        return {"acao": "sem_candidatos"}
+    res = aplicar(user_id, propostas, snap["tipo"], motivo)
+
+    db = SessionLocal()
+    try:
+        c = _config(db, user_id)
+        c.ultimo_ciclo = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+    return {"acao": "aplicado", "motivo": motivo, **res}
+
+
+def historico(user_id: int, limite: int = 20) -> list:
+    db = SessionLocal()
+    try:
+        regs = (db.query(ShopeePromoLog).filter_by(user_id=user_id)
+                .order_by(ShopeePromoLog.criado_em.desc()).limit(limite).all())
+        return [{"tipo": r.tipo, "ref_id": r.ref_id, "nome": r.nome, "qtd_itens": r.qtd_itens,
+                 "desconto_pct": r.desconto_pct, "motivo": r.motivo,
+                 "criado_em": r.criado_em.isoformat() if r.criado_em else None} for r in regs]
+    finally:
+        db.close()

@@ -228,24 +228,28 @@ def desempenho_loja(user_id: int) -> dict:
 
 # ------------------------------- Catálogo --------------------------------- #
 def nomes_itens(user_id: int, item_ids: list) -> dict:
-    """Devolve {item_id: {nome, imagem, preco}} para uma lista de item_ids (best-effort)."""
+    """Devolve {item_id: {nome, sku, imagem, preco, estoque}} para uma lista de item_ids.
+    A Shopee aceita no máx. 50 ids por chamada de get_item_base_info, então processa em lotes."""
     mapa = {}
-    ids = [int(i) for i in item_ids if i][:50]
+    ids = [int(i) for i in item_ids if i]
     if not ids:
         return mapa
-    try:
-        info = info_itens(user_id, ids)
-    except ShopeeError:
-        return mapa
-    for x in (info.get("response") or {}).get("item_list") or []:
-        imgs = (x.get("image") or {}).get("image_url_list") or []
-        precos = x.get("price_info") or []
-        mapa[x.get("item_id")] = {
-            "nome": x.get("item_name"),
-            "imagem": imgs[0] if imgs else None,
-            "preco": (precos[0].get("current_price") if precos else None),
-            "estoque": (x.get("stock_info_v2") or {}).get("summary_info", {}).get("total_available_stock"),
-        }
+    for ini in range(0, len(ids), 50):
+        lote = ids[ini:ini + 50]
+        try:
+            info = info_itens(user_id, lote)
+        except ShopeeError:
+            continue
+        for x in (info.get("response") or {}).get("item_list") or []:
+            imgs = (x.get("image") or {}).get("image_url_list") or []
+            precos = x.get("price_info") or []
+            mapa[x.get("item_id")] = {
+                "nome": x.get("item_name"),
+                "sku": x.get("item_sku"),
+                "imagem": imgs[0] if imgs else None,
+                "preco": (precos[0].get("current_price") if precos else None),
+                "estoque": (x.get("stock_info_v2") or {}).get("summary_info", {}).get("total_available_stock"),
+            }
     return mapa
 
 
@@ -260,6 +264,7 @@ def listar_itens(user_id: int, offset: int = 0, limite: int = 50) -> dict:
     for it in itens:
         meta = mapa.get(it.get("item_id")) or {}
         it["item_name"] = meta.get("nome") or f"#{it.get('item_id')}"
+        it["item_sku"] = meta.get("sku")
         it["image"] = meta.get("imagem")
         it["price"] = meta.get("preco")
         it["stock"] = meta.get("estoque")
@@ -288,11 +293,24 @@ def itens_impulsionados(user_id: int) -> dict:
 # ------------------------------ Avaliações -------------------------------- #
 def listar_avaliacoes(user_id: int, item_id=None, cursor: str = "", limite: int = 20,
                       status: str = "UNANSWERED") -> dict:
-    """Comentários/avaliações. status: ALL | UNANSWERED | ANSWERED, etc."""
+    """Comentários/avaliações já enriquecidos com nome e foto do produto.
+    status: ALL | UNANSWERED | ANSWERED."""
     extra = {"cursor": cursor, "page_size": min(limite, 100), "comment_status": status}
     if item_id:
         extra["item_id"] = int(item_id)
-    return _chamar(user_id, "/api/v2/product/get_comment", extra=extra)
+    r = _chamar(user_id, "/api/v2/product/get_comment", extra=extra)
+    coments = (r.get("response") or {}).get("item_comment_list") or []
+    ids = list({c.get("item_id") for c in coments if c.get("item_id")})
+    if ids:
+        try:
+            meta = nomes_itens(user_id, ids)
+        except ShopeeError:
+            meta = {}
+        for c in coments:
+            m = meta.get(c.get("item_id")) or {}
+            c["produto_nome"] = m.get("nome")
+            c["produto_imagem"] = m.get("imagem")
+    return r
 
 
 def responder_avaliacao(user_id: int, comment_id, texto: str) -> dict:
@@ -314,6 +332,23 @@ def detalhe_pedidos(user_id: int, order_sns: list) -> dict:
                    extra={"order_sn_list": ",".join(order_sns)})
 
 
+def contar_pedidos_horas(user_id: int, horas: int) -> int:
+    """Conta pedidos criados nas últimas `horas` horas (paginando até o teto)."""
+    agora = int(time.time())
+    inicio = agora - int(horas) * 3600
+    total, cursor = 0, ""
+    for _ in range(10):  # teto de páginas
+        r = _chamar(user_id, "/api/v2/order/get_order_list",
+                    extra={"time_range_field": "create_time", "time_from": inicio,
+                           "time_to": agora, "page_size": 100, "cursor": cursor})
+        resp = r.get("response") or {}
+        total += len(resp.get("order_list") or [])
+        cursor = resp.get("next_cursor") or ""
+        if not resp.get("more"):
+            break
+    return total
+
+
 def repasse_pedido(user_id: int, order_sn: str) -> dict:
     """Escrow: valor líquido recebido, comissões e taxas (margem real)."""
     return _chamar(user_id, "/api/v2/payment/get_escrow_detail", extra={"order_sn": order_sn})
@@ -331,6 +366,34 @@ def criar_desconto(user_id: int, nome: str, inicio: int, fim: int, itens: list) 
     return _chamar(user_id, "/api/v2/discount/add_discount", metodo="POST",
                    extra={"discount_name": nome, "start_time": inicio, "end_time": fim,
                           "item_list": itens})
+
+
+def itens_desconto_por_pct(user_id: int, itens: list) -> list:
+    """Transforma [{item_id, desconto_pct, preco?, purchase_limit?}] no item_list do add_discount,
+    aplicando o desconto ao preço de CADA variação (modelo). Sem variação -> model_id=0."""
+    out = []
+    for it in itens:
+        item_id = int(it["item_id"])
+        d = float(it.get("desconto_pct") or 0) / 100.0
+        try:
+            ml = modelos_item(user_id, item_id)
+        except ShopeeError:
+            ml = []
+        model_list = []
+        for m in ml:
+            precos = m.get("price_info") or []
+            preco_m = float((precos[0].get("current_price") if precos else 0)
+                            or m.get("original_price") or 0)
+            if preco_m <= 0:
+                continue
+            model_list.append({"model_id": m.get("model_id"),
+                               "model_promotion_price": round(preco_m * (1 - d), 2)})
+        if not model_list:
+            preco = float(it.get("preco") or 0)
+            model_list = [{"model_id": 0, "model_promotion_price": round(preco * (1 - d), 2)}]
+        out.append({"item_id": item_id, "purchase_limit": int(it.get("purchase_limit") or 0),
+                    "model_list": model_list})
+    return out
 
 
 def encerrar_desconto(user_id: int, discount_id) -> dict:

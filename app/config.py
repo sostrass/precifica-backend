@@ -39,5 +39,17 @@ class Settings(BaseSettings):
     shopee_base_url: str = "https://partner.shopeemobile.com"
     shopee_redirect_base: str = ""  # URL pública do backend p/ o callback OAuth (ex.: https://meu-backend.up.railway.app)
 
+    # Apify — descoberta de concorrentes por termo em Shopee/TikTok/Shein (anti-bot).
+    # Sem este token, esses canais ficam só com rastreio por URL (Radar). Veja /api/marketplaces/capacidades.
+    apify_token: str = ""
+    apify_actor_shopee: str = "apify/shopee-scraper"   # ajuste para o actor que você assinar
+    apify_actor_tiktok: str = "apify/tiktok-shop-scraper"
+    apify_actor_shein: str = "apify/shein-scraper"
+
+    # Scraper PRÓPRIO (sem terceiros) — descoberta de concorrentes via navegador headless.
+    scraper_browser: bool = True          # usa Playwright/Chromium para Shopee/TikTok/Shein
+    scraper_proxy: str = ""               # proxy opcional (ex.: http://user:pass@host:porta) — datacenter costuma ser bloqueado
+    scraper_timeout_ms: int = 30000
+
 
 settings = Settings()
