@@ -251,6 +251,50 @@ def catalogo_listar(busca: str = "", pagina: int = 1, limite: int = 50, situacao
     return catalogo.listar(user.id, busca=busca, pagina=pagina, limite=min(limite, 200), situacao=situacao)
 
 
+@app.get("/api/shopee/diagnostico")
+def shopee_diagnostico(user: User = Depends(auth.get_current_user)):
+    """Testa cada chamada da Shopee individualmente e reporta ok/erro por funcionalidade.
+    Serve para descobrir exatamente o que não funciona (e o porquê), sem adivinhação."""
+    import time as _t
+    if not shopee.app_configurado():
+        return {"app": False, "conectado": False, "testes": [],
+                "resumo": "App Shopee não configurado no servidor (PARTNER_ID/PARTNER_KEY)."}
+    testes = []
+
+    def probe(nome, path, extra=None, metodo="GET"):
+        try:
+            d = shopee._chamar(user.id, path, extra=extra, metodo=metodo, timeout=8)
+            err = d.get("error") if isinstance(d, dict) else None
+            if err:
+                testes.append({"nome": nome, "ok": False, "erro": f"{err}: {d.get('message') or ''}".strip(": ")})
+            else:
+                resp = d.get("response") or {}
+                qtd = next((len(resp[k]) for k in ("item", "item_comment_list", "question_list",
+                            "order_list", "discount_list", "return_list")
+                            if isinstance(resp.get(k), list)), None)
+                testes.append({"nome": nome, "ok": True, "qtd": qtd})
+        except shopee.ShopeeError as e:
+            testes.append({"nome": nome, "ok": False, "erro": str(e)})
+        except Exception as e:  # noqa: BLE001
+            testes.append({"nome": nome, "ok": False, "erro": f"{type(e).__name__}: {e}"})
+
+    agora = int(_t.time())
+    probe("Conexão e dados da loja", "/api/v2/shop/get_shop_info")
+    probe("Produtos (catálogo Shopee)", "/api/v2/product/get_item_list",
+          {"offset": 0, "page_size": 3, "item_status": "NORMAL"})
+    probe("Avaliações (reviews)", "/api/v2/product/get_comment", {"page_size": 5})
+    probe("Perguntas (Q&A)", "/api/v2/sip/get_item_qa_list", {"page_no": 1, "page_size": 5})
+    probe("Pedidos", "/api/v2/order/get_order_list",
+          {"time_range_field": "create_time", "time_from": agora - 7 * 86400,
+           "time_to": agora, "page_size": 5})
+    probe("Descontos / promoções", "/api/v2/discount/get_discount_list",
+          {"discount_status": "ongoing", "page_size": 5})
+    probe("Saúde da loja", "/api/v2/account_health/get_shop_performance")
+    probe("Devoluções", "/api/v2/returns/get_return_list", {"page_no": 0, "page_size": 5})
+    ok = sum(1 for t in testes if t["ok"])
+    return {"app": True, "conectado": testes[0]["ok"], "ok": ok, "total": len(testes), "testes": testes}
+
+
 # -------------------------------- Shopee ---------------------------------- #
 @app.get("/api/shopee/status")
 def shopee_status(user: User = Depends(auth.get_current_user)):

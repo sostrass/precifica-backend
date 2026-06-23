@@ -192,7 +192,7 @@ def _token_valido(user_id: int) -> tuple[str, str]:
 
 
 # ------------------------------ Chamada base ------------------------------ #
-def _chamar(user_id: int, path: str, extra: dict | None = None, metodo: str = "GET") -> dict:
+def _chamar(user_id: int, path: str, extra: dict | None = None, metodo: str = "GET", timeout: int = 25) -> dict:
     if not app_configurado():
         raise ShopeeError("App Shopee não configurado no servidor.")
     access_token, shop_id = _token_valido(user_id)
@@ -203,9 +203,9 @@ def _chamar(user_id: int, path: str, extra: dict | None = None, metodo: str = "G
     url = f"{settings.shopee_base_url}{path}"
     try:
         if metodo == "GET":
-            r = requests.get(url, params={**params, **(extra or {})}, timeout=30)
+            r = requests.get(url, params={**params, **(extra or {})}, timeout=timeout)
         else:
-            r = requests.post(url, params=params, json=(extra or {}), timeout=30)
+            r = requests.post(url, params=params, json=(extra or {}), timeout=timeout)
         d = r.json()
     except (requests.RequestException, ValueError) as e:
         raise ShopeeError(f"Falha na chamada Shopee: {e}")
@@ -227,9 +227,45 @@ def desempenho_loja(user_id: int) -> dict:
 
 
 # ------------------------------- Catálogo --------------------------------- #
+def nomes_itens(user_id: int, item_ids: list) -> dict:
+    """Devolve {item_id: {nome, imagem, preco}} para uma lista de item_ids (best-effort)."""
+    mapa = {}
+    ids = [int(i) for i in item_ids if i][:50]
+    if not ids:
+        return mapa
+    try:
+        info = info_itens(user_id, ids)
+    except ShopeeError:
+        return mapa
+    for x in (info.get("response") or {}).get("item_list") or []:
+        imgs = (x.get("image") or {}).get("image_url_list") or []
+        precos = x.get("price_info") or []
+        mapa[x.get("item_id")] = {
+            "nome": x.get("item_name"),
+            "imagem": imgs[0] if imgs else None,
+            "preco": (precos[0].get("current_price") if precos else None),
+            "estoque": (x.get("stock_info_v2") or {}).get("summary_info", {}).get("total_available_stock"),
+        }
+    return mapa
+
+
 def listar_itens(user_id: int, offset: int = 0, limite: int = 50) -> dict:
-    return _chamar(user_id, "/api/v2/product/get_item_list",
-                   extra={"offset": offset, "page_size": min(limite, 100), "item_status": "NORMAL"})
+    """Lista produtos da loja JÁ com nome, imagem e preço (get_item_list só traz IDs;
+    enriquecemos com get_item_base_info)."""
+    r = _chamar(user_id, "/api/v2/product/get_item_list",
+                extra={"offset": offset, "page_size": min(limite, 100), "item_status": "NORMAL"})
+    resp = r.get("response") or {}
+    itens = resp.get("item") or []
+    mapa = nomes_itens(user_id, [it.get("item_id") for it in itens])
+    for it in itens:
+        meta = mapa.get(it.get("item_id")) or {}
+        it["item_name"] = meta.get("nome") or f"#{it.get('item_id')}"
+        it["image"] = meta.get("imagem")
+        it["price"] = meta.get("preco")
+        it["stock"] = meta.get("estoque")
+    resp["item"] = itens
+    r["response"] = resp
+    return r
 
 
 def info_itens(user_id: int, item_ids: list) -> dict:

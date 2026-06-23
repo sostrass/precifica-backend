@@ -60,18 +60,43 @@ def status(user_id: int) -> dict:
         ativos = [i for i in itens if i.boost_ate and i.boost_ate > agora]
         fila = [i for i in itens if not (i.boost_ate and i.boost_ate > agora) and not i.fixo]
         fila = _ordenar(db, user_id, fila, cfg.criterio)
+        # resolve nomes/imagens reais (best-effort) para itens cujo nome ficou como ID
+        precisa = [i.item_id for i in itens if not i.nome or str(i.nome).lstrip("#") == str(i.item_id)]
+        meta = {}
+        if precisa:
+            try:
+                meta = shopee.nomes_itens(user_id, precisa)
+                # persiste o nome resolvido para as próximas vezes
+                for i in itens:
+                    m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
+                    if m and m.get("nome"):
+                        i.nome = m["nome"]
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+
+        def _nome(i):
+            if i.nome and str(i.nome).lstrip("#") != str(i.item_id):
+                return i.nome
+            m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
+            return (m or {}).get("nome") or f"#{i.item_id}"
+
+        def _img(i):
+            m = meta.get(int(i.item_id)) if str(i.item_id).isdigit() else None
+            return (m or {}).get("imagem")
+
         return {
             "ativo": cfg.ativo, "criterio": cfg.criterio,
             "janela_inicio": cfg.janela_inicio, "janela_fim": cfg.janela_fim,
             "max_simultaneos": cfg.max_simultaneos,
             "total": len(itens), "fixos": sum(1 for i in itens if i.fixo),
             "impulsionando": [{
-                "item_id": i.item_id, "nome": i.nome, "fixo": i.fixo,
+                "item_id": i.item_id, "nome": _nome(i), "imagem": _img(i), "fixo": i.fixo,
                 "termina_em": i.boost_ate.isoformat() if i.boost_ate else None,
                 "impulsos": i.impulsos,
             } for i in ativos],
             "fila": [{
-                "item_id": i.item_id, "nome": i.nome, "prioridade": i.prioridade,
+                "item_id": i.item_id, "nome": _nome(i), "imagem": _img(i), "prioridade": i.prioridade,
                 "ultimo_boost": i.ultimo_boost.isoformat() if i.ultimo_boost else None,
                 "impulsos": i.impulsos,
             } for i in fila],
