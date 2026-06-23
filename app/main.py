@@ -77,7 +77,6 @@ async def _agendador_catalogo():
             pass
 
 
-@asynccontextmanager
 async def _agendador_reviews():
     """Modo automático das avaliações: a cada hora responde sozinho as notas
     configuradas (ex.: 4 e 5 estrelas), deixando notas baixas para revisão manual."""
@@ -121,6 +120,7 @@ async def _agendador_promo():
             pass
 
 
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
