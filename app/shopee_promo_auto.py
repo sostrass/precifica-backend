@@ -130,11 +130,20 @@ def _desconto_seguro(cfg_prec: dict, preco: float, custo: float, teto: int, piso
 # --------------------------------------------------------------------------- #
 # Seleção de produtos + propostas
 # --------------------------------------------------------------------------- #
-def _candidatos(user_id: int, cfg) -> list:
+def _funil(user_id: int, cfg):
+    """Monta os candidatos E um diagnóstico de onde o funil filtra, pra explicar
+    com precisão quando nada fica elegível."""
     from . import catalogo
+    diag = {"catalogo_skus": 0, "shopee_itens": 0, "anuncios_sem_sku": 0,
+            "sku_casado": 0, "passaram_estoque": 0, "canal_shopee_configurado": False,
+            "margem_calculavel": 0, "passaram_piso": 0, "com_desconto_seguro": 0,
+            "elegiveis": 0}
+
     cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    diag["catalogo_skus"] = len(cat)
     if not cat:
-        return []
+        return [], diag
+
     shop_itens = []
     for off in (0, 100):
         try:
@@ -145,29 +154,45 @@ def _candidatos(user_id: int, cfg) -> list:
         shop_itens.extend(lst)
         if len(lst) < 100:
             break
+    diag["shopee_itens"] = len(shop_itens)
 
     cfg_prec = precificacao.obter_config(user_id)
+    # o canal Shopee está configurado na Precificação? (faixas de comissão)
+    canais = cfg_prec.get("canais") or []
+    diag["canal_shopee_configurado"] = any(
+        (c.get("canal") or "").lower() == "shopee" and (c.get("faixas")) for c in canais)
+
     teto, piso = cfg.desconto_max or 15, float(cfg.piso_margem if cfg.piso_margem is not None else 10.0)
     est_min = cfg.estoque_minimo or 0
     out = []
     for it in shop_itens:
         sku = it.get("item_sku") or it.get("sku")
+        if not sku:
+            diag["anuncios_sem_sku"] += 1
+            continue
         base = cat.get(sku)
         if not base:
             continue
+        diag["sku_casado"] += 1
         estoque = int(float(base.get("saldo") or 0))
         if estoque < max(1, est_min):
             continue
+        diag["passaram_estoque"] += 1
         preco = float(base.get("preco") or 0)
         custo = float(base.get("custo") or 0)
         if preco <= 0:
             continue
         margem_cheia = margem_no_preco(cfg_prec, preco, custo)
-        if margem_cheia is None or margem_cheia < piso:
+        if margem_cheia is None:
+            continue  # sem faixa do canal Shopee: margem não é calculável
+        diag["margem_calculavel"] += 1
+        if margem_cheia < piso:
             continue  # já está no/abaixo do piso: não há espaço para desconto
+        diag["passaram_piso"] += 1
         d = _desconto_seguro(cfg_prec, preco, custo, teto, piso)
         if d <= 0:
             continue
+        diag["com_desconto_seguro"] += 1
         preco_promo = round(preco * (1 - d / 100.0), 2)
         out.append({
             "item_id": str(it.get("item_id")), "nome": it.get("item_name") or sku, "sku": sku,
@@ -180,7 +205,50 @@ def _candidatos(user_id: int, cfg) -> list:
         out.sort(key=lambda x: x["margem_promo"], reverse=True)
     else:
         out.sort(key=lambda x: x["estoque"], reverse=True)
-    return out[: cfg.max_produtos or 20]
+    out = out[: cfg.max_produtos or 20]
+    diag["elegiveis"] = len(out)
+    return out, diag
+
+
+def _candidatos(user_id: int, cfg) -> list:
+    out, _ = _funil(user_id, cfg)
+    return out
+
+
+def _motivo_funil(diag: dict, cfg) -> str:
+    """Traduz o diagnóstico do funil em uma explicação acionável (a causa mais provável)."""
+    piso = float(cfg.piso_margem if cfg.piso_margem is not None else 10.0)
+    est_min = max(1, cfg.estoque_minimo or 0)
+    if diag["catalogo_skus"] == 0:
+        return ("Seu catálogo não está sincronizado (0 produtos no cache). "
+                "Sincronize o catálogo do Bling primeiro — as promoções leem custo, preço e estoque de lá.")
+    if diag["shopee_itens"] == 0:
+        return ("Não consegui listar seus anúncios da Shopee (0 itens). "
+                "Verifique se a loja Shopee está conectada e tente reconectar.")
+    if diag["sku_casado"] == 0:
+        extra = (f" {diag['anuncios_sem_sku']} dos seus anúncios da Shopee estão sem SKU preenchido."
+                 if diag["anuncios_sem_sku"] else "")
+        return ("Nenhum anúncio da Shopee bateu com um SKU do seu catálogo." + extra +
+                " Garanta que o SKU cadastrado no anúncio da Shopee é igual ao SKU do produto no catálogo.")
+    if not diag["canal_shopee_configurado"]:
+        return ("O canal Shopee não está configurado na Precificação (sem faixas de comissão), "
+                "então a margem de cada produto não pôde ser calculada. "
+                "Vá em Precificação → canais e configure a Shopee (comissão %, taxas). "
+                "Sem isso, o motor não tem como garantir o piso de margem.")
+    if diag["passaram_estoque"] == 0:
+        return (f"Todos os produtos que casaram estão abaixo do estoque mínimo ({est_min}). "
+                "Baixe o 'estoque mínimo' nas regras ou reponha estoque.")
+    if diag["margem_calculavel"] == 0:
+        return ("Não consegui calcular a margem de nenhum produto — confira as faixas de preço do "
+                "canal Shopee na Precificação (o preço dos seus produtos precisa cair em alguma faixa).")
+    if diag["passaram_piso"] == 0:
+        return (f"Todos os produtos já estão no ou abaixo do piso de margem ({piso:.0f}%) no preço cheio — "
+                "não há espaço para desconto. Reduza o piso de margem ou revise custos/preços.")
+    if diag["com_desconto_seguro"] == 0:
+        return (f"Há margem acima do piso, mas não cabe nem 1% de desconto mantendo o piso de {piso:.0f}%. "
+                "Aumente o 'desconto máximo' ou reduza um pouco o piso de margem.")
+    return ("Nenhum produto elegível dentro das regras. Revise estoque mínimo, piso de margem e "
+            "desconto máximo.")
 
 
 def propor(user_id: int) -> dict:
@@ -191,12 +259,12 @@ def propor(user_id: int) -> dict:
         snap = _serializar(cfg)
     finally:
         db.close()
-    propostas = _candidatos(user_id, _ConfigView(snap))
+    cfgv = _ConfigView(snap)
+    propostas, diag = _funil(user_id, cfgv)
     if not propostas:
-        return {"acao": "vazio", "propostas": [],
-                "msg": "Nenhum produto elegível dentro das regras (estoque, piso de margem). "
-                       "Confira se o catálogo está sincronizado e o piso de margem não está alto demais."}
-    return {"acao": "ok", "propostas": propostas, "config": snap}
+        return {"acao": "vazio", "propostas": [], "diagnostico": diag,
+                "msg": _motivo_funil(diag, cfgv)}
+    return {"acao": "ok", "propostas": propostas, "config": snap, "diagnostico": diag}
 
 
 class _ConfigView:

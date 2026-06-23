@@ -662,13 +662,14 @@ def shopee_review_sugerir(payload: dict = Body(...), user: User = Depends(auth.g
 
 
 @app.post("/api/shopee/avaliacoes/auto_responder")
-def shopee_review_auto(user: User = Depends(auth.get_current_user)):
-    """Roda o modo automático agora: responde as avaliações sem resposta cujas notas
-    estão configuradas em auto_estrelas (as demais ficam para revisão manual)."""
-    try:
-        return shopee_reviews.auto_responder(user.id)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(e))
+def shopee_review_auto(background_tasks: BackgroundTasks, user: User = Depends(auth.get_current_user)):
+    """Dispara o modo automático agora, em SEGUNDO PLANO: responde as avaliações sem
+    resposta cujas notas estão em auto_estrelas, com pausa entre cada uma (anti-flood na
+    API da Shopee). Roda fora da requisição para não estourar o timeout do gateway."""
+    background_tasks.add_task(shopee_reviews.auto_responder, user.id)
+    return {"acao": "iniciado",
+            "mensagem": "O agente começou a responder em segundo plano, com pausa entre as respostas. "
+                        "Atualize a lista em instantes para ver as respostas aparecendo."}
 
 
 # ----------------------- Motor de promoções automáticas ------------------- #

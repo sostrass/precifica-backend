@@ -277,6 +277,8 @@ class ShopeeReviewConfig(Base):
     usar_nome = Column(Boolean, default=True)          # citar o nome do comprador
     usar_emoji = Column(Boolean, default=True)         # permitir emojis leves
     auto_estrelas = Column(JSON, default=lambda: [4, 5])  # quais notas o agente responde sozinho
+    auto_pausa_seg = Column(Integer, default=5)        # pausa entre respostas (anti-flood na API)
+    auto_max_ciclo = Column(Integer, default=10)       # máx. de respostas por ciclo do agendador
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
 

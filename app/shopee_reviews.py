@@ -7,6 +7,8 @@ Dois modos:
 """
 from __future__ import annotations
 
+import time
+
 from . import ai, shopee
 from .db import SessionLocal
 from .models import ShopeeReviewConfig
@@ -43,6 +45,8 @@ def _serializar(c: ShopeeReviewConfig) -> dict:
         "usar_nome": bool(c.usar_nome),
         "usar_emoji": bool(c.usar_emoji),
         "auto_estrelas": list(c.auto_estrelas or [4, 5]),
+        "auto_pausa_seg": c.auto_pausa_seg if c.auto_pausa_seg is not None else 5,
+        "auto_max_ciclo": c.auto_max_ciclo if c.auto_max_ciclo is not None else 10,
     }
 
 
@@ -81,6 +85,16 @@ def salvar_config(user_id: int, payload: dict) -> dict:
             try:
                 est = sorted({int(x) for x in payload["auto_estrelas"] if 1 <= int(x) <= 5})
                 c.auto_estrelas = est or [4, 5]
+            except Exception:  # noqa: BLE001
+                pass
+        if "auto_pausa_seg" in payload:
+            try:
+                c.auto_pausa_seg = max(0, min(int(payload["auto_pausa_seg"]), 60))
+            except Exception:  # noqa: BLE001
+                pass
+        if "auto_max_ciclo" in payload:
+            try:
+                c.auto_max_ciclo = max(1, min(int(payload["auto_max_ciclo"]), 50))
             except Exception:  # noqa: BLE001
                 pass
         c.atualizado_em = datetime.utcnow()
@@ -170,6 +184,8 @@ def auto_responder(user_id: int, limite: int = 50) -> dict:
         cfg = _config(db, user_id)
         modo = cfg.modo
         alvos = set(cfg.auto_estrelas or [4, 5])
+        pausa = max(int(cfg.auto_pausa_seg or 5), 0)      # segundos entre respostas (anti-flood)
+        max_ciclo = max(int(cfg.auto_max_ciclo or 10), 1)  # teto de respostas por ciclo
         cfg_snap = ShopeeReviewConfig(
             modo=cfg.modo, tom=cfg.tom, limite_chars=cfg.limite_chars,
             assinatura=cfg.assinatura, saudacao=cfg.saudacao, instrucoes=cfg.instrucoes,
@@ -186,7 +202,8 @@ def auto_responder(user_id: int, limite: int = 50) -> dict:
         return {"acao": "erro", "erro": str(e), "respondidos": 0}
 
     comentarios = (r.get("response") or {}).get("item_comment_list") or []
-    respondidos, ignorados = 0, 0
+    respondidos, ignorados, falhas = 0, 0, 0
+    atingiu_teto = False
     for c in comentarios:
         if (c.get("comment_reply") or {}).get("reply"):
             continue
@@ -194,6 +211,9 @@ def auto_responder(user_id: int, limite: int = 50) -> dict:
         if nota not in alvos:
             ignorados += 1
             continue
+        if respondidos >= max_ciclo:        # respeita o teto do ciclo; o resto fica pro próximo
+            atingiu_teto = True
+            break
         prompt = montar_prompt(cfg_snap, nota, c.get("comment"),
                                None, c.get("buyer_username"), None)
         try:
@@ -202,7 +222,11 @@ def auto_responder(user_id: int, limite: int = 50) -> dict:
                 continue
             shopee.responder_avaliacao(user_id, c.get("comment_id"), texto)
             respondidos += 1
+            if pausa:                       # espaça as chamadas pra não floodar a API da Shopee
+                time.sleep(pausa)
         except Exception:  # noqa: BLE001 — um erro num comentário não derruba o lote
+            falhas += 1
             continue
     return {"acao": "auto", "respondidos": respondidos,
-            "ignorados_para_revisao": ignorados, "vistos": len(comentarios)}
+            "ignorados_para_revisao": ignorados, "vistos": len(comentarios),
+            "falhas": falhas, "restantes_proximo_ciclo": atingiu_teto}

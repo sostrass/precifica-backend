@@ -51,6 +51,10 @@ def garantir_colunas_extras():
         "shopee_promo_config": [
             ("base_comparacao", "VARCHAR DEFAULT 'dia'"),
         ],
+        "shopee_review_config": [
+            ("auto_pausa_seg", "INTEGER DEFAULT 5"),
+            ("auto_max_ciclo", "INTEGER DEFAULT 10"),
+        ],
         "shopee_venda_snapshot": [
             ("pedidos_6h", "INTEGER DEFAULT 0"),
             ("bucket", "INTEGER DEFAULT 0"),
