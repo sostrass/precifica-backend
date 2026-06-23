@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, webhooks
@@ -41,6 +42,25 @@ async def _agendador_boost():
             pass
 
 
+async def _agendador_catalogo():
+    """Rede de segurança: re-sincroniza o catálogo de quem já sincronizou ao menos uma vez,
+    a cada N horas (além do webhook, caso algum evento tenha se perdido)."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(max(settings.catalogo_resync_horas, 1) * 3600)
+        try:
+            from .models import CatalogoSync
+            db = SessionLocal()
+            try:
+                usuarios = [c.user_id for c in db.query(CatalogoSync).all()]
+            finally:
+                db.close()
+            for uid in usuarios:
+                await loop.run_in_executor(None, catalogo.sincronizar_tudo, uid)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
@@ -55,10 +75,13 @@ async def lifespan(app: FastAPI):
         pass
     tarefa = asyncio.create_task(_agendador_radar()) if settings.radar_intervalo_horas > 0 else None
     tarefa_boost = asyncio.create_task(_agendador_boost())
+    tarefa_cat = asyncio.create_task(_agendador_catalogo()) if settings.catalogo_resync_horas > 0 else None
     yield
     if tarefa:
         tarefa.cancel()
     tarefa_boost.cancel()
+    if tarefa_cat:
+        tarefa_cat.cancel()
 
 
 app = FastAPI(title="BlingAI Manager — Backend", version="0.2.0", lifespan=lifespan)
@@ -262,6 +285,56 @@ def shopee_renovar(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _shopee_redirect_base(request: Request) -> str:
+    """URL pública do backend para o Shopee redirecionar de volta após o login."""
+    if settings.shopee_redirect_base:
+        return settings.shopee_redirect_base.rstrip("/")
+    base = str(request.base_url).rstrip("/")
+    return base.replace("http://", "https://") if "localhost" not in base and "127.0.0.1" not in base else base
+
+
+@app.get("/api/shopee/auth/login")
+def shopee_auth_login(request: Request, user: User = Depends(auth.get_current_user)):
+    """Devolve a URL de autorização da Shopee. O front abre num popup; ao autorizar,
+    a Shopee redireciona para /api/shopee/auth/callback com o code, e a gente troca por token."""
+    if not shopee.app_configurado():
+        raise HTTPException(status_code=400, detail="App Shopee não configurado (PARTNER_ID/PARTNER_KEY).")
+    state = shopee.state_token(user.id)
+    redirect = f"{_shopee_redirect_base(request)}/api/shopee/auth/callback/{state}"
+    return {"url": shopee.url_autorizacao(redirect)}
+
+
+_HTML_OK = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Shopee conectada</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem;background:#0b0b0f;color:#eee">
+<div style="font-size:48px">✅</div>
+<h2 style="color:#34C759">Loja Shopee conectada!</h2>
+<p style="color:#aaa">Pode fechar esta janela e voltar ao Precifica AI.</p>
+<script>try{if(window.opener){window.opener.postMessage('shopee_auth_ok','*');}}catch(e){}setTimeout(function(){window.close();},1500);</script>
+</body></html>"""
+
+_HTML_ERR = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Erro</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem;background:#0b0b0f;color:#eee">
+<div style="font-size:48px">⚠️</div><h2 style="color:#ff5a52">Não foi possível conectar</h2>
+<p style="color:#aaa">{msg}</p>
+<script>try{{if(window.opener){{window.opener.postMessage('shopee_auth_err','*');}}}}catch(e){{}}</script>
+</body></html>"""
+
+
+@app.get("/api/shopee/auth/callback/{state}")
+def shopee_auth_callback(state: str, code: str = "", shop_id: str = ""):
+    """Callback do OAuth da Shopee (aberto pelo redirect). Troca o code por token e salva."""
+    uid = shopee.ler_state(state)
+    if not uid:
+        return HTMLResponse(_HTML_ERR.format(msg="Sessão de conexão expirada. Tente novamente."), status_code=400)
+    if not code:
+        return HTMLResponse(_HTML_ERR.format(msg="Autorização não recebida da Shopee."), status_code=400)
+    try:
+        shopee.trocar_code_por_token(uid, code, shop_id)
+        return HTMLResponse(_HTML_OK)
+    except shopee.ShopeeError as e:
+        return HTMLResponse(_HTML_ERR.format(msg=str(e)), status_code=400)
+
+
 @app.get("/api/shopee/produtos")
 def shopee_produtos(offset: int = 0, limite: int = 50, user: User = Depends(auth.get_current_user)):
     try:
@@ -424,6 +497,228 @@ def shopee_repasse(order_sn: str, user: User = Depends(auth.get_current_user)):
     """Escrow: valor líquido real recebido (preço − comissão − taxas)."""
     try:
         return shopee.repasse_pedido(user.id, order_sn)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Promoções: descontos ----
+@app.get("/api/shopee/descontos")
+def shopee_descontos(status: str = "ongoing", user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_descontos(user.id, status=status)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/descontos")
+def shopee_criar_desconto(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Body: {nome, inicio (epoch), fim (epoch), itens:[{item_id, promotion_price, ...}]}."""
+    try:
+        return shopee.criar_desconto(user.id, payload["nome"], int(payload["inicio"]),
+                                     int(payload["fim"]), payload.get("itens", []))
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Informe nome, inicio, fim e itens.")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/shopee/descontos/{discount_id}")
+def shopee_encerrar_desconto(discount_id: str, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.encerrar_desconto(user.id, discount_id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Promoções: cupons ----
+@app.get("/api/shopee/cupons")
+def shopee_cupons(status: str = "ongoing", user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_cupons(user.id, status=status)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/cupons")
+def shopee_criar_cupom(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Body: {nome, codigo, inicio, fim, tipo_desconto(1=valor,2=%), valor, compra_minima, quantidade, escopo?}."""
+    try:
+        return shopee.criar_cupom(user.id, payload["nome"], payload["codigo"],
+                                  int(payload["inicio"]), int(payload["fim"]),
+                                  int(payload["tipo_desconto"]), float(payload["valor"]),
+                                  float(payload.get("compra_minima", 0)),
+                                  int(payload["quantidade"]), int(payload.get("escopo", 1)))
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Faltam campos do cupom.")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/shopee/cupons/{voucher_id}")
+def shopee_encerrar_cupom(voucher_id: str, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.encerrar_cupom(user.id, voucher_id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Shopee Ads ----
+@app.get("/api/shopee/ads")
+def shopee_ads(dias: int = 7, user: User = Depends(auth.get_current_user)):
+    out = {}
+    try:
+        out["saldo"] = shopee.ads_saldo(user.id)
+    except shopee.ShopeeError as e:
+        out["saldo_erro"] = str(e)
+    try:
+        out["desempenho"] = shopee.ads_desempenho(user.id, dias=dias)
+    except shopee.ShopeeError as e:
+        out["desempenho_erro"] = str(e)
+    return out
+
+
+# ---- Q&A do anúncio ----
+@app.get("/api/shopee/perguntas")
+def shopee_perguntas(status: str = "UNANSWERED", user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_perguntas(user.id, status=status)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/perguntas/responder")
+def shopee_responder_pergunta(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Responde uma pergunta do anúncio. {qa_id, texto, ia?, pergunta?}."""
+    qid = payload.get("qa_id"); texto = payload.get("texto")
+    if payload.get("ia") and not texto:
+        prompt = ("Você é o vendedor respondendo a uma pergunta no anúncio (armarinho, Shopee Brasil). "
+                  "Seja claro, cordial e direto, em português do Brasil. "
+                  f"Pergunta do cliente: \"{payload.get('pergunta', '')}\". Responda SÓ com a resposta.")
+        try:
+            texto = ai._gerar_texto(user.id, prompt)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"IA falhou: {e}")
+    if not qid or not texto:
+        raise HTTPException(status_code=422, detail="Informe qa_id e texto (ou ia=true).")
+    try:
+        shopee.responder_pergunta(user.id, qid, texto)
+        return {"ok": True, "texto": texto}
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Devoluções ----
+@app.get("/api/shopee/devolucoes")
+def shopee_devolucoes(dias: int = 30, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_devolucoes(user.id, dias=dias)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Divergência Bling × Shopee ----
+@app.get("/api/shopee/divergencia")
+def shopee_divergencia(user: User = Depends(auth.get_current_user)):
+    """Cruza preço do anúncio Shopee × preço registrado no Bling (cache), por SKU."""
+    try:
+        return shopee.divergencia_bling_shopee(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Bundle Deal ----
+@app.get("/api/shopee/bundles")
+def shopee_bundles(status: str = "ongoing", user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_bundles(user.id, status=status)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/bundles")
+def shopee_criar_bundle(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Body: {nome, inicio, fim, rule_type(1=preço fixo,2=%,3=valor), valor, min_itens, item_ids:[]}."""
+    try:
+        return shopee.criar_bundle(user.id, payload["nome"], int(payload["inicio"]),
+                                   int(payload["fim"]), int(payload["rule_type"]),
+                                   float(payload["valor"]), int(payload.get("min_itens", 2)),
+                                   payload.get("item_ids", []))
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Faltam campos do bundle.")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/shopee/bundles/{bundle_id}")
+def shopee_encerrar_bundle(bundle_id: str, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.encerrar_bundle(user.id, bundle_id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Add-on Deal ----
+@app.get("/api/shopee/addons")
+def shopee_addons(status: str = "ongoing", user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_addons(user.id, status=status)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/addons")
+def shopee_criar_addon(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Body: {nome, inicio, fim, principais:[item_id], adicionais:[{item_id, add_on_deal_price}]}."""
+    try:
+        return shopee.criar_addon(user.id, payload["nome"], int(payload["inicio"]),
+                                  int(payload["fim"]), payload.get("principais", []),
+                                  payload.get("adicionais", []), int(payload.get("promotion_type", 0)))
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Faltam campos do add-on.")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/shopee/addons/{addon_id}")
+def shopee_encerrar_addon(addon_id: str, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.encerrar_addon(user.id, addon_id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Flash Sale ----
+@app.get("/api/shopee/flash/slots")
+def shopee_flash_slots(dias: int = 7, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.flash_slots(user.id, dias=min(max(dias, 1), 30))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/flash")
+def shopee_flash(tipo: int = 1, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_flash(user.id, tipo=tipo)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/flash")
+def shopee_criar_flash(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Body: {timeslot_id, itens:[{item_id, purchase_limit, models:[...]}]}."""
+    try:
+        return shopee.criar_flash(user.id, int(payload["timeslot_id"]), payload.get("itens", []))
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Informe timeslot_id e itens.")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/shopee/flash/{flash_id}")
+def shopee_encerrar_flash(flash_id: str, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.encerrar_flash(user.id, flash_id)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

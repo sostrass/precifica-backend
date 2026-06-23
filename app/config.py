@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # Radar — varredura automática em segundo plano (horas; 0 = desligado)
     radar_intervalo_horas: int = 6
 
+    # Re-sincronização periódica do catálogo (rede de segurança além do webhook; horas, 0 = off)
+    catalogo_resync_horas: int = 24
+
     # Shopee Open Platform (credenciais do app + loja)
     shopee_partner_id: str = ""
     shopee_partner_key: str = ""
@@ -34,6 +37,7 @@ class Settings(BaseSettings):
     shopee_access_token: str = ""
     shopee_refresh_token: str = ""
     shopee_base_url: str = "https://partner.shopeemobile.com"
+    shopee_redirect_base: str = ""  # URL pública do backend p/ o callback OAuth (ex.: https://meu-backend.up.railway.app)
 
 
 settings = Settings()
