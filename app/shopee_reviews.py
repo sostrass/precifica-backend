@@ -7,11 +7,105 @@ Dois modos:
 """
 from __future__ import annotations
 
+import threading
 import time
+from datetime import datetime
 
 from . import ai, shopee
 from .db import SessionLocal
-from .models import ShopeeReviewConfig
+from .models import ShopeeReviewConfig, ShopeeReviewLog
+
+# Estado vivo do agente, em memória (por usuário) — alimenta o painel "Agente em ação".
+# O disparo roda no mesmo processo (BackgroundTasks/agendador), então o painel lê isto via /atividade.
+_PROGRESSO: dict[int, dict] = {}
+_CONTAGEM: dict[int, dict] = {}   # cache de contagem (caro: pagina a Shopee)
+_CONTANDO: set[int] = set()       # usuários com contagem em andamento
+_LOCK = threading.Lock()
+
+
+def _prog(user_id: int) -> dict:
+    return _PROGRESSO.get(user_id) or {"em_andamento": False, "processados": 0, "alvo": 0,
+                                        "inicio": None, "fim": None, "ultimo": None}
+
+
+def _set_prog(user_id: int, **campos):
+    with _LOCK:
+        cur = dict(_prog(user_id))
+        cur.update(campos)
+        _PROGRESSO[user_id] = cur
+
+
+def _registrar_log(user_id: int, comment_id, nota, buyer, produto, texto, modo="auto"):
+    db = SessionLocal()
+    try:
+        db.add(ShopeeReviewLog(user_id=user_id, comment_id=str(comment_id or ""), nota=int(nota or 0),
+                               buyer=(buyer or "")[:80], produto=(produto or "")[:120],
+                               trecho=(texto or "")[:140], modo=modo))
+        db.commit()
+    except Exception:  # noqa: BLE001 — log nunca derruba o fluxo
+        db.rollback()
+    finally:
+        db.close()
+
+
+def historico_log(user_id: int, limite: int = 20) -> list:
+    db = SessionLocal()
+    try:
+        rows = (db.query(ShopeeReviewLog).filter_by(user_id=user_id)
+                .order_by(ShopeeReviewLog.criado_em.desc()).limit(limite).all())
+        return [{"comment_id": r.comment_id, "nota": r.nota, "buyer": r.buyer,
+                 "produto": r.produto, "trecho": r.trecho, "modo": r.modo,
+                 "quando": r.criado_em.isoformat() if r.criado_em else None} for r in rows]
+    finally:
+        db.close()
+
+
+def contar_avaliacoes(user_id: int, max_paginas: int = 60, forcar: bool = False) -> dict:
+    """Conta respondidas x pendentes paginando a Shopee (caro). Cacheia por ~10 min.
+    parcial=True se bateu o teto de páginas (loja com muitas avaliações)."""
+    cache = _CONTAGEM.get(user_id)
+    if cache and not forcar:
+        idade = (datetime.utcnow() - cache["_ts"]).total_seconds()
+        if idade < 600:
+            return {k: v for k, v in cache.items() if k != "_ts"}
+
+    respondidas, pendentes, total = 0, 0, 0
+    cursor, parcial = "", False
+    _CONTANDO.add(user_id)
+    try:
+        for i in range(max_paginas):
+            try:
+                r = shopee.listar_avaliacoes(user_id, cursor=cursor, limite=100, status="ALL")
+            except shopee.ShopeeError:
+                break
+            resp = r.get("response") or {}
+            lst = resp.get("item_comment_list") or []
+            for c in lst:
+                total += 1
+                if (c.get("comment_reply") or {}).get("reply"):
+                    respondidas += 1
+                else:
+                    pendentes += 1
+            cursor = resp.get("next_cursor") or ""
+            if not resp.get("more") or not cursor:
+                break
+            if i == max_paginas - 1:
+                parcial = True
+            time.sleep(0.15)  # respiro entre páginas
+    finally:
+        _CONTANDO.discard(user_id)
+
+    out = {"total": total, "respondidas": respondidas, "pendentes": pendentes, "parcial": parcial}
+    _CONTAGEM[user_id] = {**out, "_ts": datetime.utcnow()}
+    return out
+
+
+def atividade(user_id: int) -> dict:
+    """Tudo que o painel precisa: progresso vivo + feed das últimas respostas + contagem (cacheada)."""
+    cache = _CONTAGEM.get(user_id)
+    contagem = ({k: v for k, v in cache.items() if k != "_ts"} if cache else None)
+    return {"progresso": _prog(user_id), "log": historico_log(user_id, 15),
+            "contagem": contagem, "contando": user_id in _CONTANDO}
 
 TONS = {
     "caloroso": "caloroso, afetuoso e genuíno, como quem gosta de verdade de atender bem",
@@ -94,7 +188,7 @@ def salvar_config(user_id: int, payload: dict) -> dict:
                 pass
         if "auto_max_ciclo" in payload:
             try:
-                c.auto_max_ciclo = max(1, min(int(payload["auto_max_ciclo"]), 50))
+                c.auto_max_ciclo = max(1, min(int(payload["auto_max_ciclo"]), 100))
             except Exception:  # noqa: BLE001
                 pass
         c.atualizado_em = datetime.utcnow()
@@ -176,9 +270,113 @@ def enviar(user_id: int, comment_id, texto: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Mutirão — responde a fila INTEIRA de pendentes (notas-alvo), com pausa e progresso
+# --------------------------------------------------------------------------- #
+_PARAR: set[int] = set()   # usuários que pediram para interromper o agente
+
+
+def parar_agente(user_id: int) -> dict:
+    """Pede para o agente interromper o mutirão em andamento (no próximo item)."""
+    _PARAR.add(user_id)
+    return {"acao": "parando"}
+
+
+def iniciar_mutirao(user_id: int) -> dict:
+    """Dispara o agente para responder TODA a fila pendente (notas-alvo), em uma thread
+    de fundo, com pausa entre cada resposta e progresso ao vivo. Não bloqueia a requisição."""
+    if _prog(user_id).get("em_andamento"):
+        return {"acao": "ja_rodando", "msg": "O agente já está respondendo agora."}
+    _PARAR.discard(user_id)
+    _set_prog(user_id, em_andamento=True, fase="descobrindo", processados=0, alvo=0,
+              inicio=datetime.utcnow().isoformat(), fim=None, ultimo=None)
+    t = threading.Thread(target=_rodar_mutirao, args=(user_id,), daemon=True)
+    t.start()
+    return {"acao": "iniciado",
+            "mensagem": "O agente começou a responder a fila inteira em segundo plano, "
+                        "com pausa entre cada resposta. Acompanhe o progresso aqui."}
+
+
+def _rodar_mutirao(user_id: int):
+    """Fase 1: descobre todos os pendentes-alvo paginando a Shopee (rápido).
+    Fase 2: responde um por um, com pausa, atualizando o progresso. Respeita 'parar'."""
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        alvos = set(cfg.auto_estrelas or [4, 5])
+        pausa = max(int(cfg.auto_pausa_seg if cfg.auto_pausa_seg is not None else 5), 0)
+        cfg_snap = ShopeeReviewConfig(
+            modo=cfg.modo, tom=cfg.tom, limite_chars=cfg.limite_chars,
+            assinatura=cfg.assinatura, saudacao=cfg.saudacao, instrucoes=cfg.instrucoes,
+            oferecer_chat=cfg.oferecer_chat, usar_nome=cfg.usar_nome, usar_emoji=cfg.usar_emoji,
+        )
+    finally:
+        db.close()
+
+    pendentes, respondidos, falhas = [], 0, 0
+    try:
+        # FASE 1 — descobrir a fila completa (paginação por cursor)
+        cursor = ""
+        for _ in range(400):  # teto de segurança: 400 páginas (40k avaliações)
+            if user_id in _PARAR:
+                break
+            try:
+                r = shopee.listar_avaliacoes(user_id, cursor=cursor, limite=100, status="UNANSWERED")
+            except shopee.ShopeeError:
+                break
+            resp = r.get("response") or {}
+            for c in resp.get("item_comment_list") or []:
+                if (c.get("comment_reply") or {}).get("reply"):
+                    continue
+                if c.get("rating_star") in alvos:
+                    pendentes.append(c)
+            _set_prog(user_id, fase="descobrindo", alvo=len(pendentes))
+            cursor = resp.get("next_cursor") or ""
+            if not resp.get("more") or not cursor:
+                break
+            time.sleep(0.15)
+
+        _set_prog(user_id, fase="respondendo", alvo=len(pendentes), processados=0)
+
+        # FASE 2 — responder cada um, espaçado
+        for c in pendentes:
+            if user_id in _PARAR:
+                break
+            nota = c.get("rating_star")
+            buyer = c.get("buyer_username")
+            produto = c.get("produto_nome") or ""
+            prompt = montar_prompt(cfg_snap, nota, c.get("comment"), produto or None, buyer, None)
+            try:
+                texto = (ai._gerar_texto(user_id, prompt) or "").strip().strip('"')
+                if not texto:
+                    continue
+                shopee.responder_avaliacao(user_id, c.get("comment_id"), texto)
+                respondidos += 1
+                _registrar_log(user_id, c.get("comment_id"), nota, buyer, produto, texto, "auto")
+                _set_prog(user_id, processados=respondidos,
+                          ultimo={"nota": nota, "buyer": buyer, "produto": produto,
+                                  "quando": datetime.utcnow().isoformat()})
+                cache = _CONTAGEM.get(user_id)
+                if cache:
+                    cache["respondidas"] = cache.get("respondidas", 0) + 1
+                    cache["pendentes"] = max(0, cache.get("pendentes", 0) - 1)
+                if pausa:
+                    time.sleep(pausa)
+            except Exception:  # noqa: BLE001 — um erro não derruba o mutirão
+                falhas += 1
+                continue
+    finally:
+        interrompido = user_id in _PARAR
+        _PARAR.discard(user_id)
+        _set_prog(user_id, em_andamento=False, fase="ocioso",
+                  fim=datetime.utcnow().isoformat(),
+                  resumo={"respondidos": respondidos, "falhas": falhas,
+                          "total_fila": len(pendentes), "interrompido": interrompido})
+
+
+# --------------------------------------------------------------------------- #
 # Modo automático — o agente responde sozinho as notas configuradas
 # --------------------------------------------------------------------------- #
-def auto_responder(user_id: int, limite: int = 50) -> dict:
+def auto_responder(user_id: int, limite: int = 100) -> dict:
     db = SessionLocal()
     try:
         cfg = _config(db, user_id)
@@ -202,31 +400,47 @@ def auto_responder(user_id: int, limite: int = 50) -> dict:
         return {"acao": "erro", "erro": str(e), "respondidos": 0}
 
     comentarios = (r.get("response") or {}).get("item_comment_list") or []
-    respondidos, ignorados, falhas = 0, 0, 0
-    atingiu_teto = False
-    for c in comentarios:
-        if (c.get("comment_reply") or {}).get("reply"):
-            continue
-        nota = c.get("rating_star")
-        if nota not in alvos:
-            ignorados += 1
-            continue
-        if respondidos >= max_ciclo:        # respeita o teto do ciclo; o resto fica pro próximo
-            atingiu_teto = True
-            break
-        prompt = montar_prompt(cfg_snap, nota, c.get("comment"),
-                               None, c.get("buyer_username"), None)
-        try:
-            texto = (ai._gerar_texto(user_id, prompt) or "").strip().strip('"')
-            if not texto:
+    # fila real deste ciclo: sem resposta, nota dentro do alvo, respeitando o teto
+    fila = [c for c in comentarios
+            if not (c.get("comment_reply") or {}).get("reply") and c.get("rating_star") in alvos]
+    alvo = min(len(fila), max_ciclo)
+    ignorados = sum(1 for c in comentarios
+                    if not (c.get("comment_reply") or {}).get("reply") and c.get("rating_star") not in alvos)
+
+    _set_prog(user_id, em_andamento=True, processados=0, alvo=alvo,
+              inicio=datetime.utcnow().isoformat(), fim=None, ultimo=None)
+
+    respondidos, falhas = 0, 0
+    atingiu_teto = len(fila) > max_ciclo
+    try:
+        for c in fila[:max_ciclo]:
+            nota = c.get("rating_star")
+            buyer = c.get("buyer_username")
+            produto = c.get("produto_nome") or ""
+            prompt = montar_prompt(cfg_snap, nota, c.get("comment"), produto or None, buyer, None)
+            try:
+                texto = (ai._gerar_texto(user_id, prompt) or "").strip().strip('"')
+                if not texto:
+                    continue
+                shopee.responder_avaliacao(user_id, c.get("comment_id"), texto)
+                respondidos += 1
+                _registrar_log(user_id, c.get("comment_id"), nota, buyer, produto, texto, "auto")
+                _set_prog(user_id, processados=respondidos,
+                          ultimo={"nota": nota, "buyer": buyer, "produto": produto,
+                                  "quando": datetime.utcnow().isoformat()})
+                if pausa:                   # espaça as chamadas pra não floodar a API da Shopee
+                    time.sleep(pausa)
+            except Exception:  # noqa: BLE001 — um erro num comentário não derruba o lote
+                falhas += 1
                 continue
-            shopee.responder_avaliacao(user_id, c.get("comment_id"), texto)
-            respondidos += 1
-            if pausa:                       # espaça as chamadas pra não floodar a API da Shopee
-                time.sleep(pausa)
-        except Exception:  # noqa: BLE001 — um erro num comentário não derruba o lote
-            falhas += 1
-            continue
+    finally:
+        _set_prog(user_id, em_andamento=False, fim=datetime.utcnow().isoformat())
+        # atualiza a contagem cacheada (desconta o que acabou de responder)
+        cache = _CONTAGEM.get(user_id)
+        if cache and respondidos:
+            cache["respondidas"] = cache.get("respondidas", 0) + respondidos
+            cache["pendentes"] = max(0, cache.get("pendentes", 0) - respondidos)
+
     return {"acao": "auto", "respondidos": respondidos,
             "ignorados_para_revisao": ignorados, "vistos": len(comentarios),
             "falhas": falhas, "restantes_proximo_ciclo": atingiu_teto}

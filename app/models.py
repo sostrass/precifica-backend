@@ -337,3 +337,19 @@ class ShopeePromoLog(Base):
     desconto_pct = Column(Integer, default=0)
     motivo = Column(String)          # agendado | queda | manual
     criado_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ShopeeReviewLog(Base):
+    """Auditoria das respostas de avaliação — alimenta o painel de atividade do agente."""
+
+    __tablename__ = "shopee_review_log"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    comment_id = Column(String, index=True)
+    nota = Column(Integer, default=0)
+    buyer = Column(String, default="")
+    produto = Column(String, default="")
+    trecho = Column(String, default="")        # começo da resposta enviada
+    modo = Column(String, default="auto")      # auto | manual
+    criado_em = Column(DateTime, default=datetime.utcnow, index=True)

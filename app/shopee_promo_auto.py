@@ -422,6 +422,32 @@ def detectar_queda(user_id: int, limiar: int | None = None) -> dict:
 # --------------------------------------------------------------------------- #
 # Ciclo automático (chamado pelo agendador)
 # --------------------------------------------------------------------------- #
+def aplicar_agora(user_id: int) -> dict:
+    """Roda o agente AGORA, aplicando de fato (sem aprovação), respeitando todas as
+    travas (piso de margem, estoque). É o que o botão 'Aplicar agora' chama no modo auto."""
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        if not cfg.ativo:
+            return {"acao": "inativo", "msg": "Ligue o motor de promoções (chave 'Ativo') primeiro."}
+        snap = _serializar(cfg)
+    finally:
+        db.close()
+    cfgv = _ConfigView(snap)
+    propostas, diag = _funil(user_id, cfgv)
+    if not propostas:
+        return {"acao": "vazio", "diagnostico": diag, "msg": _motivo_funil(diag, cfgv)}
+    res = aplicar(user_id, propostas, snap["tipo"], "manual")
+    db = SessionLocal()
+    try:
+        c = _config(db, user_id)
+        c.ultimo_ciclo = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+    return {"acao": "aplicado", "propostas": propostas, **res}
+
+
 def auto_ciclo(user_id: int) -> dict:
     db = SessionLocal()
     try:

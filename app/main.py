@@ -127,10 +127,10 @@ async def lifespan(app: FastAPI):
     try:
         from .models import (ProdutoSync, ProdutoCache, CatalogoSync,
                              ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
-                             ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog)
+                             ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog)
         for M in (WebhookEvento, ProdutoSync, ProdutoCache, CatalogoSync,
                   ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
-                  ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog):
+                  ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog):
             M.__table__.create(bind=engine, checkfirst=True)
     except Exception:  # noqa: BLE001
         pass
@@ -672,6 +672,34 @@ def shopee_review_auto(background_tasks: BackgroundTasks, user: User = Depends(a
                         "Atualize a lista em instantes para ver as respostas aparecendo."}
 
 
+@app.post("/api/shopee/avaliacoes/mutirao")
+def shopee_review_mutirao(user: User = Depends(auth.get_current_user)):
+    """Responde a fila INTEIRA de pendentes (notas-alvo), em segundo plano, com pausa
+    entre cada resposta e progresso ao vivo (acompanhe em /atividade)."""
+    return shopee_reviews.iniciar_mutirao(user.id)
+
+
+@app.post("/api/shopee/avaliacoes/parar")
+def shopee_review_parar(user: User = Depends(auth.get_current_user)):
+    """Interrompe o mutirão do agente no próximo item."""
+    return shopee_reviews.parar_agente(user.id)
+
+
+@app.get("/api/shopee/avaliacoes/atividade")
+def shopee_review_atividade(user: User = Depends(auth.get_current_user)):
+    """Estado vivo do agente: progresso do lote atual, feed das últimas respostas e contagem."""
+    return shopee_reviews.atividade(user.id)
+
+
+@app.post("/api/shopee/avaliacoes/contar")
+def shopee_review_contar(background_tasks: BackgroundTasks, forcar: int = 1,
+                         user: User = Depends(auth.get_current_user)):
+    """Dispara a contagem (respondidas x pendentes) em segundo plano — pagina a Shopee.
+    forcar=0 usa o cache (~10min) se houver; forcar=1 recalcula. Resultado em /atividade."""
+    background_tasks.add_task(shopee_reviews.contar_avaliacoes, user.id, 60, bool(forcar))
+    return {"acao": "contando", "mensagem": "Contando suas avaliações em segundo plano…"}
+
+
 # ----------------------- Motor de promoções automáticas ------------------- #
 @app.get("/api/shopee/promo/config")
 def shopee_promo_config_get(user: User = Depends(auth.get_current_user)):
@@ -693,6 +721,16 @@ def shopee_promo_propor(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/promo/rodar")
+def shopee_promo_rodar(background_tasks: BackgroundTasks, user: User = Depends(auth.get_current_user)):
+    """Roda o agente AGORA e APLICA as promoções (sem aprovação), em segundo plano.
+    Para o modo automático: o usuário clica e o agente aplica sozinho, dentro das travas."""
+    background_tasks.add_task(shopee_promo_auto.aplicar_agora, user.id)
+    return {"acao": "iniciado",
+            "mensagem": "O agente está montando e aplicando as promoções em segundo plano. "
+                        "Confira o histórico em instantes."}
 
 
 @app.post("/api/shopee/promo/aplicar")
