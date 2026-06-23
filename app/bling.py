@@ -225,6 +225,26 @@ def listar_produtos(user_id: int, pagina: int = 1, limite: int = 100,
     return r.json()
 
 
+def listar_todos_produtos(user_id: int, limite: int = 100, max_paginas: int = 300):
+    """Gera todos os produtos do catálogo, página por página, até esgotar.
+    Yield (pagina, lista_de_produtos) para o chamador gravar incrementalmente."""
+    pagina = 1
+    while pagina <= max_paginas:
+        try:
+            dados = (listar_produtos(user_id, pagina=pagina, limite=limite) or {}).get("data") or []
+        except BlingAuthError:
+            raise
+        except requests.RequestException:
+            break
+        if not dados:
+            break
+        yield pagina, dados
+        if len(dados) < limite:
+            break
+        pagina += 1
+        time.sleep(0.34)  # respeita o rate limit do Bling (~3 req/s)
+
+
 def obter_produto(user_id: int, produto_id: int, id_loja=None) -> dict:
     params = {"idLoja": id_loja} if id_loja else None
     r = _request(user_id, "GET", f"/produtos/{produto_id}", params=params)
@@ -280,6 +300,26 @@ def atualizar_produto(user_id: int, produto_id: int, campos: dict) -> dict:
     r = _request(user_id, "PATCH", f"/produtos/{produto_id}", json=corpo)
     r.raise_for_status()
     return r.json()
+
+
+def atualizar_preco_canal(user_id: int, produto_id: int, id_loja, preco: float) -> dict:
+    """Grava o preço NO CANAL (loja) específico, sem mexer no preço-base.
+    Usa o contexto da loja (idLoja) — o mesmo mecanismo da leitura por canal.
+    Tenta o endpoint de produto-loja e, em fallback, o PATCH com idLoja."""
+    preco = round(float(preco), 2)
+    # 1) endpoint dedicado de produto-loja (quando a conta expõe)
+    try:
+        r = _request(user_id, "PATCH", f"/produtos/lojas/{produto_id}",
+                     params={"idLoja": id_loja}, json={"preco": preco})
+        if r.status_code < 400:
+            return {"ok": True, "via": "produtos/lojas", "preco": preco}
+    except requests.RequestException:
+        pass
+    # 2) fallback: PATCH do produto no contexto da loja
+    r = _request(user_id, "PATCH", f"/produtos/{produto_id}",
+                 params={"idLoja": id_loja}, json={"preco": preco})
+    r.raise_for_status()
+    return {"ok": True, "via": "produtos?idLoja", "preco": preco}
 
 
 def listar_nfe(user_id: int, pagina: int = 1, limite: int = 100,
@@ -361,7 +401,7 @@ def vinculos_multiloja(user_id: int, produto_id) -> list:
     # fallback por idLoja
     base_preco = _preco_br(raw.get("preco")) if isinstance(raw.get("preco"), str) else float(raw.get("preco") or 0)
     out = []
-    for lj, meta in LOJAS_CONTA.items():
+    for lj, meta in lojas_da_conta(user_id).items():
         try:
             d = (obter_produto(user_id, produto_id, id_loja=lj) or {}).get("data", {}) or {}
         except Exception:
@@ -370,10 +410,47 @@ def vinculos_multiloja(user_id: int, produto_id) -> list:
         if p > 0 and abs(p - base_preco) > 0.001:  # preço próprio do canal
             integ = meta["integracao"]
             out.append({"id_loja": lj, "nome": meta["nome"], "integracao": integ,
-                        "canal": MAPA_INTEGRACAO.get(integ.lower()), "id_anuncio": None,
+                        "canal": MAPA_INTEGRACAO.get(integ.lower()), "id_anuncio": meta.get("id_anuncio"),
                         "preco": p, "preco_promocional": 0.0, "link": None,
                         "ad_status": None, "publicado": True, "ativo": True})
     return out
+
+
+_CACHE_LOJAS = {}  # user_id -> (timestamp, {id_loja: meta})
+
+
+def descobrir_lojas(user_id: int) -> dict:
+    """Tenta listar as lojas/canais da conta pela API pública. Best-effort: testa
+    endpoints candidatos e devolve {id_loja: {nome, integracao}} ou {} se nenhum existir."""
+    for path in ("/canais-de-venda", "/lojas", "/produtos/lojas"):
+        try:
+            r = _request(user_id, "GET", path, params={"limite": 100})
+            if r.status_code >= 400:
+                continue
+            dados = (r.json() or {}).get("data") or []
+            achadas = {}
+            for it in dados if isinstance(dados, list) else []:
+                idl = str(it.get("id") or it.get("idLoja") or "")
+                if not idl:
+                    continue
+                achadas[idl] = {"nome": it.get("nome") or it.get("descricao") or f"Loja {idl}",
+                                "integracao": it.get("tipoIntegracao") or it.get("tipo") or ""}
+            if achadas:
+                return achadas
+        except (requests.RequestException, ValueError):
+            continue
+    return {}
+
+
+def lojas_da_conta(user_id: int) -> dict:
+    """Lojas da conta para leitura por canal: descobertas (cache 1h) ou as conhecidas."""
+    import time as _t
+    c = _CACHE_LOJAS.get(user_id)
+    if c and _t.time() - c[0] < 3600:
+        return c[1] or LOJAS_CONTA
+    achadas = descobrir_lojas(user_id)
+    _CACHE_LOJAS[user_id] = (_t.time(), achadas)
+    return achadas or LOJAS_CONTA
 
 
 def listar_tabelas_precos(user_id: int) -> dict:

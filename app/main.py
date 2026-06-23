@@ -1,11 +1,11 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine
 from .models import NfeConfig, User, WebhookEvento
@@ -22,18 +22,43 @@ async def _agendador_radar():
             pass
 
 
+async def _agendador_boost():
+    """Laço do auto-boost da Shopee: a cada 10min checa quem tem vaga e impulsiona
+    os próximos da fila (reimpulsiona quando os 4h de um lote acabam)."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(600)  # 10 minutos
+        try:
+            from .models import ShopeeBoostConfig
+            db = SessionLocal()
+            try:
+                ativos = [c.user_id for c in db.query(ShopeeBoostConfig).filter_by(ativo=True).all()]
+            finally:
+                db.close()
+            for uid in ativos:
+                await loop.run_in_executor(None, shopee_boost.ciclo, uid)
+        except Exception:  # noqa: BLE001 — nunca derruba o app
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
-    # garante a tabela de eventos de webhook (aditivo, não mexe nas existentes)
+    # garante tabelas aditivas — não mexe nas existentes
     try:
-        WebhookEvento.__table__.create(bind=engine, checkfirst=True)
+        from .models import (ProdutoSync, ProdutoCache, CatalogoSync,
+                             ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig)
+        for M in (WebhookEvento, ProdutoSync, ProdutoCache, CatalogoSync,
+                  ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig):
+            M.__table__.create(bind=engine, checkfirst=True)
     except Exception:  # noqa: BLE001
         pass
     tarefa = asyncio.create_task(_agendador_radar()) if settings.radar_intervalo_horas > 0 else None
+    tarefa_boost = asyncio.create_task(_agendador_boost())
     yield
     if tarefa:
         tarefa.cancel()
+    tarefa_boost.cancel()
 
 
 app = FastAPI(title="BlingAI Manager — Backend", version="0.2.0", lifespan=lifespan)
@@ -105,13 +130,37 @@ def bling_status(user: User = Depends(auth.get_current_user)):
 
 
 # ------------------------------- Webhooks --------------------------------- #
+def _processar_evento_async(user_id: int, evento_db_id: int):
+    """Processa o evento fora do ciclo da resposta (fila em background)."""
+    db = SessionLocal()
+    try:
+        reg = db.query(WebhookEvento).filter_by(id=evento_db_id).first()
+        if not reg or reg.processado:
+            return
+        data = (reg.payload or {}).get("data") or {}
+        recurso = (reg.recurso or "").lower()
+        webhooks.processar(user_id, reg.recurso, reg.acao, data)
+        # Mantém o cache do catálogo atualizado a partir do push
+        if recurso in ("produto", "produtos") and reg.entidade_id:
+            if (reg.acao or "").lower() in ("deleted", "deletado", "excluido"):
+                catalogo.remover_produto(db, user_id, reg.entidade_id)
+            else:
+                catalogo.atualizar_do_bling(user_id, reg.entidade_id)
+            webhooks.confirmar_sync(db, user_id, reg.entidade_id)
+        reg.processado = True
+        db.commit()
+    except Exception:  # noqa: BLE001 — background nunca quebra o app
+        pass
+    finally:
+        db.close()
+
+
 @app.post("/webhooks/bling/{token}")
-async def receber_webhook(token: str, request: Request):
-    """Recebe os eventos do Bling (push). Responde 200 SEMPRE e rápido — se falhar
-    por 3 dias o Bling desabilita o webhook. Erros internos são engolidos (logados)."""
+async def receber_webhook(token: str, request: Request, background_tasks: BackgroundTasks):
+    """Recebe os eventos do Bling (push). Grava rápido, responde 200 NA HORA e processa
+    em background (fila) — se falhar por 3 dias o Bling desabilita o webhook."""
     user_id = webhooks.verificar_token(token)
     if not user_id:
-        # token inválido: ainda assim 200 para o Bling não desabilitar por engano de rota
         return {"ok": False}
     try:
         corpo = await request.json()
@@ -120,11 +169,9 @@ async def receber_webhook(token: str, request: Request):
     try:
         db = SessionLocal()
         try:
-            reg = webhooks.registrar_evento(db, user_id, corpo)
+            reg = webhooks.registrar_evento(db, user_id, corpo)  # gravação rápida + dedupe
             if reg:
-                webhooks.processar(user_id, reg.recurso, reg.acao, corpo.get("data") or {})
-                reg.processado = True
-                db.commit()
+                background_tasks.add_task(_processar_evento_async, user_id, reg.id)
         finally:
             db.close()
     except Exception:  # noqa: BLE001 — nunca devolve erro ao Bling
@@ -155,6 +202,230 @@ def webhook_eventos(limite: int = 30, user: User = Depends(auth.get_current_user
         } for e in q]}
     finally:
         db.close()
+
+
+# ------------------------------- Catálogo (cache) ------------------------- #
+@app.post("/api/catalogo/sincronizar")
+def catalogo_sincronizar(background_tasks: BackgroundTasks, user: User = Depends(auth.get_current_user)):
+    """Dispara a sincronização COMPLETA do catálogo (puxa tudo do Bling pro cache).
+    Roda em background; acompanhe por /api/catalogo/sync_status."""
+    est = catalogo.status(user.id)
+    if est["status"] == "rodando":
+        return {"ok": True, "ja_rodando": True, **est}
+    background_tasks.add_task(catalogo.sincronizar_tudo, user.id)
+    return {"ok": True, "iniciado": True}
+
+
+@app.get("/api/catalogo/sync_status")
+def catalogo_sync_status(user: User = Depends(auth.get_current_user)):
+    return catalogo.status(user.id)
+
+
+@app.get("/api/catalogo")
+def catalogo_listar(busca: str = "", pagina: int = 1, limite: int = 50, situacao: str = "",
+                    user: User = Depends(auth.get_current_user)):
+    """Lê o catálogo DO CACHE local (rápido, sem martelar o Bling)."""
+    return catalogo.listar(user.id, busca=busca, pagina=pagina, limite=min(limite, 200), situacao=situacao)
+
+
+# -------------------------------- Shopee ---------------------------------- #
+@app.get("/api/shopee/status")
+def shopee_status(user: User = Depends(auth.get_current_user)):
+    """Estado da conexão (app + loja) e validação com os dados da loja."""
+    est = shopee.status_conexao(user.id)
+    if not est.get("loja"):
+        return {"configurada": False, "ok": False, **est}
+    try:
+        info = shopee.info_loja(user.id)
+        return {"configurada": True, "ok": True, "loja": info.get("response") or info, **est}
+    except shopee.ShopeeError as e:
+        return {"configurada": True, "ok": False, "erro": str(e), **est}
+
+
+@app.post("/api/shopee/conectar")
+def shopee_conectar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Salva as credenciais da loja (shop_id + access_token + refresh_token).
+    Use quando você já tem os tokens em mãos (sem passar pelo fluxo de OAuth)."""
+    shop_id = payload.get("shop_id"); at = payload.get("access_token")
+    if not shop_id or not at:
+        raise HTTPException(status_code=422, detail="Informe shop_id e access_token.")
+    shopee.salvar_conta(user.id, shop_id, at, payload.get("refresh_token"),
+                        int(payload.get("expire_in", 14400)))
+    return {"ok": True}
+
+
+@app.post("/api/shopee/renovar")
+def shopee_renovar(user: User = Depends(auth.get_current_user)):
+    try:
+        return {"ok": shopee.renovar_token(user.id)}
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/produtos")
+def shopee_produtos(offset: int = 0, limite: int = 50, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_itens(user.id, offset=offset, limite=limite)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/desempenho")
+def shopee_desempenho(user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.desempenho_loja(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Boost (auto-impulsionamento rotativo) ----
+@app.get("/api/shopee/boost/status")
+def shopee_boost_status(user: User = Depends(auth.get_current_user)):
+    return shopee_boost.status(user.id)
+
+
+@app.put("/api/shopee/boost/config")
+def shopee_boost_config(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    db = SessionLocal()
+    try:
+        from .models import ShopeeBoostConfig
+        c = db.query(ShopeeBoostConfig).filter_by(user_id=user.id).first()
+        if not c:
+            c = ShopeeBoostConfig(user_id=user.id); db.add(c)
+        if "ativo" in payload: c.ativo = bool(payload["ativo"])
+        if "criterio" in payload: c.criterio = payload["criterio"]
+        if "janela_inicio" in payload: c.janela_inicio = int(payload["janela_inicio"])
+        if "janela_fim" in payload: c.janela_fim = int(payload["janela_fim"])
+        if "max_simultaneos" in payload: c.max_simultaneos = min(int(payload["max_simultaneos"]), 5)
+        c.atualizado_em = datetime.utcnow()
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/boost/itens")
+def shopee_boost_add(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Adiciona itens à lista de boost. Body: {itens:[{item_id, nome, fixo?, prioridade?}]}."""
+    db = SessionLocal()
+    try:
+        from .models import ShopeeBoostItem
+        add = payload.get("itens", [])
+        fixos = db.query(ShopeeBoostItem).filter_by(user_id=user.id, fixo=True).count()
+        for it in add[:30]:
+            iid = str(it.get("item_id"))
+            if not iid:
+                continue
+            reg = db.query(ShopeeBoostItem).filter_by(user_id=user.id, item_id=iid).first()
+            if not reg:
+                reg = ShopeeBoostItem(user_id=user.id, item_id=iid); db.add(reg)
+            reg.nome = it.get("nome") or reg.nome
+            if it.get("fixo") and fixos < 5:
+                reg.fixo = True; fixos += 1
+            if "prioridade" in it:
+                reg.prioridade = int(it["prioridade"])
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.delete("/api/shopee/boost/itens/{item_id}")
+def shopee_boost_remove(item_id: str, user: User = Depends(auth.get_current_user)):
+    db = SessionLocal()
+    try:
+        from .models import ShopeeBoostItem
+        db.query(ShopeeBoostItem).filter_by(user_id=user.id, item_id=item_id).delete()
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/boost/itens/{item_id}/fixar")
+def shopee_boost_fixar(item_id: str, payload: dict = Body(default={}),
+                       user: User = Depends(auth.get_current_user)):
+    db = SessionLocal()
+    try:
+        from .models import ShopeeBoostItem
+        reg = db.query(ShopeeBoostItem).filter_by(user_id=user.id, item_id=item_id).first()
+        if not reg:
+            raise HTTPException(status_code=404, detail="Item não está na lista.")
+        fixar = bool(payload.get("fixo", not reg.fixo))
+        if fixar and db.query(ShopeeBoostItem).filter_by(user_id=user.id, fixo=True).count() >= 5:
+            raise HTTPException(status_code=422, detail="Máximo de 5 produtos fixos.")
+        reg.fixo = fixar
+        db.commit()
+        return {"ok": True, "fixo": reg.fixo}
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/boost/rodar")
+def shopee_boost_rodar(user: User = Depends(auth.get_current_user)):
+    """Roda um ciclo de boost agora (manual). O agendador faz isso sozinho."""
+    try:
+        return shopee_boost.ciclo(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Avaliações ----
+@app.get("/api/shopee/avaliacoes")
+def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "",
+                      user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_avaliacoes(user.id, status=status, cursor=cursor)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/avaliacoes/responder")
+def shopee_avaliacoes_responder(payload: dict = Body(...),
+                                user: User = Depends(auth.get_current_user)):
+    """Responde uma avaliação. Body: {comment_id, texto, ia?, nota?, comentario?}.
+    Se ia=true, gera a resposta com IA a partir da nota e do comentário do cliente."""
+    cid = payload.get("comment_id")
+    texto = payload.get("texto")
+    if payload.get("ia") and not texto:
+        nota = payload.get("nota", 5)
+        coment = payload.get("comentario", "")
+        prompt = (
+            "Você é o dono de uma loja de armarinho na Shopee respondendo a uma avaliação. "
+            "Seja cordial, breve, humano e em português do Brasil. "
+            f"Nota: {nota}/5. Comentário do cliente: \"{coment}\". "
+            "Se a nota for alta, agradeça com calor; se for baixa, peça desculpas, mostre que se "
+            "importa e ofereça resolver pelo chat da Shopee. Responda SÓ com o texto da resposta."
+        )
+        try:
+            texto = ai._gerar_texto(user.id, prompt)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"IA falhou: {e}")
+    if not cid or not texto:
+        raise HTTPException(status_code=422, detail="Informe comment_id e texto (ou ia=true).")
+    try:
+        shopee.responder_avaliacao(user.id, cid, texto)
+        return {"ok": True, "texto": texto}
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Pedidos & financeiro ----
+@app.get("/api/shopee/pedidos")
+def shopee_pedidos(dias: int = 7, cursor: str = "", user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee.listar_pedidos(user.id, dias=dias, cursor=cursor)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/pedidos/{order_sn}/repasse")
+def shopee_repasse(order_sn: str, user: User = Depends(auth.get_current_user)):
+    """Escrow: valor líquido real recebido (preço − comissão − taxas)."""
+    try:
+        return shopee.repasse_pedido(user.id, order_sn)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # ------------------------------- Produtos --------------------------------- #
@@ -238,16 +509,42 @@ _MAPA_PRODUTO = {  # nome amigável (front) -> campo da API do Bling
 @app.put("/api/produtos/{produto_id}")
 def atualizar_produto(produto_id: int, payload: dict = Body(...),
                       user: User = Depends(auth.get_current_user)):
-    """Edita campos do produto no Bling (envia só o que veio no corpo)."""
+    """Edita campos do produto no Bling (envia só o que veio no corpo) e registra o envio
+    para o painel de sincronização (enviado -> confirmado quando o webhook voltar)."""
     campos = {_MAPA_PRODUTO[k]: v for k, v in payload.items()
               if k in _MAPA_PRODUTO and v is not None}
     if not campos:
         raise HTTPException(status_code=422, detail="Nenhum campo editável informado.")
+    db = SessionLocal()
     try:
-        bling.atualizar_produto(user.id, produto_id, campos)
-    except bling.BlingAuthError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        try:
+            bling.atualizar_produto(user.id, produto_id, campos)
+        except bling.BlingAuthError as e:
+            raise HTTPException(status_code=401, detail=str(e))
+        sku = payload.get("sku") or payload.get("codigo")
+        webhooks.registrar_envio(db, user.id, produto_id, sku, sorted(payload.keys()))
+    finally:
+        db.close()
     return {"ok": True, "atualizados": sorted(campos.keys())}
+
+
+@app.get("/api/produtos/{produto_id}/status")
+def produto_status(produto_id, user: User = Depends(auth.get_current_user)):
+    """Status de sincronização (enviado/confirmado/pendente) + plataformas vinculadas do produto."""
+    db = SessionLocal()
+    try:
+        sync = webhooks.status_sync(db, user.id, produto_id)
+    finally:
+        db.close()
+    try:
+        vinc = bling.vinculos_multiloja(user.id, produto_id)
+    except Exception:  # noqa: BLE001
+        vinc = []
+    plataformas = [{"nome": v["nome"], "integracao": v.get("integracao"),
+                    "publicado": v.get("publicado"), "ativo": v.get("ativo"),
+                    "id_anuncio": v.get("id_anuncio"), "preco": v.get("preco")} for v in vinc]
+    return {"produto_id": produto_id, "sync": sync, "plataformas": plataformas,
+            "fonte_canais": bool(vinc)}
 
 
 # ---------- Diagnóstico: JSON cru do Bling (p/ construir telas sobre dado real) ----------
@@ -283,10 +580,13 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
     cfg = precificacao.obter_config(user.id)
     precos = {v["canal"]: v["preco"] for v in vinc if v.get("canal") and v["preco"] > 0}
     canais = precificacao.divergencias(cfg, base, precos)
+    alvo_por_canal = {c["canal"]: c.get("preco_alvo") for c in canais}
     vinculos = [{
         "nome": v["nome"], "integracao": v["integracao"], "canal": v.get("canal"),
-        "id_anuncio": v.get("id_anuncio"), "preco_registrado": v["preco"], "link": v.get("link"),
+        "id_loja": v.get("id_loja"), "id_anuncio": v.get("id_anuncio"),
+        "preco_registrado": v["preco"], "link": v.get("link"),
         "publicado": v.get("publicado"), "ativo": v.get("ativo"),
+        "preco_alvo": alvo_por_canal.get(v.get("canal")),
         "prejuizo": bool(v["preco"] > 0 and base > 0 and v["preco"] < base),
     } for v in vinc]
     return {"produto_id": raw.get("id"), "sku": raw.get("codigo"),
@@ -304,6 +604,29 @@ def diagnostico_multiloja(produto_id, lojas: str = "", user: User = Depends(auth
         return bling.probe_multiloja(user.id, produto_id, ids)
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/api/produtos/{produto_id}/preco_canal")
+def aplicar_preco_canal(produto_id, payload: dict = Body(...),
+                        user: User = Depends(auth.get_current_user)):
+    """Grava o preço no canal (marketplace) específico, sem tocar no preço-base.
+    Body: {id_loja, preco}. Registra o envio para o painel de sincronização."""
+    id_loja = payload.get("id_loja")
+    preco = payload.get("preco")
+    if not id_loja or preco in (None, ""):
+        raise HTTPException(status_code=422, detail="Informe id_loja e preco.")
+    try:
+        res = bling.atualizar_preco_canal(user.id, produto_id, id_loja, float(preco))
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Bling recusou a gravação por canal: {e}")
+    db = SessionLocal()
+    try:
+        webhooks.registrar_envio(db, user.id, produto_id, None, [f"preço canal {id_loja}"])
+    finally:
+        db.close()
+    return res
 
 
 @app.get("/api/produtos/{produto_id}/posicionamento")
@@ -457,8 +780,60 @@ def precificar_lote(payload: dict = Body(...), user: User = Depends(auth.get_cur
     return {"canal": canal, "aplicado": aplicar, "itens": resultados}
 
 
-# ------------------------ Monitoramento (bolsa de valores) ---------------- #
-def _status(margem: float) -> str:
+_LOTE_IA_CAMPOS = {
+    "titulo": ("nome", "título do anúncio (curto, com material e medida, para busca)"),
+    "nome": ("nome", "título do anúncio (curto, com material e medida, para busca)"),
+    "descricao": ("descricaoComplementar", "descrição complementar (rica, para busca e conversão)"),
+    "descricao_complementar": ("descricaoComplementar", "descrição complementar (rica, para busca e conversão)"),
+}
+
+
+@app.post("/api/produtos/lote/ia")
+def lote_ia(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Gera título OU descrição com IA para vários produtos e (opcional) grava no Bling.
+    Body: {produto_ids: [...], campo: 'titulo'|'descricao', aplicar: bool, instrucao?}."""
+    ids = payload.get("produto_ids") or []
+    campo = (payload.get("campo") or "titulo").strip().lower()
+    aplicar = bool(payload.get("aplicar", True))
+    instrucao = (payload.get("instrucao") or "").strip()
+    if campo not in _LOTE_IA_CAMPOS:
+        raise HTTPException(status_code=422, detail="campo deve ser 'titulo' ou 'descricao'.")
+    if not ids:
+        raise HTTPException(status_code=422, detail="Informe produto_ids.")
+    campo_bling, campo_label = _LOTE_IA_CAMPOS[campo]
+    ids = ids[:30]  # teto de segurança por lote
+    db = SessionLocal()
+    resultados = []
+    try:
+        for pid in ids:
+            linha = {"produto_id": pid, "aplicado": False}
+            try:
+                raw = (bling.obter_produto(user.id, pid) or {}).get("data", {}) or {}
+                nome = raw.get("nome") or ""
+                atual = raw.get(campo_bling) or ""
+                base = atual if atual else f"(vazio — crie do zero a partir do produto: {nome})"
+                prompt = (
+                    "Você é copywriter de e-commerce para marketplaces brasileiros. "
+                    f"Reescreva o campo '{campo_label}' do anúncio, otimizando para busca e conversão, "
+                    "mantendo a informação correta. Responda SOMENTE com o texto final, sem comentários.\n"
+                    + (f"Instrução: {instrucao}\n" if instrucao else "")
+                    + f"Produto: {nome}\nConteúdo atual:\n{base}"
+                )
+                texto = ai._gerar_texto(user.id, prompt)
+                if campo_bling == "nome":
+                    texto = " ".join(texto.split())[:150]
+                linha["texto"] = texto
+                if aplicar:
+                    bling.atualizar_produto(user.id, int(pid), {campo_bling: texto})
+                    webhooks.registrar_envio(db, user.id, pid, raw.get("codigo"), [campo])
+                    linha["aplicado"] = True
+            except Exception as e:  # noqa: BLE001 — falha por item não derruba o lote
+                linha["erro"] = str(e)[:160]
+            resultados.append(linha)
+    finally:
+        db.close()
+    ok = sum(1 for r in resultados if r.get("aplicado"))
+    return {"campo": campo, "aplicado": aplicar, "ok": ok, "total": len(resultados), "itens": resultados}
     if margem >= 30:
         return "lucro_ideal"
     if margem >= 15:

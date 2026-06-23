@@ -27,5 +27,13 @@ class Settings(BaseSettings):
     # Radar — varredura automática em segundo plano (horas; 0 = desligado)
     radar_intervalo_horas: int = 6
 
+    # Shopee Open Platform (credenciais do app + loja)
+    shopee_partner_id: str = ""
+    shopee_partner_key: str = ""
+    shopee_shop_id: str = ""
+    shopee_access_token: str = ""
+    shopee_refresh_token: str = ""
+    shopee_base_url: str = "https://partner.shopeemobile.com"
+
 
 settings = Settings()

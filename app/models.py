@@ -146,3 +146,109 @@ class WebhookEvento(Base):
     payload = Column(JSON, nullable=True)
     processado = Column(Boolean, default=False)
     recebido_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ProdutoSync(Base):
+    """Status de sincronização de um produto entre o app e o Bling.
+    'enviado' quando empurramos uma alteração; 'confirmado' quando o webhook
+    de produto.updated chega de volta. Pendente = enviado mas ainda não confirmado."""
+
+    __tablename__ = "produto_sync"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    produto_id = Column(String, nullable=False, index=True)
+    sku = Column(String, nullable=True)
+    status = Column(String, default="enviado")     # enviado | confirmado | erro
+    campos = Column(JSON, nullable=True)            # o que foi enviado por último
+    enviado_em = Column(DateTime, nullable=True)
+    confirmado_em = Column(DateTime, nullable=True)
+    erro = Column(String, nullable=True)
+
+    __table_args__ = (UniqueConstraint("user_id", "produto_id", name="uq_sync_user_produto"),)
+
+
+class ProdutoCache(Base):
+    """Cópia local (cache) do catálogo do Bling. Carregado uma vez por completo e
+    mantido atualizado via webhook — assim as telas leem daqui e o Bling fica com folga."""
+
+    __tablename__ = "produto_cache"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    produto_id = Column(String, nullable=False, index=True)
+    sku = Column(String, nullable=True, index=True)
+    nome = Column(String, nullable=True)
+    preco = Column(Float, default=0.0)
+    custo = Column(Float, default=0.0)
+    saldo = Column(Float, default=0.0)
+    situacao = Column(String, nullable=True)   # Ativo / Inativo
+    tipo = Column(String, nullable=True)
+    dados = Column(JSON, nullable=True)        # payload bruto do produto
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "produto_id", name="uq_cache_user_produto"),)
+
+
+class CatalogoSync(Base):
+    """Estado da sincronização completa do catálogo (uma linha por usuário)."""
+
+    __tablename__ = "catalogo_sync"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    status = Column(String, default="ocioso")   # ocioso | rodando | concluido | erro
+    total = Column(Integer, default=0)           # total no cache
+    paginas = Column(Integer, default=0)
+    erro = Column(String, nullable=True)
+    iniciado_em = Column(DateTime, nullable=True)
+    concluido_em = Column(DateTime, nullable=True)
+
+
+class ShopeeConta(Base):
+    """Credenciais e tokens da Shopee por usuário (multi-tenant).
+    O access_token expira em ~4h e é renovado pelo refresh_token automaticamente."""
+
+    __tablename__ = "shopee_conta"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    shop_id = Column(String, nullable=True)
+    access_token = Column(String, nullable=True)
+    refresh_token = Column(String, nullable=True)
+    expira_em = Column(DateTime, nullable=True)       # quando o access_token expira
+    conectado_em = Column(DateTime, nullable=True)
+    nome_loja = Column(String, nullable=True)
+    ativo = Column(Boolean, default=True)
+
+
+class ShopeeBoostItem(Base):
+    """Produto na lista de auto-boost rotativo da Shopee.
+    fixo=True => sempre impulsionado (pin, máx 5). Senão entra no rodízio por prioridade."""
+
+    __tablename__ = "shopee_boost_item"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    item_id = Column(String, nullable=False)          # id do anúncio na Shopee
+    nome = Column(String, nullable=True)
+    fixo = Column(Boolean, default=False)             # pin
+    prioridade = Column(Integer, default=0)           # maior = impulsiona antes
+    ultimo_boost = Column(DateTime, nullable=True)    # quando foi impulsionado por último
+    boost_ate = Column(DateTime, nullable=True)       # fim das 4h do boost atual
+    impulsos = Column(Integer, default=0)             # contador de quantas vezes
+    criado_em = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "item_id", name="uq_boost_user_item"),)
+
+
+class ShopeeBoostConfig(Base):
+    """Configuração do motor de auto-boost por usuário."""
+
+    __tablename__ = "shopee_boost_config"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    ativo = Column(Boolean, default=False)            # liga/desliga o rodízio
+    janela_inicio = Column(Integer, default=0)        # hora 0-23 (0 = sempre)
+    janela_fim = Column(Integer, default=0)           # hora 0-23 (0 = sempre)
+    criterio = Column(String, default="prioridade")   # prioridade | margem | giro | abc
+    max_simultaneos = Column(Integer, default=5)      # teto da Shopee
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
