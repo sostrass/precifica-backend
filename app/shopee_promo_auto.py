@@ -313,13 +313,17 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
             r = shopee.criar_desconto(user_id, nome, inicio, fim, itens)
             did = (r.get("response") or {}).get("discount_id")
             entraram = r.get("itens_adicionados", len(itens))
+            enviados = r.get("enviados", len(itens))
             _registrar_log(user_id, "desconto", did, nome, entraram, d_medio, motivo)
-            criadas.append({"tipo": "desconto", "id": did, "itens": entraram, "nome": nome})
-            for ie in (r.get("item_erros") or [])[:5]:
-                erros.append(f"desconto/item: {ie}")
+            criadas.append({"tipo": "desconto", "id": did, "itens": entraram, "nome": nome,
+                            "enviados": enviados})
+            itens_erros = r.get("item_erros") or []
             if did and not entraram:
-                erros.append("desconto: a campanha foi criada mas NENHUM produto entrou "
-                             "(verifique se os anúncios estão ativos e elegíveis a desconto).")
+                motivo_top = itens_erros[0] if itens_erros else "a Shopee não detalhou o motivo"
+                erros.append(f"desconto: a campanha foi criada mas nenhum dos {enviados} produto(s) entrou. "
+                             f"Motivo: {motivo_top}")
+            for ie in itens_erros[:4]:
+                erros.append(f"desconto/item — {ie}")
         except shopee.ShopeeError as e:
             erros.append(f"desconto: {e}")
 
@@ -390,8 +394,9 @@ def snapshot_vendas(user_id: int) -> dict:
 
 def detectar_queda(user_id: int, limiar: int | None = None) -> dict:
     """Compara as vendas recentes com a linha de base.
-    base_comparacao='dia': total de 24h x média dos dias anteriores (robusto).
-    base_comparacao='horario': janela de 6h x média da MESMA faixa de horário nos dias anteriores."""
+    base_comparacao='dia': últimas 24h x média dos dias anteriores. Usa snapshots se houver;
+      senão cai pra contagem de PEDIDOS REAIS (funciona sem esperar dias acumulando).
+    base_comparacao='horario': janela de 6h x média da MESMA faixa nos dias anteriores (só snapshot)."""
     db = SessionLocal()
     try:
         cfg = _config(db, user_id)
@@ -405,36 +410,53 @@ def detectar_queda(user_id: int, limiar: int | None = None) -> dict:
     finally:
         db.close()
 
-    if len(amostras) < _MIN_AMOSTRAS:
-        return {"queda": False, "motivo": "coletando", "amostras": len(amostras), "base_modo": base_cmp,
-                "msg": "Ainda coletando histórico de vendas (precisa de algumas amostras)."}
-
     if base_cmp == "horario":
+        if len(amostras) < _MIN_AMOSTRAS:
+            return {"queda": False, "motivo": "coletando", "amostras": len(amostras), "base_modo": "horario",
+                    "msg": "Ainda coletando histórico por horário (precisa de mais amostras). "
+                           "Dica: troque para 'Por dia' — esse já consegue avaliar com os pedidos reais."}
         atual_snap = amostras[0]
         b = atual_snap.bucket or 0
         mesmos = [a.pedidos_6h for a in amostras[1:] if (a.bucket or 0) == b]
         if len(mesmos) < 2:
             return {"queda": False, "motivo": "coletando_horario", "base_modo": "horario",
                     "rotulo": BUCKETS[b], "amostras": len(amostras),
-                    "msg": f"Coletando histórico da faixa {BUCKETS[b]} (precisa de mais dias nesse horário)."}
+                    "msg": f"Coletando histórico da faixa {BUCKETS[b]} (precisa de mais dias nesse horário). "
+                           "Dica: 'Por dia' já avalia agora pelos pedidos reais."}
         atual = atual_snap.pedidos_6h
         base = sum(mesmos) / len(mesmos)
         rotulo = BUCKETS[b]
+        fonte = "snapshot"
     else:
-        atual = amostras[0].pedidos_24h
-        base_vals = [a.pedidos_24h for a in amostras[1:9]]
-        base = sum(base_vals) / len(base_vals) if base_vals else 0
+        # modo dia: snapshot se já houver histórico suficiente; senão pedidos reais
+        if len(amostras) >= _MIN_AMOSTRAS:
+            atual = amostras[0].pedidos_24h
+            base_vals = [a.pedidos_24h for a in amostras[1:9]]
+            base = sum(base_vals) / len(base_vals) if base_vals else 0
+            fonte = "snapshot"
+        else:
+            try:
+                dias_reais = shopee.pedidos_por_dia(user_id, 8)
+            except shopee.ShopeeError:
+                dias_reais = []
+            anteriores = dias_reais[1:] if len(dias_reais) > 1 else []
+            if not anteriores or sum(anteriores) <= 0:
+                return {"queda": False, "motivo": "coletando", "amostras": len(amostras), "base_modo": "dia",
+                        "msg": "Ainda sem histórico de vendas suficiente para comparar (poucos pedidos nos últimos dias)."}
+            atual = dias_reais[0]
+            base = sum(anteriores) / len(anteriores)
+            fonte = "pedidos_reais"
         rotulo = "dia"
 
     if base < _MIN_VOLUME:
         return {"queda": False, "motivo": "volume_baixo", "atual": atual, "base": round(base, 1),
-                "base_modo": base_cmp, "rotulo": rotulo, "amostras": len(amostras),
+                "base_modo": base_cmp, "rotulo": rotulo, "amostras": len(amostras), "fonte": fonte,
                 "msg": "Volume ainda baixo pra disparar com segurança (evita falso alarme)."}
 
     pct = (base - atual) / base * 100.0
     return {"queda": pct >= lim, "atual": atual, "base": round(base, 1),
             "queda_pct": round(pct, 1), "limiar": lim, "amostras": len(amostras),
-            "base_modo": base_cmp, "rotulo": rotulo}
+            "base_modo": base_cmp, "rotulo": rotulo, "fonte": fonte}
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +532,9 @@ def auto_ciclo(user_id: int) -> dict:
             return {"acao": "aguardando_intervalo"}
         motivo = "agendado"
     else:  # queda
+        # cooldown: não re-disparar em sequência (senão cria campanha a cada 30 min na queda)
+        if ultimo and (datetime.utcnow() - ultimo) < timedelta(hours=8):
+            return {"acao": "aguardando_cooldown"}
         q = detectar_queda(user_id)
         if not q.get("queda"):
             return {"acao": "sem_queda", "detalhe": q}

@@ -807,6 +807,15 @@ def shopee_pedidos(dias: int = 7, cursor: str = "", user: User = Depends(auth.ge
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/api/shopee/pedidos/{order_sn}/detalhe")
+def shopee_pedido_detalhe(order_sn: str, user: User = Depends(auth.get_current_user)):
+    """Detalhe completo de um pedido (produtos com margem real + repasse + comprador + logística)."""
+    try:
+        return shopee.pedido_detalhe(user.id, order_sn)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/api/shopee/pedidos/painel")
 def shopee_pedidos_painel(status: str = "A_ENVIAR", dias: int = 15, user: User = Depends(auth.get_current_user)):
     """Pedidos enriquecidos + análise de valor (pago x preço de tabela)."""

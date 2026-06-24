@@ -329,6 +329,31 @@ _STATUS_PEDIDO = {
 }
 
 
+def _margem_real_shopee(cfg_prec: dict, preco: float, custo) -> dict | None:
+    """Líquido, lucro e margem REAIS ao vender por `preco` na Shopee — depois de comissão,
+    taxa fixa, imposto, cartão e embalagem (usa a config de precificação do usuário)."""
+    preco = float(preco or 0)
+    if preco <= 0:
+        return None
+    canais = cfg_prec.get("canais") or []
+    canal = next((c for c in canais if (c.get("canal") or "").lower() == "shopee"), None)
+    if not canal:
+        return None
+    faixas = sorted(canal.get("faixas") or [], key=lambda f: (f.get("ate") is None, f.get("ate") or 0))
+    faixa = next((f for f in faixas if f.get("ate") is None or preco <= f.get("ate")), faixas[-1] if faixas else None)
+    if faixa is None:
+        return None
+    pct = (float(faixa.get("comissao", 0)) + float(faixa.get("fixo_pct", 0))
+           + float(cfg_prec.get("imposto", 0)) + float(cfg_prec.get("cartao", 0))) / 100.0
+    fixos = float(faixa.get("fixo", 0)) + float(cfg_prec.get("embalagem", 0))
+    liquido = preco * (1 - pct) - fixos
+    tem_custo = custo is not None
+    lucro = liquido - float(custo or 0)
+    return {"liquido": round(liquido, 2), "taxas": round(preco - liquido, 2),
+            "lucro": round(lucro, 2) if tem_custo else None,
+            "margem_pct": round(lucro / preco * 100, 1) if tem_custo else None}
+
+
 def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limite: int = 100) -> dict:
     """Pedidos enriquecidos (produto, SKU, imagem, valor pago) + análise de valor:
     compara o que o comprador pagou com o seu preço de tabela (catálogo) e marca
@@ -356,7 +381,10 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
             break
     sns = sns[:limite]
 
+    from . import catalogo, precificacao
     cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    cfg_prec = precificacao.obter_config(user_id)
+    margem_alvo = float(cfg_prec.get("margem_padrao") or 0)
     pedidos = []
     for i in range(0, len(sns), 50):
         lote = sns[i:i + 50]
@@ -367,24 +395,34 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
         except ShopeeError:
             continue
         for o in ((rd.get("response") or {}).get("order_list") or []):
-            itens, total, abaixo, sem_cad = [], 0.0, False, False
+            itens, total, abaixo_meta, prejuizo, sem_cad = [], 0.0, False, False, False
+            lucro_pedido, tem_lucro = 0.0, False
             for it in (o.get("item_list") or []):
                 sku = it.get("model_sku") or it.get("item_sku")
                 qtd = int(it.get("model_quantity_purchased") or 0)
                 pago = float(it.get("model_discounted_price") or it.get("model_original_price") or 0)
                 total += pago * qtd
                 base = cat.get(sku)
-                preco_tab = float(base.get("preco") or 0) if base else None
-                custo = float(base.get("custo") or 0) if base else None
-                dif = round(pago - preco_tab, 2) if preco_tab else None
-                if preco_tab and pago < preco_tab - 0.01:
-                    abaixo = True
+                custo = float(base.get("custo")) if (base and base.get("custo") is not None) else None
                 if base is None:
                     sem_cad = True
+                mr = _margem_real_shopee(cfg_prec, pago, custo)
+                margem_real = mr.get("margem_pct") if mr else None
+                lucro_real = mr.get("lucro") if mr else None
+                if lucro_real is not None:
+                    lucro_pedido += lucro_real * qtd
+                    tem_lucro = True
+                if margem_real is not None:
+                    if margem_real < 0:
+                        prejuizo = True
+                    elif margem_alvo and margem_real < margem_alvo - 0.5:
+                        abaixo_meta = True
                 itens.append({
                     "nome": it.get("item_name") or f"#{it.get('item_id')}", "sku": sku, "qtd": qtd,
                     "preco_pago": round(pago, 2), "imagem": (it.get("image_info") or {}).get("image_url"),
-                    "preco_tabela": preco_tab, "custo": custo, "dif": dif, "tem_cadastro": base is not None,
+                    "custo": custo, "tem_cadastro": base is not None,
+                    "margem_real": margem_real, "lucro_real": lucro_real,
+                    "liquido": mr.get("liquido") if mr else None, "taxas_mkt": mr.get("taxas") if mr else None,
                 })
             rec = o.get("recipient_address") or {}
             pedidos.append({
@@ -392,14 +430,20 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
                 "comprador": o.get("buyer_username") or rec.get("name") or "—",
                 "cliente": rec.get("name"), "cidade": rec.get("city"), "uf": rec.get("state"),
                 "ship_by": o.get("ship_by_date"), "criado": o.get("create_time"),
-                "total_pago": round(total, 2), "abaixo_preco": abaixo, "sem_cadastro": sem_cad,
+                "total_pago": round(total, 2), "abaixo_meta": abaixo_meta, "prejuizo": prejuizo,
+                "sem_cadastro": sem_cad, "lucro_real": round(lucro_pedido, 2) if tem_lucro else None,
                 "itens": itens,
             })
     pedidos.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
-    resumo = {"total": len(pedidos), "abaixo_preco": sum(1 for p in pedidos if p["abaixo_preco"]),
+    lucros = [p["lucro_real"] for p in pedidos if p.get("lucro_real") is not None]
+    resumo = {"total": len(pedidos),
+              "abaixo_meta": sum(1 for p in pedidos if p["abaixo_meta"] or p["prejuizo"]),
+              "prejuizo": sum(1 for p in pedidos if p["prejuizo"]),
               "receita": round(sum(p["total_pago"] for p in pedidos), 2),
-              "unidades": sum(sum(i["qtd"] for i in p["itens"]) for p in pedidos)}
-    return {"status": status, "pedidos": pedidos, "resumo": resumo}
+              "unidades": sum(sum(i["qtd"] for i in p["itens"]) for p in pedidos),
+              "lucro_real": round(sum(lucros), 2) if lucros else None,
+              "margem_alvo": margem_alvo, "cobertura_lucro": len(lucros)}
+    return {"status": status, "pedidos": pedidos, "resumo": resumo, "margem_alvo": margem_alvo}
 
 
 def lista_separacao(user_id: int, status: str = "A_ENVIAR", dias: int = 15) -> dict:
@@ -420,6 +464,83 @@ def lista_separacao(user_id: int, status: str = "A_ENVIAR", dias: int = 15) -> d
             "skus": len(linhas), "pedidos": pain["resumo"]["total"], "status": status}
 
 
+def pedido_detalhe(user_id: int, order_sn: str) -> dict:
+    """Detalhe completo de UM pedido pro modal: produtos com margem real, repasse (escrow)
+    com a quebra das taxas, comprador, endereço e logística."""
+    from . import catalogo, precificacao
+    rd = _chamar(user_id, "/api/v2/order/get_order_detail",
+                 extra={"order_sn_list": order_sn,
+                        "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time,actual_shipping_fee,note"})
+    od = (((rd.get("response") or {}).get("order_list") or [{}]) or [{}])[0]
+
+    inc = {}
+    try:
+        inc = (_chamar(user_id, "/api/v2/payment/get_escrow_detail",
+                       extra={"order_sn": order_sn}).get("response") or {}).get("order_income") or {}
+    except ShopeeError:
+        inc = {}
+
+    tracking = None
+    try:
+        tr = _chamar(user_id, "/api/v2/logistics/get_tracking_number", extra={"order_sn": order_sn})
+        tracking = (tr.get("response") or {}).get("tracking_number")
+    except ShopeeError:
+        tracking = None
+
+    cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    cfg_prec = precificacao.obter_config(user_id)
+    itens, total_pago, custo_total, tem_custo_all = [], 0.0, 0.0, True
+    for it in (od.get("item_list") or []):
+        sku = it.get("model_sku") or it.get("item_sku")
+        qtd = int(it.get("model_quantity_purchased") or 0)
+        pago = float(it.get("model_discounted_price") or it.get("model_original_price") or 0)
+        total_pago += pago * qtd
+        base = cat.get(sku)
+        custo = float(base.get("custo")) if (base and base.get("custo") is not None) else None
+        if custo is None:
+            tem_custo_all = False
+        else:
+            custo_total += custo * qtd
+        mr = _margem_real_shopee(cfg_prec, pago, custo)
+        itens.append({
+            "nome": it.get("item_name") or f"#{it.get('item_id')}", "sku": sku, "qtd": qtd,
+            "variacao": it.get("model_name"), "preco_pago": round(pago, 2),
+            "imagem": (it.get("image_info") or {}).get("image_url"), "custo": custo,
+            "tem_cadastro": base is not None,
+            "margem_real": mr.get("margem_pct") if mr else None,
+            "lucro_real": mr.get("lucro") if mr else None,
+            "liquido": mr.get("liquido") if mr else None, "taxas_mkt": mr.get("taxas") if mr else None,
+        })
+
+    tem_escrow = bool(inc)
+    receita = float(inc.get("buyer_total_amount") or 0) or round(total_pago, 2)
+    comissao = float(inc.get("commission_fee") or 0)
+    servico = float(inc.get("service_fee") or 0)
+    transacao = float(inc.get("seller_transaction_fee") or inc.get("transaction_fee") or 0)
+    frete = float(inc.get("actual_shipping_fee") or od.get("actual_shipping_fee") or 0) - float(inc.get("shopee_shipping_rebate") or 0)
+    liquido = float(inc.get("escrow_amount") or 0) if tem_escrow else None
+    lucro = round(liquido - custo_total, 2) if (tem_escrow and tem_custo_all) else None
+    financeiro = {
+        "tem_escrow": tem_escrow, "receita": round(receita, 2),
+        "comissao": round(comissao, 2), "servico": round(servico, 2), "transacao": round(transacao, 2),
+        "taxas": round(comissao + servico + transacao, 2), "frete": round(frete, 2),
+        "liquido": round(liquido, 2) if liquido is not None else None,
+        "custo": round(custo_total, 2), "custo_completo": tem_custo_all,
+        "lucro": lucro, "margem_pct": round(lucro / receita * 100, 1) if (lucro is not None and receita) else None,
+    }
+    rec = od.get("recipient_address") or {}
+    return {
+        "order_sn": od.get("order_sn") or order_sn, "status": od.get("order_status"),
+        "criado": od.get("create_time"), "pago_em": od.get("pay_time"), "ship_by": od.get("ship_by_date"),
+        "comprador": od.get("buyer_username") or rec.get("name") or "—",
+        "endereco": {"nome": rec.get("name"), "telefone": rec.get("phone"),
+                     "cidade": rec.get("city"), "uf": rec.get("state"),
+                     "cep": rec.get("zipcode"), "completo": rec.get("full_address")},
+        "logistica": {"transportadora": od.get("shipping_carrier"), "rastreio": tracking},
+        "itens": itens, "total_pago": round(total_pago, 2), "financeiro": financeiro,
+    }
+
+
 def listar_pedidos(user_id: int, dias: int = 7, cursor: str = "", limite: int = 50) -> dict:
     agora = int(time.time())
     return _chamar(user_id, "/api/v2/order/get_order_list",
@@ -430,6 +551,30 @@ def listar_pedidos(user_id: int, dias: int = 7, cursor: str = "", limite: int = 
 def detalhe_pedidos(user_id: int, order_sns: list) -> dict:
     return _chamar(user_id, "/api/v2/order/get_order_detail",
                    extra={"order_sn_list": ",".join(order_sns)})
+
+
+def pedidos_por_dia(user_id: int, dias: int = 8) -> list:
+    """Quantos pedidos por dia nos últimos `dias` (hoje primeiro). Usado para detectar
+    queda de vendas a partir dos pedidos REAIS, sem depender de snapshots acumulados."""
+    agora = int(time.time())
+    inicio = agora - int(dias) * 86400
+    por_dia = {}
+    cursor = ""
+    for _ in range(30):  # teto de páginas
+        r = _chamar(user_id, "/api/v2/order/get_order_list",
+                    extra={"time_range_field": "create_time", "time_from": inicio, "time_to": agora,
+                           "page_size": 100, "cursor": cursor, "response_optional_fields": "create_time"})
+        resp = r.get("response") or {}
+        for o in (resp.get("order_list") or []):
+            ct = o.get("create_time")
+            if not ct:
+                continue
+            dia = (agora - int(ct)) // 86400  # 0 = hoje, 1 = ontem, ...
+            por_dia[dia] = por_dia.get(dia, 0) + 1
+        cursor = resp.get("next_cursor") or ""
+        if not resp.get("more") or not cursor:
+            break
+    return [por_dia.get(d, 0) for d in range(dias)]
 
 
 def contar_pedidos_horas(user_id: int, horas: int) -> int:
@@ -965,6 +1110,27 @@ def repetir_campanha(user_id: int, tipo: str, cid) -> dict:
     raise ShopeeError(f"Repetir ainda não é suportado para o tipo '{tipo}'.")
 
 
+_ERR_DESC = {
+    "discount": "produto já está em outra promoção de desconto ativa (não pode entrar em duas ao mesmo tempo)",
+    "already": "produto já está em outra promoção ativa",
+    "promotion_overlap": "produto já está em outra promoção no mesmo período",
+    "price": "preço de promoção inválido (precisa ser menor que o preço atual e dentro do limite da Shopee)",
+    "lower": "o preço de promoção precisa ser menor que o preço atual",
+    "model": "variação (model_id) inválida ou inexistente para este anúncio",
+    "not_exist": "anúncio não existe ou não está mais disponível",
+    "status": "anúncio não está ativo/elegível para desconto",
+    "stock": "estoque insuficiente para entrar na promoção",
+}
+
+
+def _traduzir_erro_item(msg: str) -> str:
+    m = (msg or "").lower()
+    for chave, texto in _ERR_DESC.items():
+        if chave in m:
+            return texto
+    return msg or "motivo não informado pela Shopee"
+
+
 def criar_desconto(user_id: int, nome: str, inicio: int, fim: int, itens: list) -> dict:
     """Cria uma campanha de desconto na Shopee. São DOIS passos na API v2:
     1) add_discount cria a campanha (nome + datas) e devolve discount_id;
@@ -973,23 +1139,35 @@ def criar_desconto(user_id: int, nome: str, inicio: int, fim: int, itens: list) 
     r = _chamar(user_id, "/api/v2/discount/add_discount", metodo="POST",
                 extra={"discount_name": nome, "start_time": inicio, "end_time": fim})
     did = (r.get("response") or {}).get("discount_id")
-    out = {"response": {"discount_id": did}, "itens_adicionados": 0, "item_erros": []}
+    out = {"response": {"discount_id": did}, "itens_adicionados": 0, "item_erros": [], "enviados": len(itens)}
     if not did or not itens:
         if not did:
-            out["item_erros"].append("a Shopee não retornou discount_id ao criar a campanha")
+            msg = r.get("message") or r.get("error") or "a Shopee não retornou discount_id ao criar a campanha"
+            out["item_erros"].append(str(msg))
         return out
     adicionados = 0
     for i in range(0, len(itens), 50):  # add_discount_item aceita até 50 por chamada
         lote = itens[i:i + 50]
         ri = _chamar(user_id, "/api/v2/discount/add_discount_item", metodo="POST",
                      extra={"discount_id": did, "item_list": lote})
+        # erro no nível da chamada toda (ex.: discount inválido, sem permissão)
+        if ri.get("error") and not ri.get("response"):
+            out["item_erros"].append(_traduzir_erro_item(ri.get("message") or ri.get("error")))
+            continue
         resp_i = ri.get("response") or {}
         erros = resp_i.get("error_list") or resp_i.get("fail_list") or []
-        adicionados += len(lote) - len(erros)
+        # quantos entraram: usa o count da Shopee se vier, senão deduz pela diferença
+        count = resp_i.get("count")
+        if isinstance(count, int):
+            adicionados += count
+        else:
+            adicionados += max(0, len(lote) - len(erros))
         for e in erros:
             if isinstance(e, dict):
-                out["item_erros"].append(
-                    f"item {e.get('item_id')}: {e.get('fail_error') or e.get('fail_message') or e.get('error')}")
+                raw = e.get("fail_error") or e.get("fail_message") or e.get("error") or e.get("message")
+                out["item_erros"].append(f"anúncio {e.get('item_id')}: {_traduzir_erro_item(raw)}")
+            elif e:
+                out["item_erros"].append(_traduzir_erro_item(str(e)))
     out["itens_adicionados"] = adicionados
     return out
 
@@ -1008,9 +1186,28 @@ def add_discount_item(user_id: int, discount_id, itens: list) -> dict:
     return {"discount_id": discount_id, "itens_adicionados": adicionados, "item_erros": item_erros}
 
 
+def _preco_modelo(m: dict) -> float:
+    """Extrai o preço atual de um modelo do get_model_list, tolerando price_info como
+    objeto {current_price,...} OU lista [{current_price,...}] (varia por versão da API)."""
+    pi = m.get("price_info")
+    if isinstance(pi, list):
+        pi = pi[0] if pi else {}
+    if not isinstance(pi, dict):
+        pi = {}
+    for k in ("current_price", "promotion_price", "selling_price", "original_price", "price"):
+        v = pi.get(k) or m.get(k)
+        if v:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
 def itens_desconto_por_pct(user_id: int, itens: list) -> list:
     """Transforma [{item_id, desconto_pct, preco?, purchase_limit?}] no item_list do add_discount,
-    aplicando o desconto ao preço de CADA variação (modelo). Sem variação -> model_id=0."""
+    aplicando o desconto ao preço de CADA variação (modelo). O model_promotion_price é sempre
+    forçado a ficar ABAIXO do preço atual (a Shopee rejeita promo >= preço vigente)."""
     out = []
     for it in itens:
         item_id = int(it["item_id"])
@@ -1021,16 +1218,26 @@ def itens_desconto_por_pct(user_id: int, itens: list) -> list:
             ml = []
         model_list = []
         for m in ml:
-            precos = m.get("price_info") or []
-            preco_m = float((precos[0].get("current_price") if precos else 0)
-                            or m.get("original_price") or 0)
+            preco_m = _preco_modelo(m)
             if preco_m <= 0:
                 continue
-            model_list.append({"model_id": m.get("model_id"),
-                               "model_promotion_price": round(preco_m * (1 - d), 2)})
+            promo = round(preco_m * (1 - d), 2)
+            if promo >= preco_m:                       # garante que fica abaixo do preço atual
+                promo = round(preco_m - 0.01, 2)
+            if promo <= 0:
+                continue
+            model_list.append({"model_id": m.get("model_id"), "model_promotion_price": promo})
         if not model_list:
+            # sem variação (anúncio simples): model_id 0 com o preço do catálogo
             preco = float(it.get("preco") or 0)
-            model_list = [{"model_id": 0, "model_promotion_price": round(preco * (1 - d), 2)}]
+            if preco > 0:
+                promo = round(preco * (1 - d), 2)
+                if promo >= preco:
+                    promo = round(preco - 0.01, 2)
+                if promo > 0:
+                    model_list = [{"model_id": 0, "model_promotion_price": promo}]
+        if not model_list:
+            continue  # não dá pra montar preço válido — não manda item quebrado
         out.append({"item_id": item_id, "purchase_limit": int(it.get("purchase_limit") or 0),
                     "model_list": model_list})
     return out
