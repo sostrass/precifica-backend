@@ -312,28 +312,46 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
             nome = f"Auto · {datetime.now().strftime('%d/%m %H:%M')}"
             r = shopee.criar_desconto(user_id, nome, inicio, fim, itens)
             did = (r.get("response") or {}).get("discount_id")
-            _registrar_log(user_id, "desconto", did, nome, len(itens), d_medio, motivo)
-            criadas.append({"tipo": "desconto", "id": did, "itens": len(itens), "nome": nome})
+            entraram = r.get("itens_adicionados", len(itens))
+            _registrar_log(user_id, "desconto", did, nome, entraram, d_medio, motivo)
+            criadas.append({"tipo": "desconto", "id": did, "itens": entraram, "nome": nome})
+            for ie in (r.get("item_erros") or [])[:5]:
+                erros.append(f"desconto/item: {ie}")
+            if did and not entraram:
+                erros.append("desconto: a campanha foi criada mas NENHUM produto entrou "
+                             "(verifique se os anúncios estão ativos e elegíveis a desconto).")
         except shopee.ShopeeError as e:
             erros.append(f"desconto: {e}")
 
     if tipo in ("flash", "ambos"):
         try:
             slots = shopee.flash_slots(user_id, dias=2)
-            lista = (slots.get("response") or {}).get("timeslot_list") or slots.get("response") or []
+            resp_s = slots.get("response")
+            if isinstance(resp_s, dict):
+                lista = resp_s.get("timeslot_list") or []
+            elif isinstance(resp_s, list):
+                lista = resp_s
+            else:
+                lista = []
             slot = None
-            if isinstance(lista, list) and lista:
-                slot = lista[0].get("timeslot_id") if isinstance(lista[0], dict) else None
+            if lista:
+                primeiro = lista[0]
+                slot = primeiro.get("timeslot_id") if isinstance(primeiro, dict) else primeiro
             if slot:
                 reserva = snap["reserva_estoque"]
                 itens_flash = [{"item_id": p["item_id"], "preco": p["preco_promo"],
                                 "stock": max(1, p["estoque"] - reserva)} for p in propostas]
                 r = shopee.criar_flash(user_id, slot, itens_flash)
                 fid = (r.get("response") or {}).get("flash_sale_id")
-                _registrar_log(user_id, "flash", fid, "Flash auto", len(itens_flash), d_medio, motivo)
-                criadas.append({"tipo": "flash", "id": fid, "itens": len(itens_flash)})
+                if fid:
+                    _registrar_log(user_id, "flash", fid, "Flash auto", len(itens_flash), d_medio, motivo)
+                    criadas.append({"tipo": "flash", "id": fid, "itens": len(itens_flash)})
+                else:
+                    erros.append("flash: a Shopee não criou a oferta relâmpago (a loja pode não estar "
+                                 "elegível a Flash Sale própria, ou o slot expirou).")
             else:
-                erros.append("flash: nenhum horário (slot) disponível agora")
+                erros.append("flash: nenhum horário (slot) de Flash Sale disponível agora — "
+                             "a Shopee libera slots por período e por elegibilidade da loja.")
         except shopee.ShopeeError as e:
             erros.append(f"flash: {e}")
 

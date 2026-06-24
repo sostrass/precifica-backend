@@ -349,6 +349,108 @@ def contar_pedidos_horas(user_id: int, horas: int) -> int:
     return total
 
 
+_MARGEM_CACHE: dict = {}
+
+
+def margem_real(user_id: int, dias: int = 7, limite_pedidos: int = 40) -> dict:
+    """Margem líquida REAL: para cada pedido recente, cruza o repasse da Shopee (líquido +
+    comissão/taxas/frete) com o CUSTO dos produtos (catálogo). Responde 'a venda deu o lucro
+    que eu esperava?'. Caro (1 chamada de repasse por pedido) — teto + cache de ~20 min."""
+    from . import catalogo
+    chave = (user_id, dias, limite_pedidos)
+    cache = _MARGEM_CACHE.get(chave)
+    if cache and (time.time() - cache["_ts"]) < 1200:
+        return {k: v for k, v in cache.items() if k != "_ts"}
+
+    agora = int(time.time())
+    inicio = agora - max(1, dias) * 86400
+    sns, cursor = [], ""
+    for _ in range(8):
+        r = _chamar(user_id, "/api/v2/order/get_order_list",
+                    extra={"time_range_field": "create_time", "time_from": inicio, "time_to": agora,
+                           "page_size": 100, "cursor": cursor, "order_status": "COMPLETED"})
+        resp = r.get("response") or {}
+        for o in (resp.get("order_list") or []):
+            if o.get("order_sn"):
+                sns.append(o["order_sn"])
+        cursor = resp.get("next_cursor") or ""
+        if not resp.get("more") or not cursor:
+            break
+    parcial = len(sns) > limite_pedidos
+    sns = sns[:limite_pedidos]
+
+    custo_por_sku = {p["sku"]: p.get("custo") for p in catalogo.todos(user_id) if p.get("sku")}
+
+    escrows, item_ids = [], set()
+    for sn in sns:
+        try:
+            e = (_chamar(user_id, "/api/v2/payment/get_escrow_detail", extra={"order_sn": sn}).get("response") or {})
+        except ShopeeError:
+            continue
+        inc = e.get("order_income") or {}
+        itens = inc.get("items") or e.get("items") or []
+        for it in itens:
+            if it.get("item_id"):
+                item_ids.add(it.get("item_id"))
+        escrows.append((sn, inc, itens))
+
+    meta = nomes_itens(user_id, list(item_ids)) if item_ids else {}
+
+    pedidos = []
+    for sn, inc, itens in escrows:
+        liquido = float(inc.get("escrow_amount") or inc.get("escrow_amount_after_adjustment") or 0)
+        receita = float(inc.get("buyer_total_amount") or inc.get("order_original_price") or inc.get("original_price") or 0)
+        comissao = float(inc.get("commission_fee") or 0)
+        servico = float(inc.get("service_fee") or 0)
+        transacao = float(inc.get("seller_transaction_fee") or inc.get("transaction_fee") or 0)
+        frete = float(inc.get("actual_shipping_fee") or 0) - float(inc.get("shopee_shipping_rebate") or 0)
+        custo_total, det, sem_custo = 0.0, [], False
+        for it in itens:
+            iid = it.get("item_id")
+            q = int(it.get("quantity_purchased") or it.get("amount") or it.get("model_quantity_purchased") or 1)
+            sku = (meta.get(iid) or {}).get("sku")
+            c = custo_por_sku.get(sku)
+            if c is None:
+                sem_custo = True
+            custo_total += (c or 0) * q
+            det.append({"nome": (meta.get(iid) or {}).get("nome") or f"#{iid}", "sku": sku,
+                        "qtd": q, "custo_unit": c, "tem_custo": c is not None})
+        lucro = liquido - custo_total
+        margem = round(lucro / receita * 100, 1) if receita else 0
+        pedidos.append({
+            "order_sn": sn, "receita": round(receita, 2),
+            "taxas": round(comissao + servico + transacao, 2), "comissao": round(comissao, 2),
+            "servico": round(servico, 2), "frete": round(frete, 2),
+            "liquido_shopee": round(liquido, 2), "custo": round(custo_total, 2),
+            "lucro": round(lucro, 2), "margem_pct": margem, "prejuizo": lucro < 0,
+            "sem_custo": sem_custo, "itens": det})
+
+    n = len(pedidos)
+    receita_total = sum(p["receita"] for p in pedidos)
+    taxas_total = sum(p["taxas"] for p in pedidos)
+    frete_total = sum(p["frete"] for p in pedidos)
+    custo_total = sum(p["custo"] for p in pedidos)
+    lucro_total = sum(p["lucro"] for p in pedidos)
+    prejuizo = sum(1 for p in pedidos if p["prejuizo"])
+    com_custo = [p for p in pedidos if not p["sem_custo"]]
+    out = {
+        "periodo_dias": dias, "parcial": parcial,
+        "pedidos": sorted(pedidos, key=lambda x: x["margem_pct"]),  # piores margens primeiro
+        "resumo": {
+            "pedidos": n, "receita_total": round(receita_total, 2), "taxas_total": round(taxas_total, 2),
+            "frete_total": round(frete_total, 2), "custo_total": round(custo_total, 2),
+            "lucro_liquido_total": round(lucro_total, 2),
+            "margem_media_pct": round(lucro_total / receita_total * 100, 1) if receita_total else 0,
+            "pedidos_prejuizo": prejuizo,
+            "pct_taxas": round(taxas_total / receita_total * 100, 1) if receita_total else 0,
+            "sem_custo": sum(1 for p in pedidos if p["sem_custo"]),
+            "cobertura_custo": len(com_custo),
+        },
+    }
+    _MARGEM_CACHE[chave] = {**out, "_ts": time.time()}
+    return out
+
+
 def repasse_pedido(user_id: int, order_sn: str) -> dict:
     """Escrow: valor líquido recebido, comissões e taxas (margem real)."""
     return _chamar(user_id, "/api/v2/payment/get_escrow_detail", extra={"order_sn": order_sn})
@@ -361,11 +463,317 @@ def listar_descontos(user_id: int, status: str = "ongoing", limite: int = 50) ->
                    extra={"discount_status": status, "page_size": min(limite, 100)})
 
 
-def criar_desconto(user_id: int, nome: str, inicio: int, fim: int, itens: list) -> dict:
-    """Cria uma campanha de desconto. itens: [{item_id, purchase_limit?, model_list?, promotion_price}]."""
-    return _chamar(user_id, "/api/v2/discount/add_discount", metodo="POST",
-                   extra={"discount_name": nome, "start_time": inicio, "end_time": fim,
-                          "item_list": itens})
+def _enriquecer_itens(user_id: int, ids: list) -> dict:
+    if not ids:
+        return {}
+    try:
+        return nomes_itens(user_id, ids)
+    except ShopeeError:
+        return {}
+
+
+def detalhe_desconto(user_id: int, discount_id) -> dict:
+    """Detalhe de uma campanha de desconto JÁ com os produtos (nome, imagem, preço de/por)."""
+    r = _chamar(user_id, "/api/v2/discount/get_discount",
+                extra={"discount_id": int(discount_id), "page_no": 1, "page_size": 100})
+    resp = r.get("response") or {}
+    itens = resp.get("item_list") or []
+    meta = _enriquecer_itens(user_id, [it.get("item_id") for it in itens if it.get("item_id")])
+    out = []
+    for it in itens:
+        iid = it.get("item_id")
+        m = meta.get(iid) or {}
+        models = it.get("model_list") or []
+        promo = [mm.get("model_promotion_price") for mm in models if mm.get("model_promotion_price")]
+        orig = [mm.get("model_original_price") or mm.get("model_normal_price")
+                for mm in models if (mm.get("model_original_price") or mm.get("model_normal_price"))]
+        po = min(promo) if promo else it.get("item_promotion_price")
+        oo = min(orig) if orig else it.get("item_original_price")
+        desc = round((1 - po / oo) * 100) if (po and oo and oo > 0) else None
+        out.append({"item_id": iid, "nome": m.get("nome") or it.get("item_name") or f"#{iid}",
+                    "imagem": m.get("imagem"), "preco_promo": po, "preco_original": oo,
+                    "desconto_pct": desc, "variacoes": len(models)})
+    return {"tipo": "desconto", "id": discount_id, "nome": resp.get("discount_name"),
+            "inicio": resp.get("start_time"), "fim": resp.get("end_time"),
+            "status": resp.get("status"), "itens": out, "total_itens": len(out)}
+
+
+def detalhe_bundle(user_id: int, bundle_id) -> dict:
+    """Detalhe de um bundle (combo) com a regra e os produtos."""
+    r = _chamar(user_id, "/api/v2/bundle_deal/get_bundle_deal",
+                extra={"bundle_deal_id": int(bundle_id)})
+    resp = r.get("response") or {}
+    try:
+        ri = _chamar(user_id, "/api/v2/bundle_deal/get_bundle_deal_item",
+                     extra={"bundle_deal_id": int(bundle_id)})
+        itens_raw = (ri.get("response") or {}).get("item_list") or []
+    except ShopeeError:
+        itens_raw = resp.get("item_list") or []
+    ids = [it.get("item_id") for it in itens_raw if it.get("item_id")]
+    meta = _enriquecer_itens(user_id, ids)
+    itens = [{"item_id": i, "nome": (meta.get(i) or {}).get("nome") or f"#{i}",
+              "imagem": (meta.get(i) or {}).get("imagem")} for i in ids]
+    regra = resp.get("bundle_deal_rule") or {}
+    return {"tipo": "bundle", "id": bundle_id, "nome": resp.get("name"),
+            "inicio": resp.get("start_time"), "fim": resp.get("end_time"),
+            "status": resp.get("bundle_deal_status") or resp.get("status"),
+            "regra": {"rule_type": regra.get("rule_type"), "valor": regra.get("discount_value"),
+                      "min_itens": regra.get("min_amount")},
+            "itens": itens, "total_itens": len(itens)}
+
+
+def detalhe_addon(user_id: int, addon_id) -> dict:
+    """Detalhe de um add-on: produto(s) principal(is) + adicionais com preço promocional."""
+    base = {}
+    try:
+        rb = _chamar(user_id, "/api/v2/add_on_deal/get_add_on_deal",
+                     extra={"add_on_deal_id": int(addon_id)})
+        base = rb.get("response") or {}
+    except ShopeeError:
+        base = {}
+    principais, adicionais = [], []
+    try:
+        rm = _chamar(user_id, "/api/v2/add_on_deal/get_add_on_deal_main_item",
+                     extra={"add_on_deal_id": int(addon_id)})
+        principais = (rm.get("response") or {}).get("main_item_list") or []
+    except ShopeeError:
+        pass
+    try:
+        rs = _chamar(user_id, "/api/v2/add_on_deal/get_add_on_deal_sub_item",
+                     extra={"add_on_deal_id": int(addon_id)})
+        adicionais = (rs.get("response") or {}).get("sub_item_list") or []
+    except ShopeeError:
+        pass
+    ids = [x.get("item_id") for x in (principais + adicionais) if x.get("item_id")]
+    meta = _enriquecer_itens(user_id, ids)
+    def _norm(x, extra=None):
+        i = x.get("item_id")
+        d = {"item_id": i, "nome": (meta.get(i) or {}).get("nome") or f"#{i}",
+             "imagem": (meta.get(i) or {}).get("imagem")}
+        if extra:
+            d.update(extra)
+        return d
+    itens_p = [_norm(x) for x in principais]
+    itens_s = [_norm(x, {"preco_promo": x.get("add_on_deal_price")}) for x in adicionais]
+    return {"tipo": "addon", "id": addon_id, "nome": base.get("add_on_deal_name"),
+            "inicio": base.get("start_time"), "fim": base.get("end_time"),
+            "status": base.get("status"), "principais": itens_p, "adicionais": itens_s,
+            "itens": itens_p + itens_s, "total_itens": len(itens_p) + len(itens_s)}
+
+
+def detalhe_flash(user_id: int, flash_id) -> dict:
+    """Detalhe de uma Flash Sale com os produtos, preço e estoque reservado."""
+    base = {}
+    try:
+        rb = _chamar(user_id, "/api/v2/shop_flash_sale/get_shop_flash_sale",
+                     extra={"flash_sale_id": int(flash_id)})
+        base = rb.get("response") or {}
+    except ShopeeError:
+        base = {}
+    itens_raw = []
+    try:
+        ri = _chamar(user_id, "/api/v2/shop_flash_sale/get_shop_flash_sale_items",
+                     extra={"flash_sale_id": int(flash_id), "offset": 0, "limit": 100})
+        rr = ri.get("response") or {}
+        itens_raw = rr.get("item_info") or rr.get("models") or rr.get("item_list") or []
+    except ShopeeError:
+        pass
+    ids = [it.get("item_id") for it in itens_raw if it.get("item_id")]
+    meta = _enriquecer_itens(user_id, ids)
+    vistos, itens = set(), []
+    for it in itens_raw:
+        iid = it.get("item_id")
+        if iid in vistos:
+            continue
+        vistos.add(iid)
+        m = meta.get(iid) or {}
+        itens.append({"item_id": iid, "nome": m.get("nome") or f"#{iid}", "imagem": m.get("imagem"),
+                      "preco_promo": it.get("promotion_price_min") or it.get("input_promo_price")
+                      or it.get("promotion_price"), "estoque": it.get("campaign_stock") or it.get("stock")})
+    return {"tipo": "flash", "id": flash_id, "nome": "Flash Sale",
+            "inicio": base.get("start_time"), "fim": base.get("end_time"),
+            "status": base.get("status"), "itens": itens, "total_itens": len(itens)}
+
+
+_DESEMP_CACHE: dict = {}
+
+
+def _pedidos_itens_periodo(user_id: int, inicio: int, fim: int, max_paginas: int = 12):
+    """order_sn no período + itens de cada pedido (lotes de 50). Caro: tem teto de páginas."""
+    agora = int(time.time())
+    fim = min(int(fim or agora), agora)
+    sns, cursor = [], ""
+    for _ in range(max_paginas):
+        r = _chamar(user_id, "/api/v2/order/get_order_list",
+                    extra={"time_range_field": "create_time", "time_from": int(inicio),
+                           "time_to": fim, "page_size": 100, "cursor": cursor})
+        resp = r.get("response") or {}
+        for o in (resp.get("order_list") or []):
+            if o.get("order_sn"):
+                sns.append(o["order_sn"])
+        cursor = resp.get("next_cursor") or ""
+        if not resp.get("more") or not cursor:
+            break
+    parcial = len(sns) >= max_paginas * 100
+    pedidos = []
+    for i in range(0, len(sns), 50):
+        lote = sns[i:i + 50]
+        try:
+            rd = _chamar(user_id, "/api/v2/order/get_order_detail",
+                         extra={"order_sn_list": ",".join(lote),
+                                "response_optional_fields": "item_list"})
+            pedidos.extend((rd.get("response") or {}).get("order_list") or [])
+        except ShopeeError:
+            continue
+    return pedidos, len(sns), parcial
+
+
+def desempenho_campanha(user_id: int, tipo: str, cid) -> dict:
+    """Desempenho = vendas dos PRODUTOS da campanha durante o período dela.
+    Atribuição precisa quando o item do pedido carrega o promotion_id da campanha.
+    Resultado em cache por ~10 min (a varredura de pedidos é cara)."""
+    chave = (user_id, tipo, str(cid))
+    cache = _DESEMP_CACHE.get(chave)
+    if cache and (time.time() - cache["_ts"]) < 600:
+        return {k: v for k, v in cache.items() if k != "_ts"}
+
+    det_fn = {"desconto": detalhe_desconto, "bundle": detalhe_bundle,
+              "addon": detalhe_addon, "flash": detalhe_flash}.get(tipo)
+    if not det_fn:
+        return {"indisponivel": True, "motivo": "tipo desconhecido"}
+    d = det_fn(user_id, cid)
+    inicio, fim = d.get("inicio"), d.get("fim")
+    agora = int(time.time())
+    if not inicio:
+        return {"indisponivel": True, "motivo": "campanha sem período definido"}
+    if inicio > agora:
+        return {"indisponivel": True, "motivo": "a campanha ainda não começou"}
+    produtos = {p["item_id"] for p in d.get("itens", []) if p.get("item_id")}
+    if not produtos:
+        return {"indisponivel": True, "motivo": "campanha sem produtos vinculados"}
+
+    pedidos, total_periodo, parcial = _pedidos_itens_periodo(user_id, inicio, fim or agora)
+    unidades = receita = pedidos_com = atribuidos = 0
+    for o in pedidos:
+        tem = False
+        for it in (o.get("item_list") or []):
+            if it.get("item_id") in produtos:
+                q = int(it.get("model_quantity_purchased") or it.get("quantity_purchased") or 0)
+                preco = float(it.get("model_discounted_price") or it.get("discounted_price")
+                              or it.get("model_original_price") or 0)
+                unidades += q
+                receita += preco * q
+                tem = True
+                if str(it.get("promotion_id") or "") == str(cid):
+                    atribuidos += q
+        if tem:
+            pedidos_com += 1
+    out = {"pedidos_com_produto": pedidos_com, "unidades": unidades, "receita": round(receita, 2),
+           "atribuido_promo": atribuidos, "pedidos_no_periodo": total_periodo, "parcial": parcial,
+           "ticket_medio": round(receita / pedidos_com, 2) if pedidos_com else 0,
+           "janela_inicio": inicio, "janela_fim": min(fim or agora, agora)}
+    _DESEMP_CACHE[chave] = {**out, "_ts": time.time()}
+    return out
+
+
+def repetir_campanha(user_id: int, tipo: str, cid) -> dict:
+    """Recria uma campanha igual, com um novo período (mesma duração, começando em ~5 min).
+    Suporta desconto, bundle e addon (flash depende de slot; cupom é recriado pela tela)."""
+    agora = int(time.time())
+    inicio = agora + 300
+    if tipo == "desconto":
+        r = _chamar(user_id, "/api/v2/discount/get_discount",
+                    extra={"discount_id": int(cid), "page_no": 1, "page_size": 100})
+        resp = r.get("response") or {}
+        itens = []
+        for it in (resp.get("item_list") or []):
+            models = [{"model_id": m.get("model_id"), "model_promotion_price": m.get("model_promotion_price")}
+                      for m in (it.get("model_list") or []) if m.get("model_promotion_price")]
+            if not models:
+                ip = it.get("item_promotion_price")
+                if ip:
+                    models = [{"model_id": 0, "model_promotion_price": ip}]
+            if models:
+                itens.append({"item_id": it.get("item_id"),
+                              "purchase_limit": it.get("purchase_limit", 0), "model_list": models})
+        if not itens:
+            raise ShopeeError("A campanha original não tem produtos para repetir.")
+        dur = (resp.get("end_time") or 0) - (resp.get("start_time") or 0)
+        fim = inicio + max(3600, dur or 3 * 86400)
+        nome = (resp.get("discount_name") or "Desconto")[:24] + " (repetida)"
+        out = criar_desconto(user_id, nome, inicio, fim, itens)
+        return {"tipo": "desconto", "novo_id": (out.get("response") or {}).get("discount_id"),
+                "itens": out.get("itens_adicionados", len(itens))}
+
+    if tipo == "bundle":
+        det = detalhe_bundle(user_id, cid)
+        ids = [p["item_id"] for p in det.get("itens", [])]
+        if not ids:
+            raise ShopeeError("O combo original não tem produtos para repetir.")
+        regra = det.get("regra") or {}
+        dur = (det.get("fim") or 0) - (det.get("inicio") or 0)
+        fim = inicio + max(3600, dur or 7 * 86400)
+        out = criar_bundle(user_id, (det.get("nome") or "Combo")[:24] + " (rep.)", inicio, fim,
+                           int(regra.get("rule_type") or 2), float(regra.get("valor") or 0),
+                           int(regra.get("min_itens") or 2), ids)
+        return {"tipo": "bundle", "novo_id": (out.get("response") or {}).get("bundle_deal_id"),
+                "itens": out.get("itens_adicionados", len(ids))}
+
+    if tipo == "addon":
+        det = detalhe_addon(user_id, cid)
+        principais = [p["item_id"] for p in det.get("principais", [])]
+        adicionais = [{"item_id": p["item_id"], "add_on_deal_price": p.get("preco_promo") or 0}
+                      for p in det.get("adicionais", [])]
+        if not principais:
+            raise ShopeeError("O add-on original não tem produto principal para repetir.")
+        dur = (det.get("fim") or 0) - (det.get("inicio") or 0)
+        fim = inicio + max(3600, dur or 7 * 86400)
+        out = criar_addon(user_id, (det.get("nome") or "Add-on")[:24] + " (rep.)", inicio, fim,
+                          principais, adicionais)
+        return {"tipo": "addon", "novo_id": (out.get("response") or {}).get("add_on_deal_id"),
+                "itens": out.get("principais_ok", len(principais))}
+
+    raise ShopeeError(f"Repetir ainda não é suportado para o tipo '{tipo}'.")
+    """Cria uma campanha de desconto na Shopee. São DOIS passos na API v2:
+    1) add_discount cria a campanha (nome + datas) e devolve discount_id;
+    2) add_discount_item anexa os produtos (o add_discount NÃO aceita itens).
+    Sem o passo 2 a promoção nasce sem produtos. Anexa em lotes de 50."""
+    r = _chamar(user_id, "/api/v2/discount/add_discount", metodo="POST",
+                extra={"discount_name": nome, "start_time": inicio, "end_time": fim})
+    did = (r.get("response") or {}).get("discount_id")
+    out = {"response": {"discount_id": did}, "itens_adicionados": 0, "item_erros": []}
+    if not did or not itens:
+        if not did:
+            out["item_erros"].append("a Shopee não retornou discount_id ao criar a campanha")
+        return out
+    adicionados = 0
+    for i in range(0, len(itens), 50):  # add_discount_item aceita até 50 por chamada
+        lote = itens[i:i + 50]
+        ri = _chamar(user_id, "/api/v2/discount/add_discount_item", metodo="POST",
+                     extra={"discount_id": did, "item_list": lote})
+        resp_i = ri.get("response") or {}
+        erros = resp_i.get("error_list") or resp_i.get("fail_list") or []
+        adicionados += len(lote) - len(erros)
+        for e in erros:
+            if isinstance(e, dict):
+                out["item_erros"].append(
+                    f"item {e.get('item_id')}: {e.get('fail_error') or e.get('fail_message') or e.get('error')}")
+    out["itens_adicionados"] = adicionados
+    return out
+
+
+def add_discount_item(user_id: int, discount_id, itens: list) -> dict:
+    """Anexa/atualiza produtos numa campanha de desconto existente (lotes de 50)."""
+    adicionados, item_erros = 0, []
+    for i in range(0, len(itens), 50):
+        lote = itens[i:i + 50]
+        ri = _chamar(user_id, "/api/v2/discount/add_discount_item", metodo="POST",
+                     extra={"discount_id": int(discount_id), "item_list": lote})
+        resp_i = ri.get("response") or {}
+        erros = resp_i.get("error_list") or resp_i.get("fail_list") or []
+        adicionados += len(lote) - len(erros)
+        item_erros.extend(erros)
+    return {"discount_id": discount_id, "itens_adicionados": adicionados, "item_erros": item_erros}
 
 
 def itens_desconto_por_pct(user_id: int, itens: list) -> list:
@@ -539,11 +947,18 @@ def criar_bundle(user_id: int, nome: str, inicio: int, fim: int, rule_type: int,
                                   "min_amount": min_itens, "max_amount": 0}}
     r = _chamar(user_id, "/api/v2/bundle_deal/add_bundle_deal", metodo="POST", extra=corpo)
     bid = (r.get("response") or {}).get("bundle_deal_id")
-    if bid and item_ids:
-        _chamar(user_id, "/api/v2/bundle_deal/add_bundle_deal_item", metodo="POST",
-                extra={"bundle_deal_id": bid,
-                       "item_list": [{"item_id": int(i)} for i in item_ids]})
-    return r
+    out = {"response": {"bundle_deal_id": bid}, "itens_adicionados": 0, "item_erros": []}
+    if not bid:
+        raise ShopeeError("A Shopee não retornou bundle_deal_id ao criar o combo.")
+    if item_ids:
+        ri = _chamar(user_id, "/api/v2/bundle_deal/add_bundle_deal_item", metodo="POST",
+                     extra={"bundle_deal_id": bid,
+                            "item_list": [{"item_id": int(i)} for i in item_ids]})
+        resp_i = ri.get("response") or {}
+        erros = resp_i.get("error_list") or resp_i.get("fail_list") or []
+        out["itens_adicionados"] = len(item_ids) - len(erros)
+        out["item_erros"] = erros
+    return out
 
 
 def encerrar_bundle(user_id: int, bundle_deal_id) -> dict:
@@ -566,18 +981,28 @@ def criar_addon(user_id: int, nome: str, inicio: int, fim: int,
              "promotion_type": promotion_type}
     r = _chamar(user_id, "/api/v2/add_on_deal/add_add_on_deal", metodo="POST", extra=corpo)
     aid = (r.get("response") or {}).get("add_on_deal_id")
-    if aid:
-        if principais:
-            _chamar(user_id, "/api/v2/add_on_deal/add_add_on_deal_main_item", metodo="POST",
-                    extra={"add_on_deal_id": aid,
-                           "main_item_list": [{"item_id": int(i), "status": 1} for i in principais]})
-        if adicionais:
-            _chamar(user_id, "/api/v2/add_on_deal/add_add_on_deal_sub_item", metodo="POST",
-                    extra={"add_on_deal_id": aid,
-                           "sub_item_list": [{"item_id": int(s["item_id"]),
-                                              "add_on_deal_price": float(s["add_on_deal_price"]),
-                                              "status": 1} for s in adicionais]})
-    return r
+    out = {"response": {"add_on_deal_id": aid}, "principais_ok": 0, "adicionais_ok": 0, "item_erros": []}
+    if not aid:
+        raise ShopeeError("A Shopee não retornou add_on_deal_id ao criar o add-on.")
+    if principais:
+        rp = _chamar(user_id, "/api/v2/add_on_deal/add_add_on_deal_main_item", metodo="POST",
+                     extra={"add_on_deal_id": aid,
+                            "main_item_list": [{"item_id": int(i), "status": 1} for i in principais]})
+        ep = (rp.get("response") or {}).get("error_list") or []
+        out["principais_ok"] = len(principais) - len(ep)
+        out["item_erros"] += [f"principal {e.get('item_id')}: {e.get('fail_error') or e.get('error')}"
+                              for e in ep if isinstance(e, dict)]
+    if adicionais:
+        rs = _chamar(user_id, "/api/v2/add_on_deal/add_add_on_deal_sub_item", metodo="POST",
+                     extra={"add_on_deal_id": aid,
+                            "sub_item_list": [{"item_id": int(s["item_id"]),
+                                               "add_on_deal_price": float(s["add_on_deal_price"]),
+                                               "status": 1} for s in adicionais]})
+        es = (rs.get("response") or {}).get("error_list") or []
+        out["adicionais_ok"] = len(adicionais) - len(es)
+        out["item_erros"] += [f"adicional {e.get('item_id')}: {e.get('fail_error') or e.get('error')}"
+                              for e in es if isinstance(e, dict)]
+    return out
 
 
 def encerrar_addon(user_id: int, add_on_deal_id) -> dict:

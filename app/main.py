@@ -765,6 +765,15 @@ def shopee_pedidos(dias: int = 7, cursor: str = "", user: User = Depends(auth.ge
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/api/shopee/financeiro/margem-real")
+def shopee_margem_real(dias: int = 7, limite: int = 40, user: User = Depends(auth.get_current_user)):
+    """Margem líquida REAL por pedido: repasse da Shopee × custo do produto. Caro — cacheado ~20min."""
+    try:
+        return shopee.margem_real(user.id, dias=dias, limite_pedidos=limite)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/api/shopee/pedidos/{order_sn}/repasse")
 def shopee_repasse(order_sn: str, user: User = Depends(auth.get_current_user)):
     """Escrow: valor líquido real recebido (preço − comissão − taxas)."""
@@ -787,16 +796,51 @@ def shopee_descontos(status: str = "ongoing", user: User = Depends(auth.get_curr
 def shopee_criar_desconto(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Body: {nome, inicio (epoch), fim (epoch), itens:[{item_id, promotion_price, ...}]}."""
     try:
-        return shopee.criar_desconto(user.id, payload["nome"], int(payload["inicio"]),
-                                     int(payload["fim"]), payload.get("itens", []))
+        itens = payload.get("itens", [])
+        res = shopee.criar_desconto(user.id, payload["nome"], int(payload["inicio"]),
+                                    int(payload["fim"]), itens)
+        if itens and not res.get("itens_adicionados"):
+            motivo = (res.get("item_erros") or ["nenhum produto elegível entrou"])[0]
+            raise HTTPException(status_code=502,
+                detail=f"O desconto foi criado, mas SEM produtos: {motivo}. "
+                       "Verifique se os anúncios estão ativos e elegíveis a desconto.")
+        return res
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Informe nome, inicio, fim e itens.")
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@app.delete("/api/shopee/descontos/{discount_id}")
-def shopee_encerrar_desconto(discount_id: str, user: User = Depends(auth.get_current_user)):
+@app.get("/api/shopee/campanha/{tipo}/{cid}/desempenho")
+def shopee_campanha_desempenho(tipo: str, cid: str, user: User = Depends(auth.get_current_user)):
+    """Vendas dos produtos da campanha no período dela (pedidos × produtos). Caro — cacheado ~10min."""
+    try:
+        return shopee.desempenho_campanha(user.id, tipo, cid)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/campanha/{tipo}/{cid}/repetir")
+def shopee_campanha_repetir(tipo: str, cid: str, user: User = Depends(auth.get_current_user)):
+    """Recria a campanha igual, com novo período (mesma duração, começando em ~5 min)."""
+    try:
+        return shopee.repetir_campanha(user.id, tipo, cid)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/campanha/{tipo}/{cid}")
+def shopee_campanha_detalhe(tipo: str, cid: str, user: User = Depends(auth.get_current_user)):
+    """Detalhe de uma campanha COM os produtos (nome, imagem, preço de/por).
+    tipo: desconto | bundle | addon | flash."""
+    fn = {"desconto": shopee.detalhe_desconto, "bundle": shopee.detalhe_bundle,
+          "addon": shopee.detalhe_addon, "flash": shopee.detalhe_flash}.get(tipo)
+    if not fn:
+        raise HTTPException(status_code=404, detail="Tipo de campanha desconhecido.")
+    try:
+        return fn(user.id, cid)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     try:
         return shopee.encerrar_desconto(user.id, discount_id)
     except shopee.ShopeeError as e:
@@ -912,10 +956,17 @@ def shopee_bundles(status: str = "ongoing", user: User = Depends(auth.get_curren
 def shopee_criar_bundle(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Body: {nome, inicio, fim, rule_type(1=preço fixo,2=%,3=valor), valor, min_itens, item_ids:[]}."""
     try:
-        return shopee.criar_bundle(user.id, payload["nome"], int(payload["inicio"]),
-                                   int(payload["fim"]), int(payload["rule_type"]),
-                                   float(payload["valor"]), int(payload.get("min_itens", 2)),
-                                   payload.get("item_ids", []))
+        ids = payload.get("item_ids", [])
+        res = shopee.criar_bundle(user.id, payload["nome"], int(payload["inicio"]),
+                                  int(payload["fim"]), int(payload["rule_type"]),
+                                  float(payload["valor"]), int(payload.get("min_itens", 2)), ids)
+        if ids and not res.get("itens_adicionados"):
+            motivo = (res.get("item_erros") or ["nenhum produto entrou no combo"])
+            motivo = motivo[0] if isinstance(motivo[0], str) else str(motivo[0])
+            raise HTTPException(status_code=502,
+                detail=f"O combo foi criado, mas SEM produtos: {motivo}. "
+                       "Bundles exigem produtos elegíveis e regra válida (ex.: mínimo 2 itens).")
+        return res
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Faltam campos do bundle.")
     except shopee.ShopeeError as e:
@@ -943,9 +994,16 @@ def shopee_addons(status: str = "ongoing", user: User = Depends(auth.get_current
 def shopee_criar_addon(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Body: {nome, inicio, fim, principais:[item_id], adicionais:[{item_id, add_on_deal_price}]}."""
     try:
-        return shopee.criar_addon(user.id, payload["nome"], int(payload["inicio"]),
-                                  int(payload["fim"]), payload.get("principais", []),
-                                  payload.get("adicionais", []), int(payload.get("promotion_type", 0)))
+        principais = payload.get("principais", [])
+        res = shopee.criar_addon(user.id, payload["nome"], int(payload["inicio"]),
+                                 int(payload["fim"]), principais,
+                                 payload.get("adicionais", []), int(payload.get("promotion_type", 0)))
+        if principais and not res.get("principais_ok"):
+            motivo = (res.get("item_erros") or ["o produto principal não pôde ser adicionado"])[0]
+            raise HTTPException(status_code=502,
+                detail=f"O add-on foi criado, mas sem o produto principal: {motivo}. "
+                       "Verifique se o anúncio principal está ativo e elegível.")
+        return res
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Faltam campos do add-on.")
     except shopee.ShopeeError as e:
