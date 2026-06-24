@@ -164,6 +164,10 @@ def _funil(user_id: int, cfg):
 
     teto, piso = cfg.desconto_max or 15, float(cfg.piso_margem if cfg.piso_margem is not None else 10.0)
     est_min = cfg.estoque_minimo or 0
+    estrategia = cfg.estrategia or "estoque_parado"
+    # estoque parado = produtos SEM vendas. Cruza com o histórico real de pedidos.
+    vendas = shopee.vendas_por_sku(user_id) if estrategia != "margem_alta" else {}
+    diag["sem_vendas"] = 0
     out = []
     for it in shop_itens:
         sku = it.get("item_sku") or it.get("sku")
@@ -193,18 +197,23 @@ def _funil(user_id: int, cfg):
         if d <= 0:
             continue
         diag["com_desconto_seguro"] += 1
+        vendidos = int(vendas.get(sku, 0))
+        if vendidos == 0:
+            diag["sem_vendas"] += 1
         preco_promo = round(preco * (1 - d / 100.0), 2)
         out.append({
             "item_id": str(it.get("item_id")), "nome": it.get("item_name") or sku, "sku": sku,
             "estoque": estoque, "preco_atual": round(preco, 2), "preco_promo": preco_promo,
             "desconto_pct": d, "margem_promo": round(margem_no_preco(cfg_prec, preco_promo, custo), 1),
-            "margem_cheia": round(margem_cheia, 1),
+            "margem_cheia": round(margem_cheia, 1), "vendidos": vendidos,
         })
 
-    if (cfg.estrategia or "estoque_parado") == "margem_alta":
+    if estrategia == "margem_alta":
         out.sort(key=lambda x: x["margem_promo"], reverse=True)
     else:
-        out.sort(key=lambda x: x["estoque"], reverse=True)
+        # ESTOQUE PARADO: menos vendas primeiro, depois mais estoque (capital parado na prateleira).
+        # Assim os campeões de venda ("coringas") ficam por último e não entram no desconto.
+        out.sort(key=lambda x: (x.get("vendidos", 0), -x["estoque"]))
     out = out[: cfg.max_produtos or 20]
     diag["elegiveis"] = len(out)
     return out, diag

@@ -291,6 +291,32 @@ def itens_impulsionados(user_id: int) -> dict:
 
 
 # ------------------------------ Avaliações -------------------------------- #
+def todos_item_ids(user_id: int, max_paginas: int = 120) -> list:
+    """Todos os item_id da loja (get_item_list cru, sem enriquecer). Pagina por offset."""
+    ids, offset = [], 0
+    for _ in range(max_paginas):
+        r = _chamar(user_id, "/api/v2/product/get_item_list",
+                    extra={"offset": offset, "page_size": 100, "item_status": "NORMAL"})
+        resp = r.get("response") or {}
+        lote = resp.get("item") or []
+        ids.extend(int(it["item_id"]) for it in lote if it.get("item_id"))
+        if not resp.get("has_next_page"):
+            break
+        offset = resp.get("next_offset") or (offset + 100)
+    return ids
+
+
+def comentarios_brutos(user_id: int, item_id=None, status: str = "UNANSWERED",
+                       cursor: str = "", limite: int = 100) -> dict:
+    """get_comment CRU (sem enriquecer com nome/foto) — usado na varredura em massa.
+    Retorna o bloco 'response' {item_comment_list, more, next_cursor}."""
+    extra = {"cursor": cursor, "page_size": min(limite, 100), "comment_status": status}
+    if item_id:
+        extra["item_id"] = int(item_id)
+    r = _chamar(user_id, "/api/v2/product/get_comment", extra=extra)
+    return r.get("response") or {}
+
+
 def listar_avaliacoes(user_id: int, item_id=None, cursor: str = "", limite: int = 20,
                       status: str = "UNANSWERED") -> dict:
     """Comentários/avaliações já enriquecidos com nome e foto do produto.
@@ -871,6 +897,33 @@ def _pedidos_itens_periodo(user_id: int, inicio: int, fim: int, max_paginas: int
         except ShopeeError:
             continue
     return pedidos, len(sns), parcial
+
+
+_VENDAS_SKU_CACHE: dict = {}  # user_id -> (ts, {sku: unidades})
+
+
+def vendas_por_sku(user_id: int, dias: int = 30, ttl: int = 1800) -> dict:
+    """Unidades vendidas por SKU nos últimos `dias`, a partir do histórico de pedidos.
+    Usado para achar ESTOQUE PARADO (SKUs sem/poucas vendas). Cacheia ~30 min."""
+    ag = time.time()
+    cache = _VENDAS_SKU_CACHE.get(user_id)
+    if cache and ag - cache[0] < ttl:
+        return cache[1]
+    fim = int(ag)
+    inicio = fim - int(dias) * 86400
+    try:
+        pedidos, _, _ = _pedidos_itens_periodo(user_id, inicio, fim, max_paginas=12)
+    except ShopeeError:
+        pedidos = []
+    vendas: dict = {}
+    for o in pedidos:
+        for it in (o.get("item_list") or []):
+            sku = it.get("model_sku") or it.get("item_sku")
+            if not sku:
+                continue
+            vendas[sku] = vendas.get(sku, 0) + int(it.get("model_quantity_purchased") or 0)
+    _VENDAS_SKU_CACHE[user_id] = (ag, vendas)
+    return vendas
 
 
 def desempenho_campanha(user_id: int, tipo: str, cid) -> dict:

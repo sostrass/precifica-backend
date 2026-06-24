@@ -281,22 +281,25 @@ def parar_agente(user_id: int) -> dict:
     return {"acao": "parando"}
 
 
-def iniciar_mutirao(user_id: int) -> dict:
+def iniciar_mutirao(user_id: int, completo: bool = False) -> dict:
     """Dispara o agente para responder TODA a fila pendente (notas-alvo), em uma thread
-    de fundo, com pausa entre cada resposta e progresso ao vivo. Não bloqueia a requisição."""
+    de fundo, com pausa entre cada resposta e progresso ao vivo. Não bloqueia a requisição.
+    completo=True: varre TODOS os produtos um a um para alcançar avaliações antigas
+    (a busca global da Shopee só devolve ~1.000 mais recentes)."""
     if _prog(user_id).get("em_andamento"):
         return {"acao": "ja_rodando", "msg": "O agente já está respondendo agora."}
     _PARAR.discard(user_id)
     _set_prog(user_id, em_andamento=True, fase="descobrindo", processados=0, alvo=0,
-              inicio=datetime.utcnow().isoformat(), fim=None, ultimo=None)
-    t = threading.Thread(target=_rodar_mutirao, args=(user_id,), daemon=True)
+              inicio=datetime.utcnow().isoformat(), fim=None, ultimo=None, completo=bool(completo))
+    t = threading.Thread(target=_rodar_mutirao, args=(user_id, bool(completo)), daemon=True)
     t.start()
+    modo = "varredura completa (todos os produtos)" if completo else "as avaliações recentes"
     return {"acao": "iniciado",
-            "mensagem": "O agente começou a responder a fila inteira em segundo plano, "
+            "mensagem": f"O agente começou a responder {modo} em segundo plano, "
                         "com pausa entre cada resposta. Acompanhe o progresso aqui."}
 
 
-def _rodar_mutirao(user_id: int):
+def _rodar_mutirao(user_id: int, completo: bool = False):
     """Fase 1: descobre todos os pendentes-alvo paginando a Shopee (rápido).
     Fase 2: responde um por um, com pausa, atualizando o progresso. Respeita 'parar'."""
     db = SessionLocal()
@@ -313,27 +316,70 @@ def _rodar_mutirao(user_id: int):
         db.close()
 
     pendentes, respondidos, falhas = [], 0, 0
+    vistos = set()  # comment_id já coletados (evita duplicar entre passada global e por produto)
+
+    def _coletar(coments):
+        for c in coments:
+            cid = c.get("comment_id")
+            if cid in vistos:
+                continue
+            if (c.get("comment_reply") or {}).get("reply"):
+                continue
+            if c.get("rating_star") in alvos:
+                vistos.add(cid)
+                pendentes.append(c)
+
     try:
-        # FASE 1 — descobrir a fila completa (paginação por cursor)
+        # FASE 1a — passada GLOBAL (rápida): pega as ~1.000 avaliações mais recentes
         cursor = ""
-        for _ in range(400):  # teto de segurança: 400 páginas (40k avaliações)
+        for _ in range(15):
             if user_id in _PARAR:
                 break
             try:
-                r = shopee.listar_avaliacoes(user_id, cursor=cursor, limite=100, status="UNANSWERED")
+                resp = shopee.comentarios_brutos(user_id, status="UNANSWERED", cursor=cursor, limite=100)
             except shopee.ShopeeError:
                 break
-            resp = r.get("response") or {}
-            for c in resp.get("item_comment_list") or []:
-                if (c.get("comment_reply") or {}).get("reply"):
-                    continue
-                if c.get("rating_star") in alvos:
-                    pendentes.append(c)
+            _coletar(resp.get("item_comment_list") or [])
             _set_prog(user_id, fase="descobrindo", alvo=len(pendentes))
             cursor = resp.get("next_cursor") or ""
             if not resp.get("more") or not cursor:
                 break
             time.sleep(0.15)
+
+        # FASE 1b — varredura POR PRODUTO (alcança as antigas além do limite global da Shopee)
+        if completo and user_id not in _PARAR:
+            try:
+                item_ids = shopee.todos_item_ids(user_id)
+            except shopee.ShopeeError:
+                item_ids = []
+            total_prod = len(item_ids)
+            for idx, iid in enumerate(item_ids):
+                if user_id in _PARAR:
+                    break
+                cur2 = ""
+                for _ in range(20):  # por produto raramente passa de 1 página
+                    try:
+                        resp = shopee.comentarios_brutos(user_id, item_id=iid, status="UNANSWERED",
+                                                         cursor=cur2, limite=100)
+                    except shopee.ShopeeError:
+                        break
+                    _coletar(resp.get("item_comment_list") or [])
+                    cur2 = resp.get("next_cursor") or ""
+                    if not resp.get("more") or not cur2:
+                        break
+                if idx % 10 == 0 or idx == total_prod - 1:
+                    _set_prog(user_id, fase="varrendo_produtos", alvo=len(pendentes),
+                              prod_atual=idx + 1, prod_total=total_prod)
+                time.sleep(0.06)  # respeita o limite de chamadas da Shopee
+
+        # enriquece a fila com nome do produto, em lotes (para o prompt da IA)
+        try:
+            ids_unicos = list({c.get("item_id") for c in pendentes if c.get("item_id")})
+            meta = shopee.nomes_itens(user_id, ids_unicos) if ids_unicos else {}
+            for c in pendentes:
+                c["produto_nome"] = (meta.get(c.get("item_id")) or {}).get("nome")
+        except shopee.ShopeeError:
+            pass
 
         _set_prog(user_id, fase="respondendo", alvo=len(pendentes), processados=0)
 

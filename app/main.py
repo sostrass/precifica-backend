@@ -707,10 +707,11 @@ def shopee_review_auto(background_tasks: BackgroundTasks, user: User = Depends(a
 
 
 @app.post("/api/shopee/avaliacoes/mutirao")
-def shopee_review_mutirao(user: User = Depends(auth.get_current_user)):
+def shopee_review_mutirao(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
     """Responde a fila INTEIRA de pendentes (notas-alvo), em segundo plano, com pausa
-    entre cada resposta e progresso ao vivo (acompanhe em /atividade)."""
-    return shopee_reviews.iniciar_mutirao(user.id)
+    entre cada resposta e progresso ao vivo (acompanhe em /atividade).
+    Body opcional: {completo: true} varre TODOS os produtos para alcançar avaliações antigas."""
+    return shopee_reviews.iniciar_mutirao(user.id, completo=bool((payload or {}).get("completo")))
 
 
 @app.post("/api/shopee/avaliacoes/parar")
