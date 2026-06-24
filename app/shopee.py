@@ -320,6 +320,106 @@ def responder_avaliacao(user_id: int, comment_id, texto: str) -> dict:
 
 
 # ------------------------------- Pedidos ---------------------------------- #
+_STATUS_PEDIDO = {
+    "A_ENVIAR": ["READY_TO_SHIP", "PROCESSED"],
+    "ENVIADO": ["SHIPPED"],
+    "CONCLUIDO": ["COMPLETED"],
+    "CANCELADO": ["CANCELLED", "IN_CANCEL"],
+    "NAO_PAGO": ["UNPAID"],
+}
+
+
+def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limite: int = 100) -> dict:
+    """Pedidos enriquecidos (produto, SKU, imagem, valor pago) + análise de valor:
+    compara o que o comprador pagou com o seu preço de tabela (catálogo) e marca
+    quando a venda saiu abaixo do preço. Ordena pelos mais urgentes (ship_by)."""
+    from . import catalogo
+    agora = int(time.time())
+    inicio = agora - max(1, dias) * 86400
+    statuses = _STATUS_PEDIDO.get(status, ["READY_TO_SHIP"])
+
+    sns = []
+    for st in statuses:
+        cursor = ""
+        for _ in range(6):
+            r = _chamar(user_id, "/api/v2/order/get_order_list",
+                        extra={"time_range_field": "create_time", "time_from": inicio, "time_to": agora,
+                               "page_size": 100, "cursor": cursor, "order_status": st})
+            resp = r.get("response") or {}
+            for o in (resp.get("order_list") or []):
+                if o.get("order_sn"):
+                    sns.append(o["order_sn"])
+            cursor = resp.get("next_cursor") or ""
+            if not resp.get("more") or not cursor or len(sns) >= limite:
+                break
+        if len(sns) >= limite:
+            break
+    sns = sns[:limite]
+
+    cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    pedidos = []
+    for i in range(0, len(sns), 50):
+        lote = sns[i:i + 50]
+        try:
+            rd = _chamar(user_id, "/api/v2/order/get_order_detail",
+                         extra={"order_sn_list": ",".join(lote),
+                                "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time"})
+        except ShopeeError:
+            continue
+        for o in ((rd.get("response") or {}).get("order_list") or []):
+            itens, total, abaixo, sem_cad = [], 0.0, False, False
+            for it in (o.get("item_list") or []):
+                sku = it.get("model_sku") or it.get("item_sku")
+                qtd = int(it.get("model_quantity_purchased") or 0)
+                pago = float(it.get("model_discounted_price") or it.get("model_original_price") or 0)
+                total += pago * qtd
+                base = cat.get(sku)
+                preco_tab = float(base.get("preco") or 0) if base else None
+                custo = float(base.get("custo") or 0) if base else None
+                dif = round(pago - preco_tab, 2) if preco_tab else None
+                if preco_tab and pago < preco_tab - 0.01:
+                    abaixo = True
+                if base is None:
+                    sem_cad = True
+                itens.append({
+                    "nome": it.get("item_name") or f"#{it.get('item_id')}", "sku": sku, "qtd": qtd,
+                    "preco_pago": round(pago, 2), "imagem": (it.get("image_info") or {}).get("image_url"),
+                    "preco_tabela": preco_tab, "custo": custo, "dif": dif, "tem_cadastro": base is not None,
+                })
+            rec = o.get("recipient_address") or {}
+            pedidos.append({
+                "order_sn": o.get("order_sn"), "status": o.get("order_status"),
+                "comprador": o.get("buyer_username") or rec.get("name") or "—",
+                "cliente": rec.get("name"), "cidade": rec.get("city"), "uf": rec.get("state"),
+                "ship_by": o.get("ship_by_date"), "criado": o.get("create_time"),
+                "total_pago": round(total, 2), "abaixo_preco": abaixo, "sem_cadastro": sem_cad,
+                "itens": itens,
+            })
+    pedidos.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
+    resumo = {"total": len(pedidos), "abaixo_preco": sum(1 for p in pedidos if p["abaixo_preco"]),
+              "receita": round(sum(p["total_pago"] for p in pedidos), 2),
+              "unidades": sum(sum(i["qtd"] for i in p["itens"]) for p in pedidos)}
+    return {"status": status, "pedidos": pedidos, "resumo": resumo}
+
+
+def lista_separacao(user_id: int, status: str = "A_ENVIAR", dias: int = 15) -> dict:
+    """Lista de separação/picking: agrega todos os produtos dos pedidos do status,
+    em ORDEM ALFABÉTICA, com a quantidade total a separar e em quantos pedidos aparece."""
+    pain = pedidos_painel(user_id, status, dias, limite=300)
+    agg = {}
+    for p in pain["pedidos"]:
+        for it in p["itens"]:
+            k = it["sku"] or it["nome"]
+            a = agg.setdefault(k, {"nome": it["nome"], "sku": it["sku"], "qtd": 0, "pedidos": set()})
+            a["qtd"] += it["qtd"]
+            a["pedidos"].add(p["order_sn"])
+    linhas = sorted(
+        [{"nome": a["nome"], "sku": a["sku"], "qtd": a["qtd"], "pedidos": len(a["pedidos"])} for a in agg.values()],
+        key=lambda x: (x["nome"] or "").lower())
+    return {"itens": linhas, "total_unidades": sum(l["qtd"] for l in linhas),
+            "skus": len(linhas), "pedidos": pain["resumo"]["total"], "status": status}
+
+
 def listar_pedidos(user_id: int, dias: int = 7, cursor: str = "", limite: int = 50) -> dict:
     agora = int(time.time())
     return _chamar(user_id, "/api/v2/order/get_order_list",
@@ -863,6 +963,9 @@ def repetir_campanha(user_id: int, tipo: str, cid) -> dict:
                 "itens": out.get("principais_ok", len(principais))}
 
     raise ShopeeError(f"Repetir ainda não é suportado para o tipo '{tipo}'.")
+
+
+def criar_desconto(user_id: int, nome: str, inicio: int, fim: int, itens: list) -> dict:
     """Cria uma campanha de desconto na Shopee. São DOIS passos na API v2:
     1) add_discount cria a campanha (nome + datas) e devolve discount_id;
     2) add_discount_item anexa os produtos (o add_discount NÃO aceita itens).

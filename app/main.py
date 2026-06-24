@@ -102,27 +102,31 @@ async def _agendador_reviews():
 
 
 async def _agendador_promo():
-    """Motor de promoções: a cada 6h tira uma foto das vendas (para detectar queda)
-    e, para quem está em modo automático, roda o ciclo (agendado ou por queda)."""
+    """Motor de promoções: roda logo após subir e a cada 30 min. Tira foto das vendas
+    a cada ~6h (para detectar queda) e roda o ciclo de quem está em modo automático
+    (o auto_ciclo respeita o intervalo configurado internamente)."""
     loop = asyncio.get_event_loop()
+    await asyncio.sleep(120)  # primeira passada ~2min após o boot (não espera 6h)
+    ticks = 0
     while True:
-        await asyncio.sleep(6 * 3600)  # 6 horas
         try:
             from .models import ShopeePromoConfig, ShopeeConta
             db = SessionLocal()
             try:
-                # tira foto das vendas de toda loja conectada
                 lojas = [c.user_id for c in db.query(ShopeeConta).all()]
                 autos = [c.user_id for c in db.query(ShopeePromoConfig)
                          .filter_by(ativo=True, modo="auto").all()]
             finally:
                 db.close()
-            for uid in lojas:
-                await loop.run_in_executor(None, shopee_promo_auto.snapshot_vendas, uid)
-            for uid in autos:
+            if ticks % 12 == 0:  # snapshot de vendas ~a cada 6h
+                for uid in lojas:
+                    await loop.run_in_executor(None, shopee_promo_auto.snapshot_vendas, uid)
+            for uid in autos:  # auto_ciclo respeita o intervalo internamente
                 await loop.run_in_executor(None, shopee_promo_auto.auto_ciclo, uid)
         except Exception:  # noqa: BLE001 — nunca derruba o app
             pass
+        ticks += 1
+        await asyncio.sleep(1800)  # 30 min
 
 
 @asynccontextmanager
@@ -737,8 +741,16 @@ def shopee_promo_config_get(user: User = Depends(auth.get_current_user)):
 
 
 @app.put("/api/shopee/promo/config")
-def shopee_promo_config_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
-    return shopee_promo_auto.salvar_config(user.id, payload)
+def shopee_promo_config_put(background_tasks: BackgroundTasks, payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    antes = shopee_promo_auto.obter_config(user.id)
+    cfg = shopee_promo_auto.salvar_config(user.id, payload)
+    # Acabou de ligar o modo automático? roda um ciclo na hora (em segundo plano),
+    # pra "selecionar auto" já produzir ação — depois o agendador mantém a cadência.
+    virou_auto = cfg.get("ativo") and cfg.get("modo") == "auto" and (
+        not antes.get("ativo") or antes.get("modo") != "auto")
+    if virou_auto:
+        background_tasks.add_task(shopee_promo_auto.auto_ciclo_forcado, user.id)
+    return {**cfg, "disparo_imediato": bool(virou_auto)}
 
 
 @app.post("/api/shopee/promo/propor")
@@ -791,6 +803,24 @@ def shopee_promo_historico(user: User = Depends(auth.get_current_user)):
 def shopee_pedidos(dias: int = 7, cursor: str = "", user: User = Depends(auth.get_current_user)):
     try:
         return shopee.listar_pedidos(user.id, dias=dias, cursor=cursor)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/pedidos/painel")
+def shopee_pedidos_painel(status: str = "A_ENVIAR", dias: int = 15, user: User = Depends(auth.get_current_user)):
+    """Pedidos enriquecidos + análise de valor (pago x preço de tabela)."""
+    try:
+        return shopee.pedidos_painel(user.id, status=status, dias=dias)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/pedidos/separacao")
+def shopee_pedidos_separacao(status: str = "A_ENVIAR", dias: int = 15, user: User = Depends(auth.get_current_user)):
+    """Lista de separação (produtos em ordem alfabética + quantidade total)."""
+    try:
+        return shopee.lista_separacao(user.id, status=status, dias=dias)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

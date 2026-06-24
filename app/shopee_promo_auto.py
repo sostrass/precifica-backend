@@ -466,6 +466,31 @@ def aplicar_agora(user_id: int) -> dict:
     return {"acao": "aplicado", "propostas": propostas, **res}
 
 
+def auto_ciclo_forcado(user_id: int) -> dict:
+    """Igual ao auto_ciclo, mas IGNORA o intervalo (usado quando o usuário acabou de
+    ligar o modo automático — dispara já). Mantém todas as travas (piso, estoque)."""
+    db = SessionLocal()
+    try:
+        cfg = _config(db, user_id)
+        if not cfg.ativo or cfg.modo != "auto":
+            return {"acao": "ocioso"}
+        snap = _serializar(cfg)
+    finally:
+        db.close()
+    propostas = _candidatos(user_id, _ConfigView(snap))
+    if not propostas:
+        return {"acao": "sem_candidatos"}
+    res = aplicar(user_id, propostas, snap["tipo"], "agendado")
+    db = SessionLocal()
+    try:
+        c = _config(db, user_id)
+        c.ultimo_ciclo = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+    return {"acao": "aplicado", "motivo": "agendado", **res}
+
+
 def auto_ciclo(user_id: int) -> dict:
     db = SessionLocal()
     try:
