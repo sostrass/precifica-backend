@@ -236,6 +236,8 @@ class ShopeeBoostItem(Base):
     boost_ate = Column(DateTime, nullable=True)       # fim das 4h do boost atual
     impulsos = Column(Integer, default=0)             # contador de quantas vezes
     auto = Column(Boolean, default=False)             # entrou pela auto-seleção (vs manual)
+    condicional = Column(Boolean, default=False)      # fixado pelo Radar (concorrente furou preço)
+    motivo = Column(String, nullable=True)            # por que está em boost condicional
     criado_em = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("user_id", "item_id", name="uq_boost_user_item"),)
@@ -255,6 +257,9 @@ class ShopeeBoostConfig(Base):
     auto_selecao = Column(Boolean, default=False)     # agentes escolhem os produtos sozinhos
     auto_estrategia = Column(String, default="estoque_parado")  # estoque_parado | margem
     auto_maximo = Column(Integer, default=30)         # quantos manter na fila automática
+    cond_ativo = Column(Boolean, default=False)       # boost condicional pelo Radar
+    cond_gatilho_pct = Column(Float, default=0.0)     # concorrente X% mais barato dispara (0 = qualquer)
+    cond_max = Column(Integer, default=3)             # máx itens em boost condicional ao mesmo tempo
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
 

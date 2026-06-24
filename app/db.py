@@ -44,9 +44,14 @@ def garantir_colunas_extras():
             ("auto_selecao", "BOOLEAN DEFAULT FALSE"),
             ("auto_estrategia", "VARCHAR DEFAULT 'estoque_parado'"),
             ("auto_maximo", "INTEGER DEFAULT 30"),
+            ("cond_ativo", "BOOLEAN DEFAULT FALSE"),
+            ("cond_gatilho_pct", "FLOAT DEFAULT 0"),
+            ("cond_max", "INTEGER DEFAULT 3"),
         ],
         "shopee_boost_item": [
             ("auto", "BOOLEAN DEFAULT FALSE"),
+            ("condicional", "BOOLEAN DEFAULT FALSE"),
+            ("motivo", "VARCHAR"),
         ],
         "shopee_promo_config": [
             ("base_comparacao", "VARCHAR DEFAULT 'dia'"),

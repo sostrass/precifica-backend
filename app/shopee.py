@@ -676,6 +676,135 @@ def desempenho_campanha(user_id: int, tipo: str, cid) -> dict:
     return out
 
 
+_DASH_CACHE: dict = {}
+
+
+def agenda_campanhas(user_id: int) -> dict:
+    """Lista TODAS as campanhas (todos os tipos) normalizadas, pra visão geral e timeline. Barato."""
+    out = []
+    def _add(tipo, cid, nome, ini, fim):
+        if cid is not None:
+            out.append({"tipo": tipo, "id": cid, "nome": nome, "inicio": ini, "fim": fim})
+    for st in ("upcoming", "ongoing"):
+        try:
+            for c in ((listar_descontos(user_id, st).get("response") or {}).get("discount_list") or []):
+                _add("desconto", c.get("discount_id"), c.get("discount_name"), c.get("start_time"), c.get("end_time"))
+        except ShopeeError:
+            pass
+        try:
+            for c in ((listar_cupons(user_id, st).get("response") or {}).get("voucher_list") or []):
+                _add("cupom", c.get("voucher_id"), c.get("voucher_name"), c.get("start_time"), c.get("end_time"))
+        except ShopeeError:
+            pass
+        try:
+            for c in ((listar_bundles(user_id, st).get("response") or {}).get("bundle_deal_list") or []):
+                _add("bundle", c.get("bundle_deal_id"), c.get("name"), c.get("start_time"), c.get("end_time"))
+        except ShopeeError:
+            pass
+        try:
+            for c in ((listar_addons(user_id, st).get("response") or {}).get("add_on_deal_list") or []):
+                _add("addon", c.get("add_on_deal_id"), c.get("add_on_deal_name"), c.get("start_time"), c.get("end_time"))
+        except ShopeeError:
+            pass
+    for tp in (1, 2):  # flash: upcoming + ongoing
+        try:
+            fr = listar_flash(user_id, tp).get("response") or {}
+            for c in (fr.get("flash_sale_list") or (fr if isinstance(fr, list) else [])):
+                _add("flash", c.get("flash_sale_id"), f"Flash #{c.get('flash_sale_id')}", c.get("start_time"), c.get("end_time"))
+        except ShopeeError:
+            pass
+    # dedup por (tipo,id)
+    vistos, limpo = set(), []
+    for c in out:
+        k = (c["tipo"], c["id"])
+        if k not in vistos:
+            vistos.add(k)
+            limpo.append(c)
+    return {"campanhas": limpo, "total": len(limpo)}
+
+
+def _tipo_promo(ptype_raw, pid, nomes):
+    p = (ptype_raw or "").lower()
+    if "flash" in p:
+        return "flash"
+    if "bundle" in p:
+        return "bundle"
+    if "add" in p:
+        return "addon"
+    if "voucher" in p or "coupon" in p or "cupom" in p:
+        return "cupom"
+    if "discount" in p or "price" in p:
+        return "desconto"
+    return (nomes.get(str(pid)) or {}).get("tipo")
+
+
+def dashboard_promo(user_id: int, dias: int = 30) -> dict:
+    """Receita gerada por promoções: UMA varredura de pedidos, atribuindo cada venda à
+    campanha pelo promotion_id/promotion_type do item. Caro — cache ~20 min."""
+    chave = (user_id, dias)
+    cache = _DASH_CACHE.get(chave)
+    if cache and (time.time() - cache["_ts"]) < 1200:
+        return {k: v for k, v in cache.items() if k != "_ts"}
+
+    agora = int(time.time())
+    nomes = {}
+    try:
+        for c in agenda_campanhas(user_id)["campanhas"]:
+            nomes[str(c["id"])] = {"tipo": c["tipo"], "nome": c["nome"]}
+    except ShopeeError:
+        pass
+    for st in ("expired",):  # nomeia campanhas que rodaram e já encerraram no período
+        try:
+            for c in ((listar_descontos(user_id, st).get("response") or {}).get("discount_list") or []):
+                nomes.setdefault(str(c.get("discount_id")), {"tipo": "desconto", "nome": c.get("discount_name")})
+        except ShopeeError:
+            pass
+
+    pedidos, total_pedidos, parcial = _pedidos_itens_periodo(user_id, agora - max(1, dias) * 86400, agora, max_paginas=15)
+    por_campanha, por_tipo = {}, {}
+    tot_receita = tot_unid = 0.0
+    pedidos_promo = set()
+    for o in pedidos:
+        osn = o.get("order_sn")
+        for it in (o.get("item_list") or []):
+            pid = str(it.get("promotion_id") or "")
+            tipo = _tipo_promo(it.get("promotion_type"), pid, nomes)
+            tem_promo = (pid and pid != "0") or tipo is not None
+            if not tem_promo:
+                continue
+            q = int(it.get("model_quantity_purchased") or it.get("quantity_purchased") or 0)
+            preco = float(it.get("model_discounted_price") or it.get("discounted_price") or it.get("model_original_price") or 0)
+            val = preco * q
+            tot_receita += val
+            tot_unid += q
+            pedidos_promo.add(osn)
+            tipo = tipo or "outras"
+            t = por_tipo.setdefault(tipo, {"receita": 0.0, "unidades": 0, "pedidos": set()})
+            t["receita"] += val
+            t["unidades"] += q
+            t["pedidos"].add(osn)
+            if pid and pid != "0":
+                meta = nomes.get(pid) or {"tipo": tipo, "nome": None}
+                c = por_campanha.setdefault(pid, {"id": pid, "tipo": meta.get("tipo") or tipo,
+                                                  "nome": meta.get("nome"), "receita": 0.0, "unidades": 0, "pedidos": set()})
+                c["receita"] += val
+                c["unidades"] += q
+                c["pedidos"].add(osn)
+
+    por_tipo_list = sorted(
+        [{"tipo": k, "receita": round(v["receita"], 2), "unidades": v["unidades"], "pedidos": len(v["pedidos"])}
+         for k, v in por_tipo.items()], key=lambda x: -x["receita"])
+    top = sorted(
+        [{"id": c["id"], "tipo": c["tipo"], "nome": c["nome"], "receita": round(c["receita"], 2),
+          "unidades": c["unidades"], "pedidos": len(c["pedidos"])} for c in por_campanha.values()],
+        key=lambda x: -x["receita"])[:8]
+    out = {"periodo_dias": dias, "parcial": parcial,
+           "total": {"receita": round(tot_receita, 2), "unidades": tot_unid, "pedidos": len(pedidos_promo)},
+           "por_tipo": por_tipo_list, "top_campanhas": top, "pedidos_no_periodo": total_pedidos}
+    _DASH_CACHE[chave] = {**out, "_ts": time.time()}
+    return out
+
+
 def repetir_campanha(user_id: int, tipo: str, cid) -> dict:
     """Recria uma campanha igual, com um novo período (mesma duração, começando em ~5 min).
     Suporta desconto, bundle e addon (flash depende de slot; cupom é recriado pela tela)."""

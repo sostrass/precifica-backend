@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_promo_auto, shopee_reviews, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_promo_auto, shopee_reviews, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
@@ -39,6 +39,7 @@ async def _agendador_boost():
             try:
                 cfgs = db.query(ShopeeBoostConfig).filter_by(ativo=True).all()
                 ativos = [c.user_id for c in cfgs]
+                cond = [c.user_id for c in cfgs if getattr(c, "cond_ativo", False)]
                 # quem precisa reabastecer a fila automática (a cada ~12h ou se esvaziou)
                 reabastecer = []
                 for c in cfgs:
@@ -52,7 +53,11 @@ async def _agendador_boost():
                 db.close()
             for uid in reabastecer:
                 await loop.run_in_executor(None, shopee_boost.auto_selecionar, uid, None)
+            for uid in cond:  # boost condicional: fixa ameaçados + roda ciclo
+                await loop.run_in_executor(None, shopee_boost_auto.aplicar, uid)
             for uid in ativos:
+                if uid in cond:
+                    continue  # aplicar já rodou o ciclo deste usuário
                 await loop.run_in_executor(None, shopee_boost.ciclo, uid)
         except Exception:  # noqa: BLE001 — nunca derruba o app
             pass
@@ -486,6 +491,31 @@ def shopee_boost_status(user: User = Depends(auth.get_current_user)):
     return shopee_boost.status(user.id)
 
 
+@app.get("/api/shopee/boost/condicional")
+def shopee_boost_cond_get(user: User = Depends(auth.get_current_user)):
+    """Config + diagnóstico do boost condicional pelo Radar (quem está ameaçado agora)."""
+    cfg = shopee_boost_auto.config(user.id)
+    try:
+        ev = shopee_boost_auto.avaliar(user.id)
+    except shopee.ShopeeError as e:
+        ev = {"erro": str(e), "ameacados": []}
+    return {"config": cfg, **ev}
+
+
+@app.put("/api/shopee/boost/condicional")
+def shopee_boost_cond_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    return shopee_boost_auto.salvar_config(user.id, payload)
+
+
+@app.post("/api/shopee/boost/condicional/aplicar")
+def shopee_boost_cond_aplicar(user: User = Depends(auth.get_current_user)):
+    """Avalia e aplica agora: fixa os ameaçados em boost e libera os que saíram da mira."""
+    try:
+        return shopee_boost_auto.aplicar(user.id, forcar=True)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.put("/api/shopee/boost/config")
 def shopee_boost_config(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     db = SessionLocal()
@@ -807,6 +837,24 @@ def shopee_criar_desconto(payload: dict = Body(...), user: User = Depends(auth.g
         return res
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Informe nome, inicio, fim e itens.")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/campanhas/agenda")
+def shopee_campanhas_agenda(user: User = Depends(auth.get_current_user)):
+    """Todas as campanhas (todos os tipos) normalizadas pra visão geral / timeline."""
+    try:
+        return shopee.agenda_campanhas(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/campanhas/dashboard")
+def shopee_campanhas_dashboard(dias: int = 30, user: User = Depends(auth.get_current_user)):
+    """Receita gerada por promoções no período (uma varredura, atribuída por promotion_id). Cacheado."""
+    try:
+        return shopee.dashboard_promo(user.id, dias=dias)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

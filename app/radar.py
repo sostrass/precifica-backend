@@ -58,6 +58,31 @@ def adicionar_alvo(user_id, sku, url, nome=None, marketplace=None) -> dict:
         return _alvo_dict(alvo)
 
 
+def menor_preco_concorrente(user_id, sku) -> float | None:
+    """Menor preço de concorrente para um SKU: pega o snapshot mais recente de cada alvo
+    ativo e devolve o menor. Base do boost condicional (alguém furou seu preço)."""
+    with SessionLocal() as db:
+        alvos = db.query(RadarAlvo).filter(
+            RadarAlvo.user_id == user_id, RadarAlvo.sku == sku, RadarAlvo.ativo == True).all()  # noqa: E712
+        precos = []
+        for a in alvos:
+            snap = (db.query(RadarSnapshot)
+                    .filter(RadarSnapshot.alvo_id == a.id)
+                    .order_by(RadarSnapshot.coletado_em.desc()).first())
+            p = snap.preco_oferta if snap else None
+            if p and float(p) > 0:
+                precos.append(float(p))
+        return min(precos) if precos else None
+
+
+def skus_monitorados(user_id) -> list:
+    """SKUs distintos que têm pelo menos um alvo ativo no Radar."""
+    with SessionLocal() as db:
+        rows = db.query(RadarAlvo.sku).filter(
+            RadarAlvo.user_id == user_id, RadarAlvo.ativo == True).distinct().all()  # noqa: E712
+        return [r[0] for r in rows if r[0]]
+
+
 def listar_alvos(user_id, sku=None) -> list:
     with SessionLocal() as db:
         q = db.query(RadarAlvo).filter(RadarAlvo.user_id == user_id)
