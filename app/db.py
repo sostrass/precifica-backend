@@ -65,6 +65,9 @@ def garantir_colunas_extras():
             ("pedidos_6h", "INTEGER DEFAULT 0"),
             ("bucket", "INTEGER DEFAULT 0"),
         ],
+        "webhook_eventos": [
+            ("resultado", "JSON"),
+        ],
     }
     try:
         with engine.begin() as conn:

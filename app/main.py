@@ -250,6 +250,14 @@ def _processar_evento_async(user_id: int, evento_db_id: int):
         data = (reg.payload or {}).get("data") or {}
         recurso = (reg.recurso or "").lower()
         webhooks.processar(user_id, reg.recurso, reg.acao, data)
+        # NF-e: aplica o desconto padrão automaticamente quando o modo auto está ligado.
+        # Roda aqui (background) porque envolve buscar a nota + PUT de volta no Bling.
+        if recurso in ("nfe", "notafiscal", "nota_fiscal", "notafiscaleletronica") and reg.entidade_id:
+            cfg_nfe = db.query(NfeConfig).filter_by(user_id=user_id).first()
+            try:
+                reg.resultado = nfe.processar_evento(user_id, reg.entidade_id, cfg_nfe)
+            except Exception:  # noqa: BLE001
+                reg.resultado = {"id": str(reg.entidade_id), "ok": False, "motivo": "erro_inesperado"}
         # Mantém o cache do catálogo atualizado a partir do push
         if recurso in ("produto", "produtos") and reg.entidade_id:
             if (reg.acao or "").lower() in ("deleted", "deletado", "excluido"):
@@ -1524,6 +1532,8 @@ def diag_nfe(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Payload CRU de uma NF-e no Bling — revela a estrutura real da nota inteira."""
     try:
         return bling.obter_nfe(user.id, nfe_id)
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2053,11 +2063,47 @@ def nfe_auto_processar(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=401, detail=str(e))
 
 
+@app.post("/api/nfe/aplicar-todas")
+def nfe_aplicar_todas(user: User = Depends(auth.get_current_user)):
+    """Ação MANUAL: aplica o desconto padrão em TODAS as notas pendentes de uma vez e
+    devolve cada uma ao Bling (sem precisar editar nota por nota no painel do Bling).
+    Não depende do modo automático estar ligado. Retorna um relatório por nota."""
+    cfg = _nfe_cfg(user.id)
+    try:
+        return nfe.processar_automatico(user.id, cfg)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/nfe/eventos")
+def nfe_eventos(limite: int = 25, user: User = Depends(auth.get_current_user)):
+    """Últimos eventos de NF-e recebidos do Bling via webhook, com o resultado do
+    auto-apply do desconto (o que o sistema fez com cada nota)."""
+    recursos = ["nfe", "notafiscal", "nota_fiscal", "notafiscaleletronica"]
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        regs = (db.query(WebhookEvento)
+                .filter(WebhookEvento.user_id == user.id,
+                        func.lower(WebhookEvento.recurso).in_(recursos))
+                .order_by(WebhookEvento.id.desc())
+                .limit(max(1, min(limite, 100))).all())
+        return [{
+            "id": e.id, "evento": e.event, "acao": e.acao, "entidade_id": e.entidade_id,
+            "quando": e.recebido_em.isoformat() if e.recebido_em else None,
+            "resultado": e.resultado,
+        } for e in regs]
+    finally:
+        db.close()
+
+
 @app.get("/api/nfe/{nfe_id}")
 def nfe_obter(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Detalhe normalizado de uma nota (itens + frete) para o editor de desconto."""
     try:
         return nfe.normalizar_nfe(bling.obter_nfe(user.id, nfe_id))
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2067,6 +2113,8 @@ def nfe_completa(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Visão COMPLETA da nota: destinatário, totais, impostos, transporte, itens e links."""
     try:
         return nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id))
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2087,5 +2135,9 @@ def nfe_aplicar(nfe_id: str, payload: dict = Body(...),
             remover_frete=bool(payload.get("remover_frete", True)),
             enviar=bool(payload.get("enviar", False)),
         )
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except bling.BlingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))

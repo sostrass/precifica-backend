@@ -31,6 +31,16 @@ class BlingAuthError(Exception):
     pass
 
 
+class BlingNotFound(Exception):
+    """Recurso não encontrado no Bling (HTTP 404)."""
+    pass
+
+
+class BlingError(Exception):
+    """Erro de API do Bling com a mensagem detalhada (validação de schema etc.)."""
+    pass
+
+
 # --------------------------------------------------------------------------- #
 # Rate limiter global (3 req/s do Bling). Em multi-instância, mover p/ Redis.
 # --------------------------------------------------------------------------- #
@@ -497,16 +507,48 @@ def listar_pedidos_periodo(user_id: int, dias: int = 30, max_paginas: int = 8) -
 def obter_nfe(user_id: int, nfe_id) -> dict:
     """Detalhe completo de uma NF-e (com itens e transporte)."""
     r = _request(user_id, "GET", f"/nfe/{nfe_id}")
+    if r.status_code == 404:
+        raise BlingNotFound(
+            f"NF-e {nfe_id} não encontrada no Bling (404). O ID pode ser de outro recurso "
+            "— alguns eventos do Bling trazem o ID do pedido, não o da nota — ou a nota foi removida.")
     r.raise_for_status()
     return r.json()
+
+
+def _resumir_erro_bling(corpo: dict) -> str:
+    """Extrai uma mensagem legível do corpo de erro do Bling v3."""
+    if not isinstance(corpo, dict):
+        return str(corpo)[:300]
+    err = corpo.get("error") or corpo
+    partes = []
+    msg = err.get("message") or err.get("description")
+    if msg:
+        partes.append(str(msg))
+    campos = err.get("fields") or err.get("errors") or []
+    if isinstance(campos, list):
+        for f in campos[:6]:
+            if isinstance(f, dict):
+                el = f.get("element") or f.get("field") or f.get("name") or ""
+                fmsg = f.get("msg") or f.get("message") or f.get("description") or ""
+                partes.append(f"{el}: {fmsg}".strip(" :"))
+            else:
+                partes.append(str(f))
+    return " | ".join(p for p in partes if p) or str(corpo)[:300]
 
 
 def atualizar_nfe(user_id: int, nfe_id, payload: dict) -> dict:
     """Altera uma NF-e existente (PUT). Só funciona em nota Pendente/Rejeitada.
 
-    O envio ao Sefaz é feito no painel/automação do Bling (certificado A1 lá),
-    não aqui. Endpoint assumido: PUT /nfe/{id} — confirme contra o schema da sua conta.
+    O envio ao Sefaz é feito no painel/automação do Bling (certificado A1 lá), não aqui.
+    Em erro, levanta BlingError com a mensagem EXATA do Bling (pra diagnosticar o schema).
     """
     r = _request(user_id, "PUT", f"/nfe/{nfe_id}", json=payload)
-    r.raise_for_status()
+    if r.status_code == 404:
+        raise BlingNotFound(f"NF-e {nfe_id} não encontrada no Bling (404) ao tentar alterar.")
+    if r.status_code >= 400:
+        try:
+            corpo = r.json()
+        except Exception:  # noqa: BLE001
+            corpo = {"raw": (r.text or "")[:400]}
+        raise BlingError(f"Bling recusou a alteração da NF-e {nfe_id} ({r.status_code}): {_resumir_erro_bling(corpo)}")
     return r.json()

@@ -95,9 +95,10 @@ def processar(user_id: int, recurso: str, acao: str, data: dict) -> str:
         except Exception:
             pass
 
-    # NF-e: o módulo de NF-e foi pensado para ser acionado por aqui.
+    # NF-e: o auto-apply do desconto roda logo depois, no processamento em background
+    # (em main._processar_evento_async), porque envolve buscar a nota e devolver ao Bling.
     if r in ("nfe", "notafiscal", "nota_fiscal", "notafiscaleletronica"):
-        feitos.append("evento de NF-e registrado para processamento")
+        feitos.append("NF-e encaminhada para auto-aplicação do desconto")
 
     return "; ".join(feitos) or "evento registrado"
 

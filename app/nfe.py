@@ -225,12 +225,26 @@ def detalhar_nfe(raw: dict) -> dict:
     }
 
 
+_NFE_READONLY = {
+    "id", "situacao", "chaveAcesso", "linkDanfe", "linkPDF", "xml", "recibo",
+    "protocolo", "digestValue", "dataAutorizacao", "dataInclusao", "dataAlteracao",
+    "valorNota", "tipoIntegracao",
+}
+
+
+def _ref_id(v):
+    """Reduz um objeto de referência {id, descricao, ...} para apenas {id}."""
+    if isinstance(v, dict) and v.get("id"):
+        return {"id": v["id"]}
+    return v
+
+
 def montar_alteracao(raw: dict, edicao: dict) -> dict:
     """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
 
-    Estratégia: parte do objeto original (preservando todos os campos fiscais) e
-    sobrescreve só o desconto de cada item e o frete. Os nomes de campo seguem o
-    mapeamento assumido — ajuste aqui se a sua conta usar outro schema.
+    Parte do objeto original (preservando os campos fiscais), sobrescreve o desconto de
+    cada item e o frete, REMOVE os campos read-only (que o Bling recusa no PUT — situação,
+    chave de acesso, links, xml etc.) e reduz objetos de referência a {id}.
     """
     nfe = dict(raw.get("data", raw))
     linhas = edicao["itens"]
@@ -238,7 +252,6 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
     for linha in linhas:
         idx = linha["indice"]
         if 0 <= idx < len(itens_raw):
-            # grava o desconto em R$ da linha (campo 'desconto' do item da NF-e)
             itens_raw[idx]["desconto"] = linha["desconto_reais"]
     if "itens" in nfe:
         nfe["itens"] = itens_raw
@@ -255,6 +268,14 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
             nfe["frete"] = 0
         if "valorFrete" in nfe:
             nfe["valorFrete"] = 0
+    # remove campos gerados pelo Bling (read-only) — costumam causar 400 no PUT
+    for campo in list(nfe.keys()):
+        if campo in _NFE_READONLY:
+            nfe.pop(campo, None)
+    # objetos de referência: o Bling espera {id}, não o objeto inteiro
+    for ref in ("naturezaOperacao", "loja", "categoria", "vendedor", "deposito"):
+        if ref in nfe:
+            nfe[ref] = _ref_id(nfe[ref])
     return nfe
 
 
@@ -286,6 +307,44 @@ def editar_nota(user_id: int, nfe_id, *, desconto_tipo, desconto_valor,
     return resultado
 
 
+def processar_evento(user_id, nfe_id, cfg) -> dict:
+    """Reage a um evento de NF-e do Bling (chamado pelo webhook, em background).
+
+    Se a nota é editável (pendente) e o modo automático está ligado, aplica o desconto
+    padrão e devolve ao Bling. NUNCA levanta — devolve um dict de status, pra não derrubar
+    o processamento do webhook e pra o painel mostrar exatamente o que aconteceu.
+    """
+    from . import bling
+
+    base = {"id": str(nfe_id)}
+    try:
+        raw = bling.obter_nfe(user_id, nfe_id)
+    except bling.BlingNotFound as e:
+        return {**base, "ok": False, "motivo": "nao_encontrada", "detalhe": str(e)}
+    except Exception as e:  # noqa: BLE001
+        return {**base, "ok": False, "motivo": "erro_busca", "detalhe": str(e)}
+
+    n = raw.get("data", raw) if isinstance(raw, dict) else {}
+    sit = n.get("situacao")
+    base.update({"numero": n.get("numero"), "situacao": sit, "situacao_label": situacao_label(sit)})
+
+    if not nota_editavel(sit):
+        return {**base, "ok": False, "motivo": "nao_editavel"}
+    if not getattr(cfg, "auto", False):
+        return {**base, "ok": False, "motivo": "auto_desligado"}
+
+    try:
+        r = editar_nota(user_id, nfe_id, desconto_tipo=cfg.desconto_tipo,
+                        desconto_valor=cfg.desconto_valor,
+                        remover_frete=cfg.remover_frete, enviar=True)
+        resumo = r.get("resumo", {})
+        return {**base, "ok": True, "aplicado": True,
+                "total_nota": resumo.get("total_nota"),
+                "total_desconto": resumo.get("total_desconto")}
+    except Exception as e:  # noqa: BLE001
+        return {**base, "ok": False, "motivo": "erro_aplicar", "detalhe": str(e)}
+
+
 def processar_automatico(user_id: int, cfg) -> dict:
     """Modo automático: aplica a regra padrão a TODAS as NF-e pendentes e devolve.
 
@@ -297,14 +356,18 @@ def processar_automatico(user_id: int, cfg) -> dict:
     pendentes = bling.listar_nfe(user_id, situacao=cfg.situacao_pendente)
     notas = pendentes.get("data", []) if isinstance(pendentes, dict) else []
     relatorio = []
+    aplicadas = 0
     for n in notas:
         nid = n.get("id")
+        numero = n.get("numero")
         try:
             r = editar_nota(user_id, nid, desconto_tipo=cfg.desconto_tipo,
                             desconto_valor=cfg.desconto_valor,
                             remover_frete=cfg.remover_frete, enviar=True)
-            relatorio.append({"id": nid, "ok": True,
-                              "total_nota": r["resumo"]["total_nota"]})
+            aplicadas += 1
+            relatorio.append({"id": nid, "numero": numero, "ok": True,
+                              "total_nota": r["resumo"]["total_nota"],
+                              "total_desconto": r["resumo"].get("total_desconto")})
         except Exception as e:  # noqa: BLE001
-            relatorio.append({"id": nid, "ok": False, "erro": str(e)})
-    return {"processadas": len(relatorio), "relatorio": relatorio}
+            relatorio.append({"id": nid, "numero": numero, "ok": False, "erro": str(e)})
+    return {"processadas": len(relatorio), "aplicadas": aplicadas, "relatorio": relatorio}

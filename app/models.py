@@ -145,6 +145,7 @@ class WebhookEvento(Base):
     entidade_id = Column(String, nullable=True)  # data.id
     payload = Column(JSON, nullable=True)
     processado = Column(Boolean, default=False)
+    resultado = Column(JSON, nullable=True)      # resultado do processamento (ex.: auto-apply de NF-e)
     recebido_em = Column(DateTime, default=datetime.utcnow, index=True)
 
 
