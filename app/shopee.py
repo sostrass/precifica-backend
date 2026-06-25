@@ -902,6 +902,71 @@ def _pedidos_itens_periodo(user_id: int, inicio: int, fim: int, max_paginas: int
 _VENDAS_SKU_CACHE: dict = {}  # user_id -> (ts, {sku: unidades})
 
 
+_VENDAS_ITEM_CACHE: dict = {}  # (user_id, dias) -> (ts, {item_id: unidades})
+_CAMP_ITENS_CACHE: dict = {}   # user_id -> (ts, set(item_id))
+
+
+def vendas_por_item(user_id: int, dias: int = 30, ttl: int = 1800) -> dict:
+    """Unidades vendidas por item_id (ANÚNCIO) nos últimos `dias`, do histórico de pedidos.
+    Agrega por item_id — não por SKU — porque produtos com variação registram a venda no
+    model_sku da variação, e o casamento por SKU do anúncio-pai falharia (apareceria 0)."""
+    chave = (user_id, int(dias))
+    ag = time.time()
+    cache = _VENDAS_ITEM_CACHE.get(chave)
+    if cache and ag - cache[0] < ttl:
+        return cache[1]
+    fim = int(ag)
+    inicio = fim - int(dias) * 86400
+    try:
+        pedidos, _, _ = _pedidos_itens_periodo(user_id, inicio, fim, max_paginas=20)
+    except ShopeeError:
+        pedidos = []
+    vendas: dict = {}
+    for o in pedidos:
+        for it in (o.get("item_list") or []):
+            iid = it.get("item_id")
+            if not iid:
+                continue
+            vendas[int(iid)] = vendas.get(int(iid), 0) + int(it.get("model_quantity_purchased") or 0)
+    _VENDAS_ITEM_CACHE[chave] = (ag, vendas)
+    return vendas
+
+
+def itens_em_campanha(user_id: int, ttl: int = 600) -> set:
+    """item_ids que JÁ estão em campanhas de desconto ATIVAS ou AGENDADAS — não podem
+    entrar em outra (a Shopee rejeita). Usado pra não sugerir esses produtos. Cacheia ~10 min."""
+    ag = time.time()
+    cache = _CAMP_ITENS_CACHE.get(user_id)
+    if cache and ag - cache[0] < ttl:
+        return cache[1]
+    ids: set = set()
+    for status in ("ongoing", "upcoming"):
+        try:
+            r = listar_descontos(user_id, status=status, limite=100)
+        except ShopeeError:
+            continue
+        for d in ((r.get("response") or {}).get("discount_list") or []):
+            did = d.get("discount_id")
+            if not did:
+                continue
+            page = 1
+            for _ in range(20):
+                try:
+                    rr = _chamar(user_id, "/api/v2/discount/get_discount",
+                                 extra={"discount_id": int(did), "page_no": page, "page_size": 100})
+                except ShopeeError:
+                    break
+                lote = (rr.get("response") or {}).get("item_list") or []
+                for it in lote:
+                    if it.get("item_id"):
+                        ids.add(int(it["item_id"]))
+                if len(lote) < 100:
+                    break
+                page += 1
+    _CAMP_ITENS_CACHE[user_id] = (ag, ids)
+    return ids
+
+
 def vendas_por_sku(user_id: int, dias: int = 30, ttl: int = 1800) -> dict:
     """Unidades vendidas por SKU nos últimos `dias`, a partir do histórico de pedidos.
     Usado para achar ESTOQUE PARADO (SKUs sem/poucas vendas). Cacheia ~30 min."""

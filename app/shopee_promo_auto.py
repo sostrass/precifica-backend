@@ -46,6 +46,7 @@ def _serializar(c: ShopeePromoConfig) -> dict:
         "reserva_estoque": c.reserva_estoque if c.reserva_estoque is not None else 1,
         "duracao_dias": c.duracao_dias or 3, "intervalo_dias": c.intervalo_dias or 7,
         "queda_limiar": c.queda_limiar or 30,
+        "dias_analise": int(getattr(c, "dias_analise", None) or 30),
         "ultimo_ciclo": c.ultimo_ciclo.isoformat() if c.ultimo_ciclo else None,
     }
 
@@ -76,6 +77,7 @@ def salvar_config(user_id: int, p: dict) -> dict:
         if "duracao_dias" in p: c.duracao_dias = max(1, min(int(p["duracao_dias"]), 30))
         if "intervalo_dias" in p: c.intervalo_dias = max(1, min(int(p["intervalo_dias"]), 60))
         if "queda_limiar" in p: c.queda_limiar = max(5, min(int(p["queda_limiar"]), 90))
+        if "dias_analise" in p: c.dias_analise = max(7, min(int(p["dias_analise"]), 120))
         c.atualizado_em = datetime.utcnow()
         db.commit()
         return _serializar(c)
@@ -165,11 +167,20 @@ def _funil(user_id: int, cfg):
     teto, piso = cfg.desconto_max or 15, float(cfg.piso_margem if cfg.piso_margem is not None else 10.0)
     est_min = cfg.estoque_minimo or 0
     estrategia = cfg.estrategia or "estoque_parado"
-    # estoque parado = produtos SEM vendas. Cruza com o histórico real de pedidos.
-    vendas = shopee.vendas_por_sku(user_id) if estrategia != "margem_alta" else {}
+    dias_an = int(getattr(cfg, "dias_analise", None) or 30)
+    # estoque parado = produtos SEM vendas. Cruza com o histórico real (por item_id, não SKU).
+    vendas = shopee.vendas_por_item(user_id, dias_an) if estrategia != "margem_alta" else {}
+    # produtos já em campanha ativa/agendada não podem entrar em outra — fora das sugestões.
+    em_campanha = shopee.itens_em_campanha(user_id)
     diag["sem_vendas"] = 0
+    diag["em_campanha"] = 0
+    diag["dias_analise"] = dias_an
     out = []
     for it in shop_itens:
+        iid = it.get("item_id")
+        if iid and int(iid) in em_campanha:
+            diag["em_campanha"] += 1
+            continue
         sku = it.get("item_sku") or it.get("sku")
         if not sku:
             diag["anuncios_sem_sku"] += 1
@@ -197,7 +208,7 @@ def _funil(user_id: int, cfg):
         if d <= 0:
             continue
         diag["com_desconto_seguro"] += 1
-        vendidos = int(vendas.get(sku, 0))
+        vendidos = int(vendas.get(int(iid), 0)) if iid else 0
         if vendidos == 0:
             diag["sem_vendas"] += 1
         preco_promo = round(preco * (1 - d / 100.0), 2)
@@ -256,6 +267,10 @@ def _motivo_funil(diag: dict, cfg) -> str:
     if diag["com_desconto_seguro"] == 0:
         return (f"Há margem acima do piso, mas não cabe nem 1% de desconto mantendo o piso de {piso:.0f}%. "
                 "Aumente o 'desconto máximo' ou reduza um pouco o piso de margem.")
+    if diag.get("elegiveis", 0) == 0 and diag.get("em_campanha"):
+        return (f"{diag['em_campanha']} anúncio(s) já estão em campanha ativa ou agendada e foram "
+                "ignorados — a Shopee não deixa o mesmo produto em duas promoções. "
+                "Espere essas campanhas terminarem (ou encerre-as) para liberar os produtos.")
     return ("Nenhum produto elegível dentro das regras. Revise estoque mínimo, piso de margem e "
             "desconto máximo.")
 

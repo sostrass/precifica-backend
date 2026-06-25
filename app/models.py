@@ -300,6 +300,7 @@ class ShopeePromoConfig(Base):
     modo = Column(String, default="auto")               # auto | sugerir  (padrão: agentes fazem)
     gatilho = Column(String, default="agendado")        # agendado | queda
     base_comparacao = Column(String, default="dia")     # dia | horario  (como medir a queda)
+    dias_analise = Column(Integer, default=30)           # janela (dias) p/ medir vendas (estoque parado)
     estrategia = Column(String, default="estoque_parado")  # estoque_parado | margem_alta
     tipo = Column(String, default="desconto")           # desconto | flash | ambos
     desconto_max = Column(Integer, default=15)          # teto do desconto (%)
