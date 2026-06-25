@@ -211,17 +211,26 @@ def token_status(user_id: int) -> dict:
 # Requisições à API (sempre escopadas no token do usuário)
 # --------------------------------------------------------------------------- #
 def _request(user_id: int, method: str, path: str, **kwargs) -> requests.Response:
-    _limiter.wait()
     url = f"{API_BASE}{path}"
     headers = kwargs.pop("headers", {})
-    headers["Authorization"] = f"Bearer {_access_token(user_id)}"
     headers.setdefault("Accept", "application/json")
-    r = requests.request(method, url, headers=headers, timeout=30, **kwargs)
-    if r.status_code == 401:
-        refresh_token(user_id)
+    r = None
+    for tentativa in range(4):
         _limiter.wait()
         headers["Authorization"] = f"Bearer {_access_token(user_id)}"
         r = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+        if r.status_code == 401 and tentativa == 0:
+            refresh_token(user_id)
+            continue
+        if r.status_code == 429:
+            # Bling estourou o rate limit — respeita o Retry-After e tenta de novo (backoff)
+            try:
+                espera = float(r.headers.get("Retry-After", ""))
+            except ValueError:
+                espera = 0.0
+            time.sleep(min(max(espera, 0.8 * (tentativa + 1)), 6.0))
+            continue
+        return r
     return r
 
 

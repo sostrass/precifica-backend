@@ -141,3 +141,49 @@ def status_sync(db, user_id: int, produto_id) -> dict:
             "enviado_em": reg.enviado_em.isoformat() if reg.enviado_em else None,
             "confirmado_em": reg.confirmado_em.isoformat() if reg.confirmado_em else None,
             "campos": reg.campos, "erro": reg.erro}
+
+
+# --------------------------------------------------------------------------- #
+# Descrição amigável de eventos (para o centro de notificações da plataforma)
+# --------------------------------------------------------------------------- #
+_CATEGORIA_EVENTO = {
+    "nfe": "nfe", "notafiscal": "nfe", "nota_fiscal": "nfe", "notafiscaleletronica": "nfe",
+    "nfce": "nfe", "notafiscalconsumidor": "nfe",
+    "produto": "produto", "produtos": "produto", "estoque": "estoque", "saldoestoque": "estoque",
+    "pedido": "pedido", "pedidovenda": "pedido", "pedidovendas": "pedido", "order": "pedido",
+    "contato": "contato", "contatos": "contato",
+}
+_ACAO_PT = {
+    "created": "criada", "created.v2": "criada", "inserted": "criada", "insert": "criada",
+    "updated": "atualizada", "update": "atualizada", "changed": "alterada",
+    "deleted": "excluída", "delete": "excluída", "stock": "movimentado",
+}
+_MOTIVO_PT = {
+    "nao_editavel": "nota não editável", "nao_encontrada": "nota não encontrada (id de pedido?)",
+    "auto_desligado": "automático desligado", "erro_aplicar": "erro ao aplicar desconto",
+    "erro_busca": "erro ao buscar a nota", "erro_inesperado": "erro inesperado",
+}
+
+
+def descrever_evento(recurso, acao, resultado):
+    """Retorna (categoria, titulo, texto, ok) amigáveis para a UI de notificações."""
+    r = (recurso or "").lower().replace("-", "").replace(" ", "")
+    cat = _CATEGORIA_EVENTO.get(r, "outro")
+    acao_pt = _ACAO_PT.get((acao or "").lower(), (acao or "").lower() or "registrada")
+    ok = None
+    if cat == "nfe":
+        res = resultado or {}
+        ok = bool(res.get("ok"))
+        num = res.get("numero")
+        ref = f"NF-e nº {num}" if num else "NF-e"
+        if res.get("ok") and res.get("aplicado"):
+            tot = res.get("total_nota")
+            txt = "Desconto padrão aplicado e salvo no Bling."
+            if tot is not None:
+                txt = f"Desconto aplicado · novo total R$ {float(tot):.2f}".replace(".", ",")
+            return cat, f"{ref} — desconto aplicado", txt, True
+        if res.get("motivo"):
+            return cat, f"{ref} — {_MOTIVO_PT.get(res['motivo'], res['motivo'])}", res.get("detalhe") or "", False
+        return cat, f"{ref} {acao_pt}", "Evento recebido do Bling.", ok
+    nomes = {"produto": "Produto", "pedido": "Pedido", "estoque": "Estoque", "contato": "Contato", "outro": "Evento"}
+    return cat, f"{nomes[cat]} {acao_pt}".strip(), "Evento recebido do Bling.", None

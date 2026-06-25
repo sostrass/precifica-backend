@@ -143,6 +143,35 @@ SITUACOES_NFE = {
 }
 
 
+def resumir_lista(raw: dict) -> list:
+    """Normaliza a lista de NF-e do Bling para a UI: id, número, situação (+rótulo),
+    se é editável, cliente, valor e data. Defensivo quanto aos nomes de campo."""
+    notas = raw.get("data", []) if isinstance(raw, dict) else (raw or [])
+    out = []
+    for n in notas:
+        if not isinstance(n, dict):
+            continue
+        contato = n.get("contato") or {}
+        nome_cli = contato.get("nome") if isinstance(contato, dict) else (contato or None)
+        cod = n.get("situacao")
+        loja = n.get("loja")
+        out.append({
+            "id": n.get("id"),
+            "numero": n.get("numero"),
+            "serie": n.get("serie"),
+            "situacao": cod,
+            "situacao_label": situacao_label(cod),
+            "editavel": nota_editavel(cod),
+            "cliente": nome_cli,
+            "documento": contato.get("numeroDocumento") if isinstance(contato, dict) else None,
+            "valor": _num(n.get("valorNota") if n.get("valorNota") is not None else (n.get("total") or n.get("valor"))),
+            "data": n.get("dataEmissao") or n.get("dataOperacao") or n.get("data"),
+            "loja_id": loja.get("id") if isinstance(loja, dict) else loja,
+            "tipo": n.get("tipo"),
+        })
+    return out
+
+
 def situacao_label(cod) -> str:
     try:
         return SITUACOES_NFE.get(int(cod), f"Situação {cod}")
@@ -239,14 +268,43 @@ def _ref_id(v):
     return v
 
 
+def _reescalar_parcelas(parcelas: list, novo_total: float) -> list:
+    """Reescala as parcelas para somarem exatamente o novo total da nota.
+    O Bling recusa o PUT com 'Total das parcelas difere do total da nota' se não bater."""
+    if not parcelas or novo_total <= 0:
+        return parcelas
+    soma = sum(_num(p.get("valor")) for p in parcelas)
+    if soma <= 0:
+        # sem base para proporção: joga tudo na 1ª parcela, zera as demais
+        for i, p in enumerate(parcelas):
+            p["valor"] = _r2(novo_total) if i == 0 else 0.0
+        return parcelas
+    if abs(soma - novo_total) < 0.01:
+        return parcelas  # já bate
+    acc = 0.0
+    n = len(parcelas)
+    for i, p in enumerate(parcelas):
+        if i < n - 1:
+            v = round(_num(p.get("valor")) * novo_total / soma, 2)
+            p["valor"] = v
+            acc += v
+        else:
+            p["valor"] = _r2(novo_total - acc)  # última absorve o arredondamento
+    return parcelas
+
+
 def montar_alteracao(raw: dict, edicao: dict) -> dict:
     """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
 
     Parte do objeto original (preservando os campos fiscais), sobrescreve o desconto de
-    cada item e o frete, REMOVE os campos read-only (que o Bling recusa no PUT — situação,
-    chave de acesso, links, xml etc.) e reduz objetos de referência a {id}.
+    cada item e o frete, REESCALA as parcelas para o novo total (senão o Bling recusa),
+    REMOVE os campos read-only e reduz objetos de referência a {id}.
     """
     nfe = dict(raw.get("data", raw))
+    # total real original da nota (já inclui impostos) — base para reescalar parcelas
+    total_original = _num(nfe.get("valorNota"))
+    resumo = edicao.get("resumo", {})
+
     linhas = edicao["itens"]
     itens_raw = nfe.get("itens") or nfe.get("itensNota") or []
     for linha in linhas:
@@ -257,9 +315,10 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
         nfe["itensNota"] = itens_raw
+
     # zera o frete no transporte (e no total, conforme o schema)
     transporte = dict(nfe.get("transporte") or {})
-    if edicao["resumo"]["frete_depois"] == 0:
+    if resumo.get("frete_depois") == 0:
         if "frete" in transporte:
             transporte["frete"] = 0
         transporte["valorFrete"] = 0
@@ -268,6 +327,15 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
             nfe["frete"] = 0
         if "valorFrete" in nfe:
             nfe["valorFrete"] = 0
+
+    # reescala as parcelas para o novo total real (original − desconto − frete removido)
+    if total_original > 0:
+        novo_total = _r2(total_original - _num(resumo.get("total_desconto")) - _num(resumo.get("frete_removido")))
+    else:
+        novo_total = _num(resumo.get("total_nota"))
+    if nfe.get("parcelas"):
+        nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
+
     # remove campos gerados pelo Bling (read-only) — costumam causar 400 no PUT
     for campo in list(nfe.keys()):
         if campo in _NFE_READONLY:

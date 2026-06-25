@@ -2025,11 +2025,13 @@ def nfe_set_config(payload: dict = Body(...), user: User = Depends(auth.get_curr
 def nfe_pendentes(pagina: int = 1, limite: int = 100,
                   situacao: int | None = None,
                   user: User = Depends(auth.get_current_user)):
-    """Lista as NF-e pendentes (editáveis). Usa o código de situação da config."""
+    """Lista as NF-e pendentes (editáveis), já normalizadas para a UI (número, cliente,
+    valor, situação, editável). Usa o código de situação da config por padrão."""
     cfg = _nfe_cfg(user.id)
     sit = situacao if situacao is not None else cfg.situacao_pendente
     try:
-        return bling.listar_nfe(user.id, pagina=pagina, limite=limite, situacao=sit)
+        raw = bling.listar_nfe(user.id, pagina=pagina, limite=limite, situacao=sit)
+        return {"notas": nfe.resumir_lista(raw), "situacao": sit}
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2073,6 +2075,30 @@ def nfe_aplicar_todas(user: User = Depends(auth.get_current_user)):
         return nfe.processar_automatico(user.id, cfg)
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/notificacoes")
+def notificacoes(limite: int = 40, user: User = Depends(auth.get_current_user)):
+    """Centro de notificações da plataforma: tudo o que o Bling empurrou (NF-e, produtos,
+    pedidos, estoque…) e o que a aplicação fez com cada evento, em ordem cronológica."""
+    db = SessionLocal()
+    try:
+        regs = (db.query(WebhookEvento)
+                .filter(WebhookEvento.user_id == user.id)
+                .order_by(WebhookEvento.id.desc())
+                .limit(max(1, min(limite, 100))).all())
+        out = []
+        for e in regs:
+            cat, titulo, texto, ok = webhooks.descrever_evento(e.recurso, e.acao, e.resultado)
+            out.append({
+                "id": e.id, "categoria": cat, "titulo": titulo, "texto": texto, "ok": ok,
+                "recurso": e.recurso, "acao": e.acao, "entidade_id": e.entidade_id,
+                "quando": e.recebido_em.isoformat() if e.recebido_em else None,
+                "resultado": e.resultado,
+            })
+        return out
+    finally:
+        db.close()
 
 
 @app.get("/api/nfe/eventos")
