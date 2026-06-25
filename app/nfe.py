@@ -16,6 +16,7 @@ IMPORTANTE sobre o schema do Bling: os nomes exatos de alguns campos da NF-e v3
 são defensivos e concentram esse mapeamento num lugar só, fácil de ajustar.
 """
 
+import re
 from typing import Optional
 
 
@@ -46,7 +47,10 @@ def desconto_do_item(valor_unitario, quantidade, desconto, desconto_tipo="valor"
     else:
         desc = _num(desconto)
     desc = min(max(desc, 0.0), bruto)
-    return {"bruto": _r2(bruto), "desconto_reais": _r2(desc), "liquido": _r2(bruto - desc)}
+    bruto_r = _r2(bruto)
+    desc_r = _r2(desc)
+    # líquido SEMPRE = bruto − desconto, ambos arredondados (evita divergir 1 centavo do total)
+    return {"bruto": bruto_r, "desconto_reais": desc_r, "liquido": _r2(bruto_r - desc_r)}
 
 
 def aplicar_edicao(itens, *, desconto_tipo="percentual", desconto_valor=0.0,
@@ -124,14 +128,21 @@ def normalizar_nfe(raw: dict) -> dict:
     transporte = nfe.get("transporte") or {}
     frete = transporte.get("frete", transporte.get("valorFrete",
             nfe.get("frete", nfe.get("valorFrete", 0))))
+    contato = nfe.get("contato") or {}
     return {
         "id": nfe.get("id"),
         "numero": nfe.get("numero"),
         "serie": nfe.get("serie"),
         "situacao": nfe.get("situacao"),
-        "contato": (nfe.get("contato") or {}).get("nome", ""),
+        "contato": contato.get("nome", ""),
+        "documento": contato.get("numeroDocumento", ""),
         "frete": _num(frete),
         "itens": itens,
+        "parcelas": [{"data": p.get("data"), "valor": _num(p.get("valor"))}
+                     for p in (nfe.get("parcelas") or [])],
+        "valor_nota": _num(nfe.get("valorNota")),
+        "plataforma": plataforma_nota(nfe),
+        "pedido_loja": nfe.get("numeroPedidoLoja"),
     }
 
 
@@ -144,6 +155,27 @@ SITUACOES_NFE = {
 
 MODELO_NFE = {"55": "NF-e (modelo 55)", "65": "NFC-e (modelo 65)"}
 FINALIDADE_NFE = {"1": "Normal", "2": "Complementar", "3": "Ajuste", "4": "Devolução"}
+
+# Marketplace pela raiz do CNPJ do intermediador (8 primeiros dígitos)
+_PLATAFORMA_CNPJ = {
+    "35635824": "Shopee",
+    "10573521": "Mercado Livre",
+    "03361252": "Mercado Livre",
+    "15436940": "Amazon",
+    "47960950": "Magalu",
+    "09358108": "Magalu",
+    "00776574": "Americanas",
+    "01882369": "TikTok Shop",
+}
+
+
+def plataforma_nota(note: dict):
+    """Detecta o marketplace da nota pelo CNPJ do intermediador (Shopee, Mercado Livre…)."""
+    inter = note.get("intermediador") or {}
+    cnpj = re.sub(r"\D", "", str(inter.get("cnpj") or ""))
+    if cnpj[:8] in _PLATAFORMA_CNPJ:
+        return _PLATAFORMA_CNPJ[cnpj[:8]]
+    return None
 
 
 def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, remover_frete=True) -> dict:
@@ -195,15 +227,19 @@ def enriquecer_valores(user_id: int, notas: list, limite: int = 60) -> list:
     """O endpoint /nfe (lista) do Bling NÃO traz o valor total — só o GET individual.
     Para as notas sem valor, busca o total real (respeitando o rate limit, com teto)."""
     from . import bling  # import tardio (evita ciclo)
-    faltando = [n for n in notas if not n.get("valor")]
-    for n in faltando[:limite]:
+    for n in notas[:limite]:
         if not n.get("id"):
+            continue
+        if n.get("valor") and n.get("plataforma"):
             continue
         try:
             raw = bling.obter_nfe(user_id, n["id"])
-            n["valor"] = valor_total_raw(raw)
+            note = raw.get("data", raw) if isinstance(raw, dict) else {}
+            if not n.get("valor"):
+                n["valor"] = valor_total_raw(raw)
+            n["plataforma"] = plataforma_nota(note)
         except Exception:
-            pass  # mantém 0; não derruba a listagem por causa de uma nota
+            pass  # mantém o que tiver; não derruba a listagem por causa de uma nota
     return notas
 
 
@@ -307,6 +343,7 @@ def detalhar_nfe(raw: dict) -> dict:
         "valor_frete": _num(n.get("valorFrete")),
         "simples_nacional": bool(n.get("optanteSimplesNacional")),
         "pedido_loja": n.get("numeroPedidoLoja"),
+        "plataforma": plataforma_nota(n),
         "link_danfe": n.get("linkDanfe"),
         "link_pdf": n.get("linkPDF"),
         "link_xml": n.get("xml"),
@@ -410,9 +447,18 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
     itens_raw = nfe.get("itens") or nfe.get("itensNota") or []
     for linha in linhas:
         idx = linha["indice"]
-        if 0 <= idx < len(itens_raw):
-            # desconto SEMPRE arredondado a 2 casas: garante que valor*qtd − desconto feche em centavos
-            itens_raw[idx]["desconto"] = _r2(linha["desconto_reais"])
+        if not (0 <= idx < len(itens_raw)):
+            continue
+        it = itens_raw[idx]
+        qty = _num(it.get("quantidade")) or 1
+        net = _num(linha.get("liquido"))  # total líquido da linha (já arredondado)
+        novo_valor = _r2(net / qty) if qty else _r2(net)
+        # O Bling RECALCULA o total da nota pela soma dos valorTotal dos itens. Por isso o
+        # desconto é aplicado REDUZINDO valor e valorTotal (e zerando desconto) — assim o
+        # total recalculado bate com as parcelas e o PUT é aceito.
+        it["valor"] = novo_valor
+        it["valorTotal"] = _r2(novo_valor * qty)
+        it["desconto"] = 0
     if "itens" in nfe:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
@@ -431,8 +477,8 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
         if "valorFrete" in nfe:
             nfe["valorFrete"] = 0
 
-    # novo total = soma dos líquidos item a item (arredondados) + frete — IGUAL ao que o Bling vai calcular
-    total_itens = _r2(sum(_liquido_item(it) for it in itens_raw))
+    # novo total = soma dos valorTotal (já líquidos) + frete — exatamente o que o Bling recalcula
+    total_itens = _r2(sum(_num(it.get("valorTotal")) for it in itens_raw))
     novo_total = _r2(total_itens + frete_depois)
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)

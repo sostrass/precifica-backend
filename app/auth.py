@@ -1,5 +1,6 @@
 """Autenticação multi-tenant: senha com bcrypt e sessão com JWT."""
 
+import hashlib
 from datetime import datetime, timedelta
 
 import bcrypt
@@ -9,6 +10,22 @@ from fastapi import Header, HTTPException
 from .config import settings
 from .db import SessionLocal
 from .models import User
+
+
+def _signing_key() -> str:
+    """Chave de assinatura do JWT com pelo menos 32 bytes (exigência do HS256/SHA-256).
+
+    Se a JWT_SECRET configurada for curta (< 32 bytes), deriva uma chave estável de
+    64 bytes via SHA-256 — silencia o InsecureKeyLengthWarning e mantém o login
+    funcionando com qualquer valor de secret, sem precisar trocar a env do Railway.
+    """
+    s = (settings.jwt_secret or "").encode()
+    if len(s) >= 32:
+        return settings.jwt_secret
+    return hashlib.sha256(s).hexdigest()  # 64 caracteres = 64 bytes
+
+
+_JWT_KEY = _signing_key()
 
 
 def hash_password(senha: str) -> str:
@@ -26,11 +43,11 @@ def create_access_token(user_id: int) -> str:
         "type": "access",
         "exp": datetime.utcnow() + timedelta(minutes=settings.jwt_expire_minutes),
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+    return jwt.encode(payload, _JWT_KEY, algorithm="HS256")
 
 
 def decode_token(token: str) -> dict:
-    return jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    return jwt.decode(token, _JWT_KEY, algorithms=["HS256"])
 
 
 def registrar(email: str, senha: str, nome: str | None = None) -> User:
