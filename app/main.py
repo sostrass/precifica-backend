@@ -2031,7 +2031,9 @@ def nfe_pendentes(pagina: int = 1, limite: int = 100,
     sit = situacao if situacao is not None else cfg.situacao_pendente
     try:
         raw = bling.listar_nfe(user.id, pagina=pagina, limite=limite, situacao=sit)
-        return {"notas": nfe.resumir_lista(raw), "situacao": sit}
+        notas = nfe.resumir_lista(raw)
+        notas = nfe.enriquecer_valores(user.id, notas)  # busca o total real (lista não traz)
+        return {"notas": notas, "situacao": sit}
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2139,6 +2141,23 @@ def nfe_completa(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Visão COMPLETA da nota: destinatário, totais, impostos, transporte, itens e links."""
     try:
         return nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id))
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/nfe/{nfe_id}/diagnostico-edicao")
+def nfe_diagnostico_edicao(nfe_id: str, user: User = Depends(auth.get_current_user)):
+    """Dry-run: mostra a estrutura real da nota e o payload que seria enviado (sem enviar),
+    para ver as parcelas e checar se a soma bate com o total."""
+    cfg = _nfe_cfg(user.id)
+    try:
+        return nfe.diagnosticar_edicao(
+            user.id, nfe_id,
+            desconto_tipo=cfg.desconto_tipo, desconto_valor=float(cfg.desconto_valor or 0),
+            remover_frete=bool(cfg.remover_frete),
+        )
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:

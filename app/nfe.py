@@ -142,6 +142,70 @@ SITUACOES_NFE = {
     9: "Denegada", 10: "Em digitação", 11: "Bloqueada",
 }
 
+MODELO_NFE = {"55": "NF-e (modelo 55)", "65": "NFC-e (modelo 65)"}
+FINALIDADE_NFE = {"1": "Normal", "2": "Complementar", "3": "Ajuste", "4": "Devolução"}
+
+
+def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, remover_frete=True) -> dict:
+    """Dry-run: mostra a estrutura real da nota e o payload que SERIA enviado (sem enviar).
+    Serve para ver as parcelas, os campos da nota e se a soma das parcelas bate com o total."""
+    from . import bling
+    raw = bling.obter_nfe(user_id, nfe_id)
+    note = raw.get("data", raw) if isinstance(raw, dict) else {}
+    view = normalizar_nfe(raw)
+    edicao = aplicar_edicao(
+        view["itens"], desconto_tipo=desconto_tipo, desconto_valor=desconto_valor,
+        remover_frete=remover_frete, frete_atual=view["frete"],
+    )
+    payload = montar_alteracao(raw, edicao)
+    parc_pay = payload.get("parcelas") or []
+    itens_pay = payload.get("itens") or payload.get("itensNota") or []
+    soma_parc = _r2(sum(_parcela_val(p) for p in parc_pay))
+    total_calc = _r2(sum(_liquido_item(it) for it in itens_pay) + _num(edicao["resumo"].get("frete_depois")))
+    return {
+        "raw": {
+            "valorNota": note.get("valorNota"),
+            "tem_parcelas": bool(note.get("parcelas")),
+            "parcelas": note.get("parcelas"),
+            "chaves_nota": sorted([k for k in note.keys()]),
+        },
+        "payload": {
+            "parcelas": parc_pay,
+            "itens_desconto": [it.get("desconto") for it in itens_pay],
+        },
+        "soma_parcelas_payload": soma_parc,
+        "total_calculado": total_calc,
+        "bate": abs(soma_parc - total_calc) < 0.01,
+        "resumo": edicao["resumo"],
+    }
+
+
+def valor_total_raw(raw: dict) -> float:
+    """Total da nota a partir do payload bruto do Bling (GET individual)."""
+    n = raw.get("data", raw) if isinstance(raw, dict) else {}
+    v = n.get("valorNota")
+    if v is None:
+        v = n.get("total")
+    if v is None:
+        v = n.get("valor")
+    return _num(v)
+
+
+def enriquecer_valores(user_id: int, notas: list, limite: int = 60) -> list:
+    """O endpoint /nfe (lista) do Bling NÃO traz o valor total — só o GET individual.
+    Para as notas sem valor, busca o total real (respeitando o rate limit, com teto)."""
+    from . import bling  # import tardio (evita ciclo)
+    faltando = [n for n in notas if not n.get("valor")]
+    for n in faltando[:limite]:
+        if not n.get("id"):
+            continue
+        try:
+            raw = bling.obter_nfe(user_id, n["id"])
+            n["valor"] = valor_total_raw(raw)
+        except Exception:
+            pass  # mantém 0; não derruba a listagem por causa de uma nota
+    return notas
+
 
 def resumir_lista(raw: dict) -> list:
     """Normaliza a lista de NF-e do Bling para a UI: id, número, situação (+rótulo),
@@ -221,6 +285,9 @@ def detalhar_nfe(raw: dict) -> dict:
     if end.get("cep"):
         partes.append(f"CEP {end['cep']}")
     sit = n.get("situacao")
+    _tipo = n.get("tipo")
+    _modelo = n.get("modelo")
+    _fin = n.get("finalidade")
     return {
         "id": n.get("id"),
         "numero": n.get("numero"),
@@ -228,6 +295,12 @@ def detalhar_nfe(raw: dict) -> dict:
         "situacao": sit,
         "situacao_label": situacao_label(sit),
         "editavel": nota_editavel(sit),
+        "modelo": _modelo,
+        "modelo_label": MODELO_NFE.get(str(_modelo), f"Modelo {_modelo}" if _modelo not in (None, "") else None),
+        "tipo": _tipo,
+        "tipo_label": {0: "Entrada", 1: "Saída"}.get(_tipo) if _tipo is not None else None,
+        "finalidade": _fin,
+        "finalidade_label": FINALIDADE_NFE.get(str(_fin)) if _fin not in (None, "") else None,
         "data_emissao": n.get("dataEmissao"),
         "chave_acesso": n.get("chaveAcesso"),
         "valor_nota": _num(n.get("valorNota")),
@@ -268,16 +341,35 @@ def _ref_id(v):
     return v
 
 
+_PARCELA_VAL_KEYS = ("valor", "valorParcela", "valorParc", "vlr")
+
+
+def _parcela_val(p: dict) -> float:
+    for k in _PARCELA_VAL_KEYS:
+        if k in p:
+            return _num(p.get(k))
+    return 0.0
+
+
+def _set_parcela_val(p: dict, v: float):
+    # grava no mesmo campo que existia; se nenhum existir, usa 'valor'
+    for k in _PARCELA_VAL_KEYS:
+        if k in p:
+            p[k] = v
+            return
+    p["valor"] = v
+
+
 def _reescalar_parcelas(parcelas: list, novo_total: float) -> list:
     """Reescala as parcelas para somarem exatamente o novo total da nota.
-    O Bling recusa o PUT com 'Total das parcelas difere do total da nota' se não bater."""
+    O Bling recusa o PUT com 'Total das parcelas difere do total da nota' se não bater.
+    Robusto ao nome do campo de valor da parcela."""
     if not parcelas or novo_total <= 0:
         return parcelas
-    soma = sum(_num(p.get("valor")) for p in parcelas)
+    soma = sum(_parcela_val(p) for p in parcelas)
     if soma <= 0:
-        # sem base para proporção: joga tudo na 1ª parcela, zera as demais
         for i, p in enumerate(parcelas):
-            p["valor"] = _r2(novo_total) if i == 0 else 0.0
+            _set_parcela_val(p, _r2(novo_total) if i == 0 else 0.0)
         return parcelas
     if abs(soma - novo_total) < 0.01:
         return parcelas  # já bate
@@ -285,24 +377,33 @@ def _reescalar_parcelas(parcelas: list, novo_total: float) -> list:
     n = len(parcelas)
     for i, p in enumerate(parcelas):
         if i < n - 1:
-            v = round(_num(p.get("valor")) * novo_total / soma, 2)
-            p["valor"] = v
+            v = round(_parcela_val(p) * novo_total / soma, 2)
+            _set_parcela_val(p, v)
             acc += v
         else:
-            p["valor"] = _r2(novo_total - acc)  # última absorve o arredondamento
+            _set_parcela_val(p, _r2(novo_total - acc))  # última absorve o arredondamento
     return parcelas
+
+
+def _liquido_item(it: dict) -> float:
+    """Total líquido de um item, arredondado a 2 casas — como o Bling calcula por item."""
+    v = it.get("valor")
+    if v is None:
+        v = it.get("valorUnitario")
+    q = it.get("quantidade") if it.get("quantidade") is not None else 1
+    d = _num(it.get("desconto"))
+    return _r2(_num(v) * _num(q) - d)
 
 
 def montar_alteracao(raw: dict, edicao: dict) -> dict:
     """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
 
-    Parte do objeto original (preservando os campos fiscais), sobrescreve o desconto de
-    cada item e o frete, REESCALA as parcelas para o novo total (senão o Bling recusa),
-    REMOVE os campos read-only e reduz objetos de referência a {id}.
+    Sobrescreve o desconto de cada item (ARREDONDADO a 2 casas), recalcula o novo total
+    somando os líquidos item a item (mesma conta do Bling) e REESCALA as parcelas para
+    esse total — evita o erro 'Total das parcelas difere do total da nota' por arredondamento.
+    Remove campos read-only e reduz objetos de referência a {id}.
     """
     nfe = dict(raw.get("data", raw))
-    # total real original da nota (já inclui impostos) — base para reescalar parcelas
-    total_original = _num(nfe.get("valorNota"))
     resumo = edicao.get("resumo", {})
 
     linhas = edicao["itens"]
@@ -310,7 +411,8 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
     for linha in linhas:
         idx = linha["indice"]
         if 0 <= idx < len(itens_raw):
-            itens_raw[idx]["desconto"] = linha["desconto_reais"]
+            # desconto SEMPRE arredondado a 2 casas: garante que valor*qtd − desconto feche em centavos
+            itens_raw[idx]["desconto"] = _r2(linha["desconto_reais"])
     if "itens" in nfe:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
@@ -318,7 +420,8 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
 
     # zera o frete no transporte (e no total, conforme o schema)
     transporte = dict(nfe.get("transporte") or {})
-    if resumo.get("frete_depois") == 0:
+    frete_depois = _num(resumo.get("frete_depois"))
+    if frete_depois == 0:
         if "frete" in transporte:
             transporte["frete"] = 0
         transporte["valorFrete"] = 0
@@ -328,11 +431,9 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
         if "valorFrete" in nfe:
             nfe["valorFrete"] = 0
 
-    # reescala as parcelas para o novo total real (original − desconto − frete removido)
-    if total_original > 0:
-        novo_total = _r2(total_original - _num(resumo.get("total_desconto")) - _num(resumo.get("frete_removido")))
-    else:
-        novo_total = _num(resumo.get("total_nota"))
+    # novo total = soma dos líquidos item a item (arredondados) + frete — IGUAL ao que o Bling vai calcular
+    total_itens = _r2(sum(_liquido_item(it) for it in itens_raw))
+    novo_total = _r2(total_itens + frete_depois)
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
 
