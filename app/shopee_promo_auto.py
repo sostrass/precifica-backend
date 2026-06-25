@@ -275,6 +275,64 @@ def _motivo_funil(diag: dict, cfg) -> str:
             "desconto máximo.")
 
 
+def diagnosticar_desconto(user_id: int) -> dict:
+    """Testa criar UM desconto com 1 produto e devolve as respostas CRUAS da Shopee
+    (get_model_list, add_discount, add_discount_item) pra revelar o motivo exato do
+    '0 produtos'. Apaga o desconto de teste no fim."""
+    out: dict = {"ok": False, "etapas": []}
+    cfg_v = _ConfigView(obter_config(user_id))
+    cands, diag = _funil(user_id, cfg_v)
+    out["diagnostico_funil"] = diag
+    if not cands:
+        out["motivo"] = _motivo_funil(diag, cfg_v)
+        return out
+    cand = cands[0]
+    out["produto"] = {k: cand.get(k) for k in ("item_id", "nome", "sku", "preco_atual", "preco_promo", "desconto_pct")}
+    iid = int(cand["item_id"])
+
+    try:
+        ml = shopee._chamar(user_id, "/api/v2/product/get_model_list", extra={"item_id": iid})
+        out["etapas"].append({"passo": "get_model_list", "resposta": ml})
+    except Exception as e:
+        out["etapas"].append({"passo": "get_model_list", "erro": str(e)})
+
+    itens = shopee.itens_desconto_por_pct(user_id, [
+        {"item_id": cand["item_id"], "desconto_pct": cand["desconto_pct"], "preco": cand["preco_atual"]}])
+    out["payload_enviado"] = itens
+
+    inicio = int(time.time()) + 3900
+    fim = inicio + 86400
+    nome = f"TESTE diag {datetime.now().strftime('%H:%M:%S')}"
+    did = None
+    try:
+        ad = shopee._chamar(user_id, "/api/v2/discount/add_discount", metodo="POST",
+                            extra={"discount_name": nome, "start_time": inicio, "end_time": fim})
+        out["etapas"].append({"passo": "add_discount", "resposta": ad})
+        did = (ad.get("response") or {}).get("discount_id")
+    except Exception as e:
+        out["etapas"].append({"passo": "add_discount", "erro": str(e)})
+
+    if did and itens:
+        try:
+            adi = shopee._chamar(user_id, "/api/v2/discount/add_discount_item", metodo="POST",
+                                 extra={"discount_id": did, "item_list": itens})
+            out["etapas"].append({"passo": "add_discount_item", "resposta": adi})
+            resp = adi.get("response") or {}
+            out["count"] = resp.get("count")
+            out["error_list"] = resp.get("error_list") or resp.get("fail_list")
+            out["ok"] = bool(resp.get("count"))
+        except Exception as e:
+            out["etapas"].append({"passo": "add_discount_item", "erro": str(e)})
+        try:
+            shopee._chamar(user_id, "/api/v2/discount/delete_discount", metodo="POST",
+                           extra={"discount_id": did})
+            out["teste_apagado"] = True
+        except Exception:
+            out["teste_apagado"] = False
+            out["aviso"] = f"Não consegui apagar o desconto de teste (id {did}); apague manualmente na Shopee se aparecer."
+    return out
+
+
 def propor(user_id: int) -> dict:
     """Monta as propostas de promoção (não cria nada). Para revisão no modo sugerir."""
     db = SessionLocal()
@@ -328,7 +386,8 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
 
     if tipo in ("desconto", "ambos"):
         try:
-            inicio = int(time.time()) + 300
+            # a Shopee exige start_time >= 1h no futuro; senão cria a campanha mas REJEITA anexar itens
+            inicio = int(time.time()) + 3900  # 1h05min de folga
             fim = inicio + max(1, snap["duracao_dias"]) * 86400
             itens = shopee.itens_desconto_por_pct(user_id, [
                 {"item_id": p["item_id"], "desconto_pct": p["desconto_pct"], "preco": p["preco_atual"]}

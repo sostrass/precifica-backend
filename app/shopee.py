@@ -1346,16 +1346,16 @@ def itens_desconto_por_pct(user_id: int, itens: list) -> list:
                 continue
             model_list.append({"model_id": m.get("model_id"), "model_promotion_price": promo})
         if not model_list:
-            # sem variação (anúncio simples): model_id 0 com o preço do catálogo
+            # sem variação (anúncio simples): preço no nível do ITEM (model_id 0 é rejeitado por alguns anúncios)
             preco = float(it.get("preco") or 0)
             if preco > 0:
                 promo = round(preco * (1 - d), 2)
                 if promo >= preco:
                     promo = round(preco - 0.01, 2)
                 if promo > 0:
-                    model_list = [{"model_id": 0, "model_promotion_price": promo}]
-        if not model_list:
-            continue  # não dá pra montar preço válido — não manda item quebrado
+                    out.append({"item_id": item_id, "purchase_limit": int(it.get("purchase_limit") or 0),
+                                "item_promotion_price": promo})
+            continue
         out.append({"item_id": item_id, "purchase_limit": int(it.get("purchase_limit") or 0),
                     "model_list": model_list})
     return out

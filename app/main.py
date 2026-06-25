@@ -754,6 +754,18 @@ def shopee_promo_config_put(background_tasks: BackgroundTasks, payload: dict = B
     return {**cfg, "disparo_imediato": bool(virou_auto)}
 
 
+@app.post("/api/shopee/promo/diagnosticar")
+def shopee_promo_diagnosticar(user: User = Depends(auth.get_current_user)):
+    """Testa anexar 1 produto a um desconto e devolve as respostas CRUAS da Shopee,
+    pra revelar o motivo exato do '0 produtos'. Apaga o desconto de teste no fim."""
+    try:
+        return shopee_promo_auto.diagnosticar_desconto(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/api/shopee/promo/propor")
 def shopee_promo_propor(user: User = Depends(auth.get_current_user)):
     """Monta as propostas de promoção (não cria nada) — o agente escolhe os produtos
