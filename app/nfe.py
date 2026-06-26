@@ -429,6 +429,87 @@ def resumir_lista(raw: dict) -> list:
     return out
 
 
+# ===== NF-e por pedido da loja (enriquecimento da impressão Shopee) =====
+# A listagem do Bling NÃO traz numeroPedidoLoja/chaveAcesso (e nesta conta nem o valor),
+# então casamos pelo DETALHE da nota (obter_nfe -> detalhar_nfe.pedido_loja). Para não
+# estourar rate-limit, buscamos só as notas mais recentes até achar os pedidos pedidos
+# (early-exit) e cacheamos o mapa por 10 min.
+_NFE_POR_PEDIDO_CACHE: dict = {}
+_NFE_POR_PEDIDO_TTL = 600
+
+
+def _fmt_data_br(s):
+    if not s:
+        return None
+    txt = str(s)[:10]
+    try:
+        a, m, d = txt.split("-")
+        return f"{d}/{m}/{a}"
+    except Exception:  # noqa: BLE001
+        return txt
+
+
+def nfe_por_pedidos(user_id: int, order_sns: list, dias: int = 60,
+                    max_detalhes: int = 120, max_paginas: int = 8) -> dict:
+    """Mapa {order_sn: {nfe_numero, nfe_serie, nfe_emissao, valor_total, nfe_chave}}
+    casando a NF-e do Bling pelo numeroPedidoLoja (= order_sn da Shopee)."""
+    from . import bling
+    import time
+    alvo = {str(s) for s in (order_sns or []) if s}
+    if not alvo:
+        return {}
+    agora = time.time()
+    ent = _NFE_POR_PEDIDO_CACHE.get(user_id)
+    cache = dict(ent[1]) if (ent and agora - ent[0] < _NFE_POR_PEDIDO_TTL) else {}
+    faltam = alvo - set(cache.keys())
+    if not faltam:
+        return {s: cache[s] for s in alvo if s in cache}
+
+    from datetime import date, timedelta
+    fim = date.today()
+    ini = fim - timedelta(days=max(1, dias))
+    detalhes = 0
+    pagina = 1
+    while pagina <= max_paginas and faltam and detalhes < max_detalhes:
+        try:
+            raw = bling.listar_nfe(user_id, pagina=pagina, limite=100,
+                                   data_ini=ini.isoformat(), data_fim=fim.isoformat())
+        except Exception:  # noqa: BLE001
+            break
+        linhas = resumir_lista(raw)
+        if not linhas:
+            break
+        for n in linhas:
+            if detalhes >= max_detalhes or not faltam:
+                break
+            nid = n.get("id")
+            if not nid:
+                continue
+            if n.get("tipo") not in (1, "1", None):  # só notas de saída
+                continue
+            detalhes += 1
+            try:
+                det = detalhar_nfe(bling.obter_nfe(user_id, nid))
+            except Exception:  # noqa: BLE001
+                continue
+            ped = str(det.get("pedido_loja") or "").strip()
+            if not ped:
+                continue
+            cache[ped] = {
+                "nfe_numero": det.get("numero"),
+                "nfe_serie": det.get("serie"),
+                "nfe_emissao": _fmt_data_br(det.get("data_emissao")),
+                "valor_total": det.get("valor_nota"),
+                "nfe_chave": det.get("chave_acesso"),
+            }
+            faltam.discard(ped)
+        if len(linhas) < 100:
+            break
+        pagina += 1
+    _NFE_POR_PEDIDO_CACHE[user_id] = (agora, cache)
+    return {s: cache[s] for s in alvo if s in cache}
+
+
 def situacao_label(cod) -> str:
     try:
         return SITUACOES_NFE.get(int(cod), f"Situação {cod}")
@@ -745,12 +826,14 @@ def montar_alteracao(raw: dict, edicao: dict, modo: str = "nota") -> dict:
                 transporte["frete"] = 0
             if "valorFrete" in transporte:
                 transporte["valorFrete"] = 0
-        # preserva a quantidade de volumes (o GET do Bling não devolve, e sem isso vira 0)
+        # preserva/garante a quantidade de volumes (o GET do Bling não devolve, e sem isso vira 0)
         vols = transporte.get("volumes")
-        if isinstance(vols, list):
+        if isinstance(vols, list) and vols:
             for v in vols:
                 if isinstance(v, dict) and not _num(v.get("quantidade")):
                     v["quantidade"] = 1
+        else:
+            transporte["volumes"] = [{"quantidade": 1}]
 
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
@@ -1003,7 +1086,9 @@ def editar_nota(user_id: int, nfe_id, *, desconto_tipo, desconto_valor,
     plataforma = None
     if desconto_plataformas:
         note = raw.get("data", raw) if isinstance(raw, dict) else {}
-        plataforma = plataforma_nota(note)
+        # precisa do mapa de lojas p/ detectar Shein/NuvemShop/site próprio (não têm CNPJ de intermediador)
+        lojas_map = _mapear_lojas_plataforma(user_id)
+        plataforma = plataforma_nota(note, lojas_map)
         regra = desconto_plataformas.get(plataforma) if plataforma else None
         if regra and regra.get("tipo") in ("percentual", "valor"):
             desconto_tipo = regra["tipo"]
@@ -1080,9 +1165,11 @@ def processar_evento(user_id, nfe_id, cfg) -> dict:
     try:
         r = editar_nota(user_id, nfe_id, desconto_tipo=cfg.desconto_tipo,
                         desconto_valor=cfg.desconto_valor,
-                        remover_frete=cfg.remover_frete, enviar=True)
+                        remover_frete=cfg.remover_frete, enviar=True,
+                        desconto_plataformas=getattr(cfg, "desconto_plataformas", None))
         resumo = r.get("resumo", {})
         return {**base, "ok": True, "aplicado": True,
+                "plataforma": r.get("plataforma"),
                 "total_nota": resumo.get("total_nota"),
                 "total_desconto": resumo.get("total_desconto")}
     except Exception as e:  # noqa: BLE001

@@ -417,7 +417,7 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
         try:
             rd = _chamar(user_id, "/api/v2/order/get_order_detail",
                          extra={"order_sn_list": ",".join(lote),
-                                "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time"})
+                                "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time,note"})
         except ShopeeError:
             continue
         for o in ((rd.get("response") or {}).get("order_list") or []):
@@ -445,6 +445,7 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
                         abaixo_meta = True
                 itens.append({
                     "nome": it.get("item_name") or f"#{it.get('item_id')}", "sku": sku, "qtd": qtd,
+                    "variacao": it.get("model_name"),
                     "preco_pago": round(pago, 2), "imagem": (it.get("image_info") or {}).get("image_url"),
                     "custo": custo, "tem_cadastro": base is not None,
                     "margem_real": margem_real, "lucro_real": lucro_real,
@@ -455,7 +456,11 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
                 "order_sn": o.get("order_sn"), "status": o.get("order_status"),
                 "comprador": o.get("buyer_username") or rec.get("name") or "—",
                 "cliente": rec.get("name"), "cidade": rec.get("city"), "uf": rec.get("state"),
+                "endereco": {"nome": rec.get("name"), "telefone": rec.get("phone"),
+                             "cidade": rec.get("city"), "uf": rec.get("state"),
+                             "cep": rec.get("zipcode"), "completo": rec.get("full_address")},
                 "ship_by": o.get("ship_by_date"), "criado": o.get("create_time"),
+                "nota_comprador": o.get("note") or "",
                 "total_pago": round(total, 2), "abaixo_meta": abaixo_meta, "prejuizo": prejuizo,
                 "sem_cadastro": sem_cad, "lucro_real": round(lucro_pedido, 2) if tem_lucro else None,
                 "itens": itens,
@@ -496,7 +501,7 @@ def pedido_detalhe(user_id: int, order_sn: str) -> dict:
     from . import catalogo, precificacao
     rd = _chamar(user_id, "/api/v2/order/get_order_detail",
                  extra={"order_sn_list": order_sn,
-                        "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time,actual_shipping_fee,note"})
+                        "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time,actual_shipping_fee,note,payment_method,cod"})
     od = (((rd.get("response") or {}).get("order_list") or [{}]) or [{}])[0]
 
     inc = {}
@@ -563,8 +568,195 @@ def pedido_detalhe(user_id: int, order_sn: str) -> dict:
                      "cidade": rec.get("city"), "uf": rec.get("state"),
                      "cep": rec.get("zipcode"), "completo": rec.get("full_address")},
         "logistica": {"transportadora": od.get("shipping_carrier"), "rastreio": tracking},
+        "pagamento": od.get("payment_method"), "nota_comprador": od.get("note") or "", "cod": bool(od.get("cod")),
         "itens": itens, "total_pago": round(total_pago, 2), "financeiro": financeiro,
     }
+
+
+def enriquecer_impressao(user_id: int, order_sns: list, skus: list | None = None) -> dict:
+    """Enriquecimento sob demanda para a impressão (etiqueta/folha): para os pedidos
+    selecionados busca rastreio (tracking_number) + dados da NF-e (casada pelo
+    numeroPedidoLoja); para os SKUs, a descrição complementar (Bling, cacheada).
+    O front mescla isso nos pedidos antes de abrir a janela de impressão.
+    Retorna {"patches": {order_sn: {...}}, "complementos": {sku: texto}}."""
+    from . import catalogo, nfe as nfe_mod
+    sns = [str(s) for s in (order_sns or []) if s][:60]
+    patches: dict = {}
+    if sns:
+        try:
+            mapa_nfe = nfe_mod.nfe_por_pedidos(user_id, sns)  # um scan cacheado por usuário
+        except Exception:  # noqa: BLE001
+            mapa_nfe = {}
+        for sn in sns:
+            patch: dict = {}
+            try:
+                tr = _chamar(user_id, "/api/v2/logistics/get_tracking_number",
+                             extra={"order_sn": sn})
+                rastreio = (tr.get("response") or {}).get("tracking_number")
+                if rastreio:
+                    patch["rastreio"] = rastreio
+            except ShopeeError:
+                pass
+            info = mapa_nfe.get(sn)
+            if info:
+                for k, v in info.items():
+                    if v not in (None, ""):
+                        patch[k] = v
+            if patch:
+                patches[sn] = patch
+    complementos: dict = {}
+    vistos: set = set()
+    for sku in (skus or []):
+        s = str(sku or "").strip()
+        if not s or s in vistos:
+            continue
+        vistos.add(s)
+        if len(vistos) > 400:
+            break
+        try:
+            dc = catalogo.descricao_complementar(user_id, s)
+        except Exception:  # noqa: BLE001
+            dc = ""
+        if dc:
+            complementos[s] = dc
+    return {"patches": patches, "complementos": complementos}
+
+
+# ============================================================================
+# MÓDULO 5 — Documento de envio oficial da Shopee (waybill/etiqueta em PDF)
+# Fluxo: resolver tipo -> create_shipping_document -> get_result (poll) -> download (PDF)
+# ============================================================================
+_DOC_ENVIO_TIPO_PADRAO = "THERMAL_AIR_WAYBILL"
+
+
+def _chamar_binario(user_id: int, path: str, extra: dict | None = None,
+                    metodo: str = "POST", timeout: int = 45) -> bytes:
+    """Igual ao _chamar, mas devolve o corpo BINÁRIO (ex.: PDF do download_shipping_document).
+    Se a Shopee responder JSON (caso de erro), levanta ShopeeError com a mensagem."""
+    if not app_configurado():
+        raise ShopeeError("App Shopee não configurado no servidor.")
+    access_token, shop_id = _token_valido(user_id)
+    ts = int(time.time())
+    sign = _sign_loja(path, ts, access_token, shop_id)
+    params = {"partner_id": int(settings.shopee_partner_id), "timestamp": ts,
+              "access_token": access_token, "shop_id": int(shop_id), "sign": sign}
+    url = f"{settings.shopee_base_url}{path}"
+    try:
+        if metodo == "GET":
+            r = requests.get(url, params={**params, **(extra or {})}, timeout=timeout)
+        else:
+            r = requests.post(url, params=params, json=(extra or {}), timeout=timeout)
+    except requests.RequestException as e:
+        raise ShopeeError(f"Falha na chamada Shopee: {e}")
+    ct = (r.headers.get("content-type") or "").lower()
+    if "application/json" in ct or "text/" in ct or (r.content[:1] in (b"{", b"[")):
+        try:
+            d = r.json()
+        except ValueError:
+            d = {}
+        if isinstance(d, dict) and d.get("error"):
+            if "token" in str(d.get("error", "")).lower():
+                renovar_token(user_id)
+            raise ShopeeError(f"{d.get('error')}: {d.get('message')}")
+        raise ShopeeError("Resposta inesperada da Shopee ao baixar o documento.")
+    if not r.content:
+        raise ShopeeError("Documento vazio retornado pela Shopee.")
+    return r.content
+
+
+def tipo_documento_sugerido(user_id: int, order_sn: str) -> str:
+    """Pergunta à Shopee qual tipo de waybill o pedido aceita (preferindo o térmico).
+    Cai no padrão térmico se a consulta não retornar nada utilizável."""
+    try:
+        r = _chamar(user_id, "/api/v2/logistics/get_shipping_document_parameter",
+                    extra={"order_sn": order_sn})
+        resp = r.get("response") or {}
+        sug = resp.get("suggest_shipping_document_type")
+        if sug:
+            return sug
+        infos = (resp.get("selectable_shipping_document_type")
+                 or resp.get("shipping_document_info") or resp.get("info_list") or [])
+        tipos = []
+        for x in infos:
+            t = x.get("shipping_document_type") if isinstance(x, dict) else x
+            if t:
+                tipos.append(t)
+        for t in tipos:
+            if "THERMAL" in str(t).upper():
+                return t
+        if tipos:
+            return tipos[0]
+    except ShopeeError:
+        pass
+    return _DOC_ENVIO_TIPO_PADRAO
+
+
+def criar_documento_envio(user_id: int, order_sns: list, tipo: str,
+                          rastreios: dict | None = None) -> dict:
+    """Dispara a geração do(s) waybill(s) na Shopee (create_shipping_document)."""
+    lista = []
+    for sn in order_sns:
+        item = {"order_sn": sn, "shipping_document_type": tipo}
+        if rastreios and rastreios.get(sn):
+            item["tracking_number"] = rastreios[sn]
+        lista.append(item)
+    return _chamar(user_id, "/api/v2/logistics/create_shipping_document",
+                   extra={"order_list": lista}, metodo="POST")
+
+
+def resultado_documento_envio(user_id: int, order_sns: list, tipo: str) -> dict:
+    """Status da geração por pedido: {order_sn: {status, erro}} (READY/PROCESSING/FAILED)."""
+    lista = [{"order_sn": sn, "shipping_document_type": tipo} for sn in order_sns]
+    r = _chamar(user_id, "/api/v2/logistics/get_shipping_document_result",
+                extra={"order_list": lista}, metodo="POST")
+    out = {}
+    for x in ((r.get("response") or {}).get("result_list") or []):
+        out[x.get("order_sn")] = {"status": x.get("status"),
+                                  "erro": x.get("fail_message") or x.get("fail_error") or ""}
+    return out
+
+
+def baixar_documento_envio(user_id: int, order_sns: list, tipo: str) -> bytes:
+    """Baixa o PDF do(s) waybill(s) já gerado(s) — binário, combina todos numa folha."""
+    lista = [{"order_sn": sn} for sn in order_sns]
+    return _chamar_binario(user_id, "/api/v2/logistics/download_shipping_document",
+                           extra={"shipping_document_type": tipo, "order_list": lista}, metodo="POST")
+
+
+def gerar_etiqueta_oficial(user_id: int, order_sns: list, tipo: str = "auto",
+                           tentativas: int = 6, intervalo: float = 1.5) -> bytes:
+    """Fluxo completo do waybill oficial: garante rastreio, resolve o tipo, cria, espera
+    ficar PRONTO e baixa o PDF. Retorna os bytes do PDF (todos os pedidos numa folha)."""
+    sns = [str(s) for s in (order_sns or []) if s][:50]
+    if not sns:
+        raise ShopeeError("Nenhum pedido informado.")
+    if not tipo or tipo == "auto":
+        tipo = tipo_documento_sugerido(user_id, sns[0])
+    # rastreio ajuda a Shopee a casar o pedido; busca o que der (sem bloquear)
+    rastreios = {}
+    for sn in sns:
+        try:
+            tr = _chamar(user_id, "/api/v2/logistics/get_tracking_number", extra={"order_sn": sn})
+            tn = (tr.get("response") or {}).get("tracking_number")
+            if tn:
+                rastreios[sn] = tn
+        except ShopeeError:
+            pass
+    criar_documento_envio(user_id, sns, tipo, rastreios)
+    prontos: set = set()
+    for _ in range(max(1, tentativas)):
+        res = resultado_documento_envio(user_id, sns, tipo)
+        prontos = {sn for sn, v in res.items() if str(v.get("status") or "").upper() == "READY"}
+        falhou = {sn: v.get("erro") for sn, v in res.items() if str(v.get("status") or "").upper() == "FAILED"}
+        if falhou:
+            msg = "; ".join(f"{sn}: {e}" for sn, e in falhou.items() if e) or "a Shopee recusou a geração"
+            raise ShopeeError(f"Etiqueta recusada — {msg}")
+        if len(prontos) >= len(sns):
+            break
+        time.sleep(intervalo)
+    if not prontos:
+        raise ShopeeError("A Shopee ainda está gerando a etiqueta. Tente de novo em alguns segundos.")
+    return baixar_documento_envio(user_id, sorted(prontos), tipo)
 
 
 def listar_pedidos(user_id: int, dias: int = 7, cursor: str = "", limite: int = 50) -> dict:

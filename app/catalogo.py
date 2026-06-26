@@ -164,3 +164,46 @@ def todos(user_id: int) -> list:
                  "custo": r.custo or 0.0, "saldo": r.saldo or 0.0} for r in rows]
     finally:
         db.close()
+
+
+# Cache em memória por (user_id, sku) além do que fica gravado em ProdutoCache.dados
+_DESC_COMPL_CACHE: dict = {}
+
+
+def descricao_complementar(user_id: int, sku: str) -> str:
+    """Descrição complementar do produto (campo descricaoComplementar do Bling) por SKU.
+    Resolve o produto_id pelo cache local, busca no Bling uma vez e grava em ProdutoCache.dados."""
+    if not sku:
+        return ""
+    chave = (user_id, str(sku))
+    if chave in _DESC_COMPL_CACHE:
+        return _DESC_COMPL_CACHE[chave]
+    db = SessionLocal()
+    try:
+        reg = db.query(ProdutoCache).filter_by(user_id=user_id, sku=str(sku)).first()
+        if not reg:
+            _DESC_COMPL_CACHE[chave] = ""
+            return ""
+        dados = reg.dados or {}
+        if "descricaoComplementar" in dados:
+            v = (dados.get("descricaoComplementar") or "").strip()
+            _DESC_COMPL_CACHE[chave] = v
+            return v
+        # ainda não cacheado: busca no Bling (1 chamada) e grava no cache local
+        try:
+            prod = (bling.obter_produto(user_id, reg.produto_id) or {}).get("data") or {}
+        except Exception:  # noqa: BLE001
+            return ""  # erro transitório: não cacheia, tenta de novo na próxima
+        v = (prod.get("descricaoComplementar") or "").strip()
+        dados["descricaoComplementar"] = v
+        reg.dados = dados
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(reg, "dados")
+        except Exception:  # noqa: BLE001
+            pass
+        db.commit()
+        _DESC_COMPL_CACHE[chave] = v
+        return v
+    finally:
+        db.close()

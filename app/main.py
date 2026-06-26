@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_promo_auto, shopee_reviews, webhooks
@@ -861,6 +861,36 @@ def shopee_pedidos_separacao(status: str = "A_ENVIAR", dias: int = 15, user: Use
         return shopee.lista_separacao(user.id, status=status, dias=dias)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/pedidos/enriquecer-impressao")
+def shopee_pedidos_enriquecer_impressao(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Enriquece os pedidos selecionados para impressão (etiqueta/folha): rastreio +
+    NF-e (casada por numeroPedidoLoja) + descrição complementar por SKU.
+    Body: {order_sns:[...], skus:[...]}. Retorna {patches:{order_sn:{...}}, complementos:{sku:texto}}."""
+    try:
+        return shopee.enriquecer_impressao(user.id,
+                                           payload.get("order_sns") or [],
+                                           payload.get("skus") or [])
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/pedidos/etiqueta-oficial")
+def shopee_etiqueta_oficial(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Gera e baixa o waybill OFICIAL da Shopee (PDF) para os pedidos selecionados.
+    Fluxo: create_shipping_document -> get_result (poll) -> download. Conta de vendedor
+    precisa estar validada. Body: {order_sns:[...], tipo?:'auto'}. Retorna o PDF (application/pdf)."""
+    order_sns = payload.get("order_sns") or []
+    if not order_sns:
+        raise HTTPException(status_code=400, detail="Informe ao menos um pedido.")
+    try:
+        pdf = shopee.gerar_etiqueta_oficial(user.id, order_sns, payload.get("tipo") or "auto")
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    nome = "etiqueta-shopee.pdf" if len(order_sns) == 1 else f"etiquetas-shopee-{len(order_sns)}.pdf"
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{nome}"'})
 
 
 @app.get("/api/shopee/financeiro/margem-real")
