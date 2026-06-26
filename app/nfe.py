@@ -621,17 +621,22 @@ def _liquido_item(it: dict) -> float:
     return _r2(_num(v) * _num(q) - d)
 
 
-def montar_alteracao(raw: dict, edicao: dict) -> dict:
-    """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
+def montar_alteracao(raw: dict, edicao: dict, modo: str = "nota") -> dict:
+    """Monta o payload de alteração (PUT) da NF-e.
 
-    O DESCONTO vai no CAMPO CORRETO de cada item (`desconto` = vDesc da NF-e), que é onde
-    o cálculo de aplicação acontece. O preço de venda (`valor`) é PRESERVADO e `valorTotal`
-    = bruto (valor × qtd). Assim fica fiscalmente coerente:
-        item líquido = valorTotal − desconto   (260 − 234 = 26)
-        valorNota    = Σ(valorTotal − desconto) + frete   (26 + 0 = 26)
-        parcelas     = valorNota                (26)
-    Essa é a forma que transmite certo pra SEFAZ (vProd 260 − vDesc 234 = vNF 26).
-    O tributo aproximado (IBPT) é escalado proporcionalmente (campo informativo).
+    Dois modos (o envio tenta o 1º e cai pro 2º se o Bling recusar por total):
+
+    modo="nota" (preferido — espelha o que a TELA do Bling faz, validado no HAR):
+        itens ficam CHEIOS (valor e valorTotal brutos), e o desconto vai no CAMPO `desconto`
+        DA NOTA. O Bling calcula valorNota = Σ(valorTotal) − desconto + frete.
+        Preserva o preço cheio na DANFE + linha de desconto.
+
+    modo="embutido" (à prova de falha):
+        o desconto é embutido no PREÇO UNITÁRIO (valor = líquido/qtd), sem campo desconto.
+        Os itens já somam o líquido, então o recálculo do Bling fecha de qualquer jeito.
+
+    Em ambos: frete definido direto, parcelas somam o total, tributo IBPT escalado,
+    campos read-only removidos e refs reduzidas a {id}.
     """
     nfe = dict(raw.get("data", raw))
     resumo = edicao.get("resumo", {})
@@ -639,34 +644,61 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
     itens_raw = nfe.get("itens") or nfe.get("itensNota") or []
 
     frete_depois = _r2(_num(resumo.get("frete_depois")))
-    novo_total_resumo = _r2(_num(resumo.get("total_nota")))
+    total_nota = _r2(_num(resumo.get("total_nota")))
     valor_original = _num(nfe.get("valorNota")) or 0.0
-    ratio = (novo_total_resumo / valor_original) if valor_original > 0 else 1.0
+    ratio = (total_nota / valor_original) if valor_original > 0 else 1.0
 
+    # bruto por item (valor original × qtd) — base dos dois modos
+    bruto_por_idx = {}
     for linha in linhas:
         idx = linha["indice"]
-        if not (0 <= idx < len(itens_raw)):
-            continue
-        it = itens_raw[idx]
-        qty = _num(it.get("quantidade")) or 1
-        it["valor"] = _r2(_num(it.get("valor")))             # PRESERVA o preço de venda (vUnCom)
-        it["valorTotal"] = _r2(_num(it.get("valor")) * qty)  # bruto (valor × qtd) = vProd
-        it["desconto"] = _r2(linha["desconto_reais"])        # <-- DESCONTO no campo correto (vDesc)
-        imp = it.get("impostos")
-        if isinstance(imp, dict) and imp.get("valorAproximadoTotalTributos") is not None and ratio != 1.0:
-            imp["valorAproximadoTotalTributos"] = _r2(_num(imp["valorAproximadoTotalTributos"]) * ratio)
+        if 0 <= idx < len(itens_raw):
+            it = itens_raw[idx]
+            bruto_por_idx[idx] = _num(it.get("valor")) * (_num(it.get("quantidade")) or 1)
+
+    if modo == "embutido":
+        # desconto embutido no preço unitário; itens já somam o líquido
+        for linha in linhas:
+            idx = linha["indice"]
+            if not (0 <= idx < len(itens_raw)):
+                continue
+            it = itens_raw[idx]
+            qty = _num(it.get("quantidade")) or 1
+            liquido = _r2(bruto_por_idx[idx] - _num(linha["desconto_reais"]))
+            novo_unit = _r2(liquido / qty) if qty else liquido
+            it["valor"] = novo_unit
+            it["valorTotal"] = _r2(novo_unit * qty)
+            it.pop("desconto", None)
+            _escala_tributo(it, ratio)
+        _zerar_desconto_nota(nfe)
+        total_itens = _r2(sum(_num(it.get("valorTotal")) for it in itens_raw))
+        novo_total = _r2(total_itens + frete_depois)
+    else:
+        # modo="nota": itens CHEIOS + desconto no nível da NOTA (como a tela do Bling)
+        for linha in linhas:
+            idx = linha["indice"]
+            if not (0 <= idx < len(itens_raw)):
+                continue
+            it = itens_raw[idx]
+            qty = _num(it.get("quantidade")) or 1
+            it["valor"] = _r2(_num(it.get("valor")))             # preço cheio
+            it["valorTotal"] = _r2(_num(it.get("valor")) * qty)  # bruto
+            it.pop("desconto", None)                              # desconto é da NOTA, não do item
+            _escala_tributo(it, ratio)
+        total_bruto_itens = _r2(sum(bruto_por_idx.get(i, _num(it.get("valorTotal")))
+                                    for i, it in enumerate(itens_raw)))
+        # desconto da nota = bruto dos produtos − (total desejado − frete)
+        desconto_nota = _r2(total_bruto_itens - (total_nota - frete_depois))
+        if desconto_nota < 0:
+            desconto_nota = 0.0
+        _set_desconto_nota(nfe, desconto_nota)
+        novo_total = total_nota
+
     if "itens" in nfe:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
         nfe["itensNota"] = itens_raw
 
-    # zera qualquer desconto no NÍVEL DA NOTA (o desconto agora está nos itens; evita dupla contagem)
-    _zerar_desconto_nota(nfe)
-
-    # total da nota = Σ(valorTotal − desconto) + frete — consistente com os itens enviados.
-    # Definimos DIRETAMENTE (o Bling confia nesses campos e valida soma(parcelas) == valorNota).
-    total_itens = _r2(sum(_num(it.get("valorTotal")) - _num(it.get("desconto")) for it in itens_raw))
-    novo_total = _r2(total_itens + frete_depois)
     nfe["valorNota"] = novo_total
     nfe["valorFrete"] = frete_depois
     transporte = nfe.get("transporte")
@@ -676,19 +708,35 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
         if "valorFrete" in transporte:
             transporte["valorFrete"] = 0
 
-    # parcelas somam exatamente o novo total (== valorNota)
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
 
-    # remove campos gerados pelo Bling (read-only) — MAS mantém valorNota e valorFrete
     for campo in list(nfe.keys()):
         if campo in _NFE_READONLY:
             nfe.pop(campo, None)
-    # objetos de referência: o Bling espera {id}, não o objeto inteiro
     for ref in ("naturezaOperacao", "loja", "categoria", "vendedor", "deposito"):
         if ref in nfe:
             nfe[ref] = _ref_id(nfe[ref])
     return nfe
+
+
+def _escala_tributo(it: dict, ratio: float):
+    """Escala o tributo aproximado (IBPT) proporcional ao novo total (campo informativo)."""
+    if ratio == 1.0:
+        return
+    imp = it.get("impostos")
+    if isinstance(imp, dict) and imp.get("valorAproximadoTotalTributos") is not None:
+        imp["valorAproximadoTotalTributos"] = _r2(_num(imp["valorAproximadoTotalTributos"]) * ratio)
+
+
+def _set_desconto_nota(nfe: dict, valor: float):
+    """Define o desconto NO NÍVEL DA NOTA, como a tela do Bling faz (campo `desconto`).
+    Seta APENAS `desconto` (canônico) e zera espelhos pra evitar dupla contagem."""
+    nfe["desconto"] = valor
+    # zera quaisquer outros campos de desconto da nota (evita o Bling somar desconto+valorDesconto)
+    for k in ("valorDesconto", "descontoTotal", "valorDescontos"):
+        if k in nfe:
+            nfe[k] = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -926,10 +974,37 @@ def editar_nota(user_id: int, nfe_id, *, desconto_tipo, desconto_valor,
     resultado = {"id": view["id"], "numero": view["numero"], "serie": view["serie"],
                  "contato": view["contato"], "plataforma": plataforma, "enviado": False, **edicao}
     if enviar:
-        payload = montar_alteracao(raw, edicao)
-        bling.atualizar_nfe(user_id, nfe_id, payload)
+        modo_usado = _enviar_alteracao_com_fallback(user_id, nfe_id, raw, edicao)
         resultado["enviado"] = True
+        resultado["modo_envio"] = modo_usado
     return resultado
+
+
+def _enviar_alteracao_com_fallback(user_id, nfe_id, raw, edicao) -> str:
+    """Envia a alteração tentando primeiro o desconto NA NOTA (preserva preço cheio + linha
+    de desconto, como a tela do Bling). Se o Bling recusar por divergência de total
+    (a API v3 pode não expor o desconto da nota como o endpoint interno), reenvia com o
+    desconto EMBUTIDO no preço (à prova de falha). Devolve qual modo funcionou.
+    """
+    import copy as _copy
+    from . import bling
+    try:
+        payload = montar_alteracao(_copy.deepcopy(raw), edicao, modo="nota")
+        bling.atualizar_nfe(user_id, nfe_id, payload)
+        return "nota"
+    except bling.BlingError as e:
+        if not _erro_de_total(str(e)):
+            raise  # outro erro (não é divergência de total) — propaga
+        # fallback: embute o desconto no preço unitário
+        payload = montar_alteracao(_copy.deepcopy(raw), edicao, modo="embutido")
+        bling.atualizar_nfe(user_id, nfe_id, payload)
+        return "embutido"
+
+
+def _erro_de_total(msg: str) -> bool:
+    """Detecta a recusa do Bling por divergência entre parcelas e total da nota."""
+    m = (msg or "").lower()
+    return ("parcela" in m and ("difere" in m or "total" in m)) or "total da nota" in m
 
 
 def processar_evento(user_id, nfe_id, cfg) -> dict:
