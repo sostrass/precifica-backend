@@ -2104,15 +2104,27 @@ def nfe_auto_processar(user: User = Depends(auth.get_current_user)):
 @app.post("/api/nfe/valores")
 def nfe_valores(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Busca em lote os dados que a lista do Bling não traz: valor, plataforma, UF, tributos
-    (IBPT), pedido, chave, links e motivo de rejeição. Chamado em background pela tela."""
-    ids = payload.get("ids") or []
-    out = {}
+    (IBPT), pedido, chave, links e motivo de rejeição. Chamado em background pela tela.
+
+    Faz as chamadas em PARALELO (cada bling.obter_nfe abre sua própria sessão de DB e respeita
+    o rate-limit) — sem isso, dezenas de notas demoravam segundos e a tela ficava em 0,00.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    ids = [str(i) for i in (payload.get("ids") or [])][:100]
+    if not ids:
+        return {}
     lojas_map = nfe._mapear_lojas_plataforma(user.id)  # cache 1h — resolve NuvemShop/site próprio
-    for nid in ids[:100]:
+
+    def _um(nid):
         try:
-            out[str(nid)] = nfe.resumo_extra_raw(bling.obter_nfe(user.id, nid), lojas_map)
-        except Exception:
-            out[str(nid)] = {"valor": 0, "plataforma": None}
+            return nid, nfe.resumo_extra_raw(bling.obter_nfe(user.id, nid), lojas_map)
+        except Exception:  # noqa: BLE001
+            return nid, {"valor": 0, "plataforma": None}
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for nid, dados in ex.map(_um, ids):
+            out[nid] = dados
     return out
 
 
@@ -2200,6 +2212,16 @@ def notificacoes(limite: int = 40, user: User = Depends(auth.get_current_user)):
 def notificacoes_marcar_lidas(user: User = Depends(auth.get_current_user)):
     from . import notificacoes as notif
     return {"lidas": notif.marcar_lidas(user.id)}
+
+
+@app.post("/api/notificacoes/arquivar")
+def notificacoes_arquivar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Arquiva (marca como lidas) notificações específicas. Body: {ids:[...]} ou {id:'n123'}."""
+    from . import notificacoes as notif
+    ids = payload.get("ids")
+    if ids is None and payload.get("id") is not None:
+        ids = [payload["id"]]
+    return {"arquivadas": notif.arquivar(user.id, ids or [])}
 
 
 @app.get("/api/nfe/eventos")

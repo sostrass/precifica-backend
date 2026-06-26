@@ -77,3 +77,29 @@ def marcar_lidas(user_id: int) -> int:
             return n
     except Exception:  # noqa: BLE001
         return 0
+
+
+def arquivar(user_id: int, ids) -> int:
+    """Marca notificações específicas como lidas/arquivadas.
+    Aceita ids no formato 'n123' (do front) ou 123. Ignora ids de webhook ('w*'),
+    que o front arquiva localmente. Retorna quantas foram afetadas."""
+    try:
+        from .db import SessionLocal
+        from .models import Notificacao
+        nums = []
+        for i in (ids or []):
+            s = str(i).strip()
+            if s.startswith("n"):
+                s = s[1:]
+            if s.isdigit():
+                nums.append(int(s))
+        if not nums:
+            return 0
+        with SessionLocal() as db:
+            n = (db.query(Notificacao)
+                 .filter(Notificacao.user_id == user_id, Notificacao.id.in_(nums))
+                 .update({Notificacao.lido: True}, synchronize_session=False))
+            db.commit()
+            return n
+    except Exception:  # noqa: BLE001
+        return 0

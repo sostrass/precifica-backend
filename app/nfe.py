@@ -129,6 +129,7 @@ def normalizar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
     frete = transporte.get("frete", transporte.get("valorFrete",
             nfe.get("frete", nfe.get("valorFrete", 0))))
     contato = nfe.get("contato") or {}
+    _end = contato.get("endereco") or {}
     return {
         "id": nfe.get("id"),
         "numero": nfe.get("numero"),
@@ -136,11 +137,14 @@ def normalizar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
         "situacao": nfe.get("situacao"),
         "contato": contato.get("nome", ""),
         "documento": contato.get("numeroDocumento", ""),
+        "uf": _end.get("uf") or None,
+        "municipio": _end.get("municipio") or None,
         "frete": _num(frete),
         "itens": itens,
         "parcelas": [{"data": p.get("data"), "valor": _num(p.get("valor"))}
                      for p in (nfe.get("parcelas") or [])],
         "valor_nota": _num(nfe.get("valorNota")),
+        "valor_produtos": _r2(sum(_num(it.get("valorTotal")) for it in itens_raw if isinstance(it, dict))),
         "plataforma": plataforma_nota(nfe, lojas_map),
         "pedido_loja": nfe.get("numeroPedidoLoja"),
     }
@@ -155,6 +159,11 @@ SITUACOES_NFE = {
 
 MODELO_NFE = {"55": "NF-e (modelo 55)", "65": "NFC-e (modelo 65)"}
 FINALIDADE_NFE = {"1": "Normal", "2": "Complementar", "3": "Ajuste", "4": "Devolução"}
+_FRETE_MODALIDADE = {
+    "0": "Por conta do emitente (CIF)", "1": "Por conta do destinatário (FOB)",
+    "2": "Por conta de terceiros", "3": "Transporte próprio (remetente)",
+    "4": "Transporte próprio (destinatário)", "9": "Sem frete",
+}
 
 # Marketplace pela raiz do CNPJ do intermediador (8 primeiros dígitos)
 _PLATAFORMA_CNPJ = {
@@ -447,14 +456,21 @@ def detalhar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
     itens = []
     for it in (n.get("itens") or []):
         imp = it.get("impostos") or {}
+        icms = imp.get("icms") or {}
         itens.append({
             "codigo": it.get("codigo"),
             "descricao": it.get("descricao"),
+            "unidade": it.get("unidade") or "",
             "quantidade": _num(it.get("quantidade")),
             "valor": _num(it.get("valor")),
             "valor_total": _num(it.get("valorTotal")),
+            "desconto": _num(it.get("desconto")),
             "ncm": it.get("classificacaoFiscal"),
+            "cest": it.get("cest") or "",
             "cfop": it.get("cfop"),
+            "origem": icms.get("origem"),
+            "peso_bruto": _num(it.get("pesoBruto")),
+            "gtin": it.get("gtin") or "",
             "tributos_aprox": _num(imp.get("valorAproximadoTotalTributos")),
         })
     partes = []
@@ -511,17 +527,38 @@ def detalhar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
         "destinatario": {
             "nome": contato.get("nome"),
             "documento": contato.get("numeroDocumento"),
+            "ie": contato.get("ie") or "",
             "telefone": contato.get("telefone") or "",
             "email": contato.get("email") or "",
             "endereco": ", ".join(partes),
+            "logradouro": end.get("endereco") or "",
+            "numero": end.get("numero") or "",
+            "complemento": end.get("complemento") or "",
+            "bairro": end.get("bairro") or "",
+            "municipio": end.get("municipio") or "",
+            "uf": end.get("uf") or "",
+            "cep": end.get("cep") or "",
         },
         "transporte": {
             "frete_por_conta": transporte.get("fretePorConta"),
+            "frete_por_conta_label": _FRETE_MODALIDADE.get(str(transporte.get("fretePorConta")), None),
             "transportador": (transporte.get("transportador") or {}).get("nome") or "—",
+            "transportador_documento": (transporte.get("transportador") or {}).get("numeroDocumento") or "",
+            "volumes": [{
+                "quantidade": _num(v.get("quantidade")) or (1 if v.get("id") else 0),
+                "especie": v.get("especie") or "",
+                "peso_bruto": _num(v.get("pesoBruto")),
+                "peso_liquido": _num(v.get("pesoLiquido")),
+            } for v in (transporte.get("volumes") or [])],
         },
         "itens": itens,
-        "parcelas": [{"data": p.get("data"), "valor": _num(p.get("valor"))}
-                     for p in (n.get("parcelas") or [])],
+        "parcelas": [{
+            "data": p.get("data"),
+            "valor": _num(p.get("valor")),
+            "forma": ((p.get("formaPagamento") or {}).get("descricao")
+                      if isinstance(p.get("formaPagamento"), dict) else None),
+            "observacoes": p.get("observacoes") or "",
+        } for p in (n.get("parcelas") or [])],
     }
 
 
@@ -702,11 +739,18 @@ def montar_alteracao(raw: dict, edicao: dict, modo: str = "nota") -> dict:
     nfe["valorNota"] = novo_total
     nfe["valorFrete"] = frete_depois
     transporte = nfe.get("transporte")
-    if isinstance(transporte, dict) and frete_depois == 0:
-        if "frete" in transporte:
-            transporte["frete"] = 0
-        if "valorFrete" in transporte:
-            transporte["valorFrete"] = 0
+    if isinstance(transporte, dict):
+        if frete_depois == 0:
+            if "frete" in transporte:
+                transporte["frete"] = 0
+            if "valorFrete" in transporte:
+                transporte["valorFrete"] = 0
+        # preserva a quantidade de volumes (o GET do Bling não devolve, e sem isso vira 0)
+        vols = transporte.get("volumes")
+        if isinstance(vols, list):
+            for v in vols:
+                if isinstance(v, dict) and not _num(v.get("quantidade")):
+                    v["quantidade"] = 1
 
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
