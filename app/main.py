@@ -1990,7 +1990,8 @@ def _nfe_cfg(user_id: int) -> NfeConfig:
 def _cfg_dict(cfg: NfeConfig) -> dict:
     return {"auto": bool(cfg.auto), "desconto_tipo": cfg.desconto_tipo,
             "desconto_valor": cfg.desconto_valor, "remover_frete": bool(cfg.remover_frete),
-            "situacao_pendente": cfg.situacao_pendente}
+            "situacao_pendente": cfg.situacao_pendente,
+            "desconto_plataformas": getattr(cfg, "desconto_plataformas", None) or {}}
 
 
 @app.get("/api/nfe/config")
@@ -2016,6 +2017,22 @@ def nfe_set_config(payload: dict = Body(...), user: User = Depends(auth.get_curr
             cfg.remover_frete = bool(payload["remover_frete"])
         if "situacao_pendente" in payload:
             cfg.situacao_pendente = int(payload["situacao_pendente"])
+        if "desconto_plataformas" in payload and isinstance(payload["desconto_plataformas"], dict):
+            # sanitiza: só plataformas conhecidas, tipo válido e valor numérico
+            limpo = {}
+            for plat, regra in payload["desconto_plataformas"].items():
+                if not isinstance(regra, dict):
+                    continue
+                tipo = regra.get("tipo")
+                if tipo not in ("percentual", "valor"):
+                    continue
+                try:
+                    valor = float(regra.get("valor") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if valor > 0:
+                    limpo[str(plat)] = {"tipo": tipo, "valor": valor}
+            cfg.desconto_plataformas = limpo
         db.commit()
         db.refresh(cfg)
         return _cfg_dict(cfg)
@@ -2031,9 +2048,8 @@ def nfe_pendentes(pagina: int = 1, limite: int = 100,
     sit = situacao if situacao is not None else cfg.situacao_pendente
     try:
         raw = bling.listar_nfe(user.id, pagina=pagina, limite=limite, situacao=sit)
-        notas = nfe.resumir_lista(raw)
-        notas = nfe.enriquecer_valores(user.id, notas)  # busca o total real (lista não traz)
-        return {"notas": notas, "situacao": sit}
+        # lista rápida: sem buscar nota a nota (os valores vêm em background via /api/nfe/valores)
+        return {"notas": nfe.resumir_lista(raw), "situacao": sit}
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2063,6 +2079,33 @@ def nfe_auto_processar(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=409, detail="Modo automático desligado. Ligue em /api/nfe/config.")
     try:
         return nfe.processar_automatico(user.id, cfg)
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/api/nfe/valores")
+def nfe_valores(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Busca em lote os dados que a lista do Bling não traz: valor, plataforma, UF, tributos
+    (IBPT), pedido, chave, links e motivo de rejeição. Chamado em background pela tela."""
+    ids = payload.get("ids") or []
+    out = {}
+    for nid in ids[:100]:
+        try:
+            out[str(nid)] = nfe.resumo_extra_raw(bling.obter_nfe(user.id, nid))
+        except Exception:
+            out[str(nid)] = {"valor": 0, "plataforma": None}
+    return out
+
+
+@app.post("/api/nfe/aplicar-selecionadas")
+def nfe_aplicar_selecionadas(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Aplica o desconto padrão em uma lista ESPECÍFICA de notas (seleção em massa) e salva no Bling."""
+    ids = payload.get("ids") or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="Nenhuma nota selecionada.")
+    cfg = _nfe_cfg(user.id)
+    try:
+        return nfe.processar_ids(user.id, ids, cfg)
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -2160,6 +2203,29 @@ def nfe_diagnostico_edicao(nfe_id: str, user: User = Depends(auth.get_current_us
         )
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/nfe/{nfe_id}/conciliacao-shopee")
+def nfe_conciliacao_shopee(nfe_id: str, user: User = Depends(auth.get_current_user)):
+    """Compara o valor fiscal da NF-e com o repasse real da Shopee (escrow) do pedido."""
+    try:
+        return nfe.conciliar_shopee(user.id, nfe_id)
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/api/nfe/conciliacao-shopee-lote")
+def nfe_conciliacao_shopee_lote(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Concilia várias notas Shopee de uma vez (resumo + divergências)."""
+    ids = payload.get("ids") or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="Nenhuma nota informada.")
+    try:
+        return nfe.conciliar_shopee_lote(user.id, ids)
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 

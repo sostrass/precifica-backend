@@ -68,6 +68,9 @@ def garantir_colunas_extras():
         "webhook_eventos": [
             ("resultado", "JSON"),
         ],
+        "nfe_config": [
+            ("desconto_plataformas", "JSON"),
+        ],
     }
     try:
         with engine.begin() as conn:

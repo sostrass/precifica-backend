@@ -212,6 +212,38 @@ def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, 
     }
 
 
+def _motivo_rejeicao(n: dict):
+    """Tenta extrair o motivo de rejeição da nota (o Bling nem sempre expõe na própria NF-e)."""
+    for k in ("motivo", "mensagemRetorno", "xMotivo", "motivoRejeicao", "mensagem", "observacoes"):
+        v = n.get(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def resumo_extra_raw(raw: dict) -> dict:
+    """Extrai do payload bruto tudo que a lista não traz: valor, plataforma, UF, tributos
+    aproximados (IBPT), pedido, chave de acesso, links e motivo de rejeição."""
+    n = raw.get("data", raw) if isinstance(raw, dict) else {}
+    end = (n.get("contato") or {}).get("endereco") or {}
+    trib = 0.0
+    for it in (n.get("itens") or []):
+        trib += _num((it.get("impostos") or {}).get("valorAproximadoTotalTributos"))
+    return {
+        "valor": valor_total_raw(raw),
+        "plataforma": plataforma_nota(n),
+        "uf": end.get("uf") or None,
+        "municipio": end.get("municipio") or None,
+        "tributos": _r2(trib),
+        "pedido": n.get("numeroPedidoLoja"),
+        "chave": n.get("chaveAcesso") or None,
+        "link_xml": n.get("xml") or None,
+        "link_danfe": n.get("linkDanfe") or None,
+        "link_pdf": n.get("linkPDF") or None,
+        "motivo": _motivo_rejeicao(n),
+    }
+
+
 def valor_total_raw(raw: dict) -> float:
     """Total da nota a partir do payload bruto do Bling (GET individual)."""
     n = raw.get("data", raw) if isinstance(raw, dict) else {}
@@ -451,14 +483,12 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
             continue
         it = itens_raw[idx]
         qty = _num(it.get("quantidade")) or 1
-        net = _num(linha.get("liquido"))  # total líquido da linha (já arredondado)
-        novo_valor = _r2(net / qty) if qty else _r2(net)
-        # O Bling RECALCULA o total da nota pela soma dos valorTotal dos itens. Por isso o
-        # desconto é aplicado REDUZINDO valor e valorTotal (e zerando desconto) — assim o
-        # total recalculado bate com as parcelas e o PUT é aceito.
-        it["valor"] = novo_valor
-        it["valorTotal"] = _r2(novo_valor * qty)
-        it["desconto"] = 0
+        desc = _r2(linha["desconto_reais"])
+        # PRESERVA o preço de venda (valor) do produto e aplica o desconto no campo 'desconto'
+        # (vDesc da NF-e). valorTotal = bruto (valor × qtd); o Bling calcula o total da nota
+        # como soma(valorTotal) − soma(desconto). Assim o preço do item não é alterado.
+        it["desconto"] = desc
+        it["valorTotal"] = _r2(_num(it.get("valor")) * qty)
     if "itens" in nfe:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
@@ -477,8 +507,8 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
         if "valorFrete" in nfe:
             nfe["valorFrete"] = 0
 
-    # novo total = soma dos valorTotal (já líquidos) + frete — exatamente o que o Bling recalcula
-    total_itens = _r2(sum(_num(it.get("valorTotal")) for it in itens_raw))
+    # novo total = soma(valorTotal) − soma(desconto) + frete = exatamente o que o Bling gera como vNF
+    total_itens = _r2(sum(_num(it.get("valorTotal")) - _num(it.get("desconto")) for it in itens_raw))
     novo_total = _r2(total_itens + frete_depois)
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
@@ -497,16 +527,92 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # ORQUESTRAÇÃO (usa os adaptadores do Bling)
 # --------------------------------------------------------------------------- #
+def conciliar_shopee(user_id: int, nfe_id) -> dict:
+    """Concilia o valor FISCAL da NF-e com o que de fato ocorreu na Shopee (escrow):
+    quanto o comprador pagou pelo produto, o repasse líquido recebido e as taxas da Shopee.
+    Ajuda a conferir se o desconto aplicado na nota reflete a venda real."""
+    from . import bling
+    raw = bling.obter_nfe(user_id, nfe_id)
+    note = raw.get("data", raw) if isinstance(raw, dict) else {}
+    plataforma = plataforma_nota(note)
+    valor_nota = valor_total_raw(raw)
+    order_sn = note.get("numeroPedidoLoja")
+
+    if plataforma != "Shopee":
+        return {"ok": False, "erro": f"Esta nota não é da Shopee (plataforma: {plataforma or 'não identificada'}).",
+                "plataforma": plataforma}
+    if not order_sn:
+        return {"ok": False, "erro": "Nota sem número do pedido Shopee (numeroPedidoLoja)."}
+
+    try:
+        from . import shopee
+        det = shopee.pedido_detalhe(user_id, order_sn)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": f"Não foi possível buscar o pedido na Shopee: {e}", "order_sn": order_sn}
+
+    fin = det.get("financeiro") or {}
+    pago_produto = float(det.get("total_pago") or 0)
+    diff = _r2(valor_nota - pago_produto)
+    # divergência relevante: acima de R$0,05 e de 1% do valor pago
+    divergente = abs(diff) > 0.05 and (pago_produto == 0 or abs(diff) / pago_produto > 0.01)
+    return {
+        "ok": True, "order_sn": order_sn, "status": det.get("status"),
+        "comprador": det.get("comprador"),
+        "valor_nota": _r2(valor_nota),
+        "pago_produto": _r2(pago_produto),
+        "recebido_liquido": fin.get("liquido"),
+        "taxas": fin.get("taxas"),
+        "tem_escrow": fin.get("tem_escrow", False),
+        "diferenca": diff, "divergente": divergente,
+        "itens": det.get("itens"),
+    }
+
+
+def conciliar_shopee_lote(user_id: int, ids: list) -> dict:
+    """Concilia várias notas Shopee de uma vez. Retorna resumo + itens divergentes."""
+    linhas = []
+    for nid in ids[:60]:
+        try:
+            r = conciliar_shopee(user_id, nid)
+            r["id"] = nid
+            linhas.append(r)
+        except Exception as e:  # noqa: BLE001
+            linhas.append({"id": nid, "ok": False, "erro": str(e)})
+    ok = [l for l in linhas if l.get("ok")]
+    divergentes = [l for l in ok if l.get("divergente")]
+    return {
+        "total": len(linhas), "conferidas": len(ok), "divergentes": len(divergentes),
+        "soma_nota": _r2(sum(l.get("valor_nota") or 0 for l in ok)),
+        "soma_pago": _r2(sum(l.get("pago_produto") or 0 for l in ok)),
+        "soma_recebido": _r2(sum(l.get("recebido_liquido") or 0 for l in ok if l.get("recebido_liquido") is not None)),
+        "linhas": linhas,
+    }
+
+
 def editar_nota(user_id: int, nfe_id, *, desconto_tipo, desconto_valor,
-                descontos_por_item=None, remover_frete=True, enviar=False):
+                descontos_por_item=None, remover_frete=True, enviar=False,
+                desconto_plataformas=None):
     """Busca a nota no Bling, aplica a edição e devolve a revisão.
 
     enviar=False -> só recalcula e devolve para revisão (não toca no Bling de volta).
     enviar=True  -> também envia a alteração (PUT) para o Bling.
+    desconto_plataformas -> dict opcional {plataforma: {tipo, valor}}. Se a nota for de uma
+        plataforma com regra própria, ela substitui o desconto padrão (usado no lote/automático).
     """
     from . import bling  # import tardio (evita ciclo)
 
     raw = bling.obter_nfe(user_id, nfe_id)
+
+    # regra por plataforma (sobrepõe a padrão só quando há override para a plataforma da nota)
+    plataforma = None
+    if desconto_plataformas:
+        note = raw.get("data", raw) if isinstance(raw, dict) else {}
+        plataforma = plataforma_nota(note)
+        regra = desconto_plataformas.get(plataforma) if plataforma else None
+        if regra and regra.get("tipo") in ("percentual", "valor"):
+            desconto_tipo = regra["tipo"]
+            desconto_valor = regra.get("valor") or 0
+
     view = normalizar_nfe(raw)
     edicao = aplicar_edicao(
         view["itens"], desconto_tipo=desconto_tipo, desconto_valor=desconto_valor,
@@ -514,7 +620,7 @@ def editar_nota(user_id: int, nfe_id, *, desconto_tipo, desconto_valor,
         frete_atual=view["frete"],
     )
     resultado = {"id": view["id"], "numero": view["numero"], "serie": view["serie"],
-                 "contato": view["contato"], "enviado": False, **edicao}
+                 "contato": view["contato"], "plataforma": plataforma, "enviado": False, **edicao}
     if enviar:
         payload = montar_alteracao(raw, edicao)
         bling.atualizar_nfe(user_id, nfe_id, payload)
@@ -560,6 +666,26 @@ def processar_evento(user_id, nfe_id, cfg) -> dict:
         return {**base, "ok": False, "motivo": "erro_aplicar", "detalhe": str(e)}
 
 
+def processar_ids(user_id: int, ids: list, cfg) -> dict:
+    """Aplica a regra padrão de desconto a uma lista ESPECÍFICA de notas (seleção em massa).
+    Reusa exatamente a mesma lógica do editar_nota. Retorna um relatório por nota."""
+    relatorio = []
+    aplicadas = 0
+    for nid in ids:
+        try:
+            r = editar_nota(user_id, nid, desconto_tipo=cfg.desconto_tipo,
+                            desconto_valor=cfg.desconto_valor,
+                            remover_frete=cfg.remover_frete, enviar=True,
+                            desconto_plataformas=getattr(cfg, "desconto_plataformas", None))
+            aplicadas += 1
+            relatorio.append({"id": nid, "numero": r.get("numero"), "ok": True,
+                              "total_nota": r["resumo"]["total_nota"],
+                              "total_desconto": r["resumo"].get("total_desconto")})
+        except Exception as e:  # noqa: BLE001
+            relatorio.append({"id": nid, "numero": None, "ok": False, "erro": str(e)})
+    return {"processadas": len(ids), "aplicadas": aplicadas, "relatorio": relatorio}
+
+
 def processar_automatico(user_id: int, cfg) -> dict:
     """Modo automático: aplica a regra padrão a TODAS as NF-e pendentes e devolve.
 
@@ -578,7 +704,8 @@ def processar_automatico(user_id: int, cfg) -> dict:
         try:
             r = editar_nota(user_id, nid, desconto_tipo=cfg.desconto_tipo,
                             desconto_valor=cfg.desconto_valor,
-                            remover_frete=cfg.remover_frete, enviar=True)
+                            remover_frete=cfg.remover_frete, enviar=True,
+                            desconto_plataformas=getattr(cfg, "desconto_plataformas", None))
             aplicadas += 1
             relatorio.append({"id": nid, "numero": numero, "ok": True,
                               "total_nota": r["resumo"]["total_nota"],

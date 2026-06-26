@@ -56,6 +56,9 @@ class NfeConfig(Base):
     desconto_tipo = Column(String, default="percentual", nullable=False)  # 'percentual' | 'valor'
     desconto_valor = Column(Float, default=0.0, nullable=False)
     remover_frete = Column(Boolean, default=True, nullable=False)
+    # Overrides de desconto por plataforma (JSON): {"Shopee": {"tipo": "percentual", "valor": 90}, ...}.
+    # Quando a nota é de uma plataforma com override, o lote/automático usa essa regra no lugar da padrão.
+    desconto_plataformas = Column(JSON, default=dict, nullable=True)
     # Código da situação "Pendente" na API do Bling. Na v3 costuma ser 1, mas deixamos
     # configurável para não arriscar erro fiscal caso a sua conta use outro código.
     situacao_pendente = Column(Integer, default=1, nullable=False)
