@@ -624,11 +624,13 @@ def _liquido_item(it: dict) -> float:
 def montar_alteracao(raw: dict, edicao: dict) -> dict:
     """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
 
-    Aplica o desconto NO CAMPO CORRETO de cada item (campo `desconto` = vDesc), PRESERVANDO
-    o preço de venda (`valor`) e usando `valorTotal` = bruto (valor × qtd). Em seguida define
-    o `valorNota` (total com desconto) e `valorFrete` DIRETAMENTE — porque o Bling usa esses
-    campos e valida soma(parcelas) == valorNota. Tudo fica consistente:
-    valorNota = Σ(valorTotal − desconto) + frete = soma das parcelas.
+    O DESCONTO vai no CAMPO CORRETO de cada item (`desconto` = vDesc da NF-e), que é onde
+    o cálculo de aplicação acontece. O preço de venda (`valor`) é PRESERVADO e `valorTotal`
+    = bruto (valor × qtd). Assim fica fiscalmente coerente:
+        item líquido = valorTotal − desconto   (260 − 234 = 26)
+        valorNota    = Σ(valorTotal − desconto) + frete   (26 + 0 = 26)
+        parcelas     = valorNota                (26)
+    Essa é a forma que transmite certo pra SEFAZ (vProd 260 − vDesc 234 = vNF 26).
     O tributo aproximado (IBPT) é escalado proporcionalmente (campo informativo).
     """
     nfe = dict(raw.get("data", raw))
@@ -647,8 +649,8 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
             continue
         it = itens_raw[idx]
         qty = _num(it.get("quantidade")) or 1
-        it["valor"] = _r2(_num(it.get("valor")))            # PRESERVA o preço de venda
-        it["valorTotal"] = _r2(_num(it.get("valor")) * qty)  # bruto (valor × qtd)
+        it["valor"] = _r2(_num(it.get("valor")))             # PRESERVA o preço de venda (vUnCom)
+        it["valorTotal"] = _r2(_num(it.get("valor")) * qty)  # bruto (valor × qtd) = vProd
         it["desconto"] = _r2(linha["desconto_reais"])        # <-- DESCONTO no campo correto (vDesc)
         imp = it.get("impostos")
         if isinstance(imp, dict) and imp.get("valorAproximadoTotalTributos") is not None and ratio != 1.0:
