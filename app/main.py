@@ -1368,6 +1368,10 @@ def aplicar_preco_canal(produto_id, payload: dict = Body(...),
         webhooks.registrar_envio(db, user.id, produto_id, None, [f"preço canal {id_loja}"])
     finally:
         db.close()
+    from . import notificacoes as notif
+    notif.criar(user.id, "precificacao", f"Preço atualizado: {_brl(preco)}",
+                f"Produto {produto_id} no canal {id_loja}.", ok=True,
+                modulo="precificacao", entidade_id=produto_id)
     return res
 
 
@@ -1587,6 +1591,12 @@ def precificar_lote(payload: dict = Body(...), user: User = Depends(auth.get_cur
             except Exception as e:  # noqa: BLE001 — registra falha por item, segue o lote
                 linha["erro"] = str(e)
         resultados.append(linha)
+    if aplicar:
+        aplicados = sum(1 for r in resultados if r.get("aplicado"))
+        if aplicados:
+            from . import notificacoes as notif
+            notif.criar(user.id, "precificacao", f"{aplicados} preço(s) reprecificado(s) em lote",
+                        f"Canal {canal}. Confira os novos preços.", ok=True, modulo="precificacao")
     return {"canal": canal, "aplicado": aplicar, "itens": resultados}
 
 
@@ -2282,7 +2292,12 @@ def nfe_conciliacao_shopee_lote(payload: dict = Body(...), user: User = Depends(
 def nfe_enviar(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Retransmite uma NF-e ao Sefaz (para reprocessar notas rejeitadas já corrigidas)."""
     try:
-        return {"ok": True, "resultado": bling.enviar_nfe(user.id, nfe_id)}
+        resultado = bling.enviar_nfe(user.id, nfe_id)
+        from . import notificacoes as notif
+        notif.criar(user.id, "nfe", f"Nota {nfe_id} retransmitida ao Sefaz",
+                    "Acompanhe a autorização na lista/no Bling.", ok=True,
+                    modulo="nfe", entidade_id=nfe_id)
+        return {"ok": True, "resultado": resultado}
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingError as e:

@@ -64,6 +64,7 @@ def contar_avaliacoes(user_id: int, max_paginas: int = 60, forcar: bool = False)
     """Conta respondidas x pendentes paginando a Shopee (caro). Cacheia por ~10 min.
     parcial=True se bateu o teto de páginas (loja com muitas avaliações)."""
     cache = _CONTAGEM.get(user_id)
+    anterior_pend = cache.get("pendentes") if cache else None
     if cache and not forcar:
         idade = (datetime.utcnow() - cache["_ts"]).total_seconds()
         if idade < 600:
@@ -97,6 +98,17 @@ def contar_avaliacoes(user_id: int, max_paginas: int = 60, forcar: bool = False)
 
     out = {"total": total, "respondidas": respondidas, "pendentes": pendentes, "parcial": parcial}
     _CONTAGEM[user_id] = {**out, "_ts": datetime.utcnow()}
+    # avisa quando surgem avaliações novas para responder (sem repetir o mesmo número)
+    if anterior_pend is not None and pendentes > anterior_pend:
+        try:
+            from . import notificacoes as notif
+            novas = pendentes - anterior_pend
+            notif.criar(user_id, "avaliacao",
+                        f"{novas} avaliação(ões) nova(s) para responder",
+                        f"Total de {pendentes} pendente(s) na Shopee. Rode o agente para responder.",
+                        ok=True, modulo="avaliacoes")
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 

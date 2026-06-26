@@ -466,6 +466,16 @@ def descobrir_lojas(user_id: int) -> dict:
     return {}
 
 
+def lojas_cacheadas(user_id: int):
+    """Lojas já em cache (sem rede). Retorna o dict se houver cache válido (<1h), senão None.
+    Usado para NÃO bloquear o carregamento de notas com a descoberta (que pode demorar)."""
+    import time as _t
+    c = _CACHE_LOJAS.get(user_id)
+    if c and _t.time() - c[0] < 3600:
+        return c[1] if c[1] is not None else {}
+    return None
+
+
 def lojas_da_conta(user_id: int) -> dict:
     """Lojas da conta para leitura por canal: descobertas (cache 1h) ou as conhecidas."""
     import time as _t

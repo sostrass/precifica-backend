@@ -104,6 +104,13 @@ def sincronizar_tudo(user_id: int) -> None:
             est.status = "concluido"; est.concluido_em = datetime.utcnow()
             est.total = db.query(ProdutoCache).filter_by(user_id=user_id).count()
             db.commit()
+            try:
+                from . import notificacoes as notif
+                notif.criar(user_id, "produto",
+                            f"Catálogo sincronizado: {est.total} produto(s)",
+                            "Importação do Bling concluída.", ok=True, modulo="catalogo")
+            except Exception:  # noqa: BLE001
+                pass
         except bling.BlingAuthError as e:
             est = _estado(db, user_id)
             est.status = "erro"; est.erro = f"Bling não autorizado: {e}"; db.commit()

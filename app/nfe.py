@@ -191,12 +191,21 @@ _LOJA_KW_PLATAFORMA = [
 
 
 def _mapear_lojas_plataforma(user_id: int) -> dict:
-    """Mapa {loja_id(str): plataforma} a partir das lojas da conta no Bling (cache 1h).
-    Usa palavras-chave do nome/integração; se não casar, usa o próprio nome da loja."""
+    """Mapa {loja_id(str): plataforma} a partir das lojas da conta no Bling.
+    NÃO bloqueia: usa só o cache já pronto. Se o cache estiver frio, dispara a descoberta
+    em segundo plano e retorna {} agora (o badge aparece no próximo carregamento)."""
     from . import bling
     try:
-        lojas = bling.lojas_da_conta(user_id) or {}
+        lojas = bling.lojas_cacheadas(user_id)
     except Exception:  # noqa: BLE001
+        return {}
+    if lojas is None:
+        # aquece o cache em background — não trava esta requisição
+        try:
+            import threading
+            threading.Thread(target=lambda: _warm_lojas_silencioso(user_id), daemon=True).start()
+        except Exception:  # noqa: BLE001
+            pass
         return {}
     out = {}
     for lid, info in (lojas.items() if isinstance(lojas, dict) else []):
@@ -208,6 +217,15 @@ def _mapear_lojas_plataforma(user_id: int) -> dict:
                 break
         out[str(lid)] = plat or (info or {}).get("nome") or None
     return out
+
+
+def _warm_lojas_silencioso(user_id: int) -> None:
+    """Popula o cache de lojas (faz a descoberta no Bling). Roda em background; engole erros."""
+    try:
+        from . import bling
+        bling.lojas_da_conta(user_id)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def plataforma_nota(note: dict, lojas_map: dict | None = None):
@@ -229,6 +247,7 @@ def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, 
     """Dry-run: mostra a estrutura real da nota e o payload que SERIA enviado (sem enviar).
     Serve para ver as parcelas, os campos da nota e se a soma das parcelas bate com o total."""
     from . import bling
+    import copy as _copy
     raw = bling.obter_nfe(user_id, nfe_id)
     note = raw.get("data", raw) if isinstance(raw, dict) else {}
     view = normalizar_nfe(raw)
@@ -236,12 +255,61 @@ def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, 
         view["itens"], desconto_tipo=desconto_tipo, desconto_valor=desconto_valor,
         remover_frete=remover_frete, frete_atual=view["frete"],
     )
-    payload = montar_alteracao(raw, edicao)
+    # cópia profunda: montar_alteracao altera itens in-place; não pode poluir o 'note' original
+    payload = montar_alteracao(_copy.deepcopy(raw), edicao)
     parc_pay = payload.get("parcelas") or []
     itens_pay = payload.get("itens") or payload.get("itensNota") or []
     soma_parc = _r2(sum(_parcela_val(p) for p in parc_pay))
-    total_calc = _r2(sum(_liquido_item(it) for it in itens_pay) + _num(edicao["resumo"].get("frete_depois")))
+    # o Bling valida soma(parcelas) == valorNota do envio (ele usa o valorNota direto)
+    total_calc = _r2(_num(payload.get("valorNota")))
+
+    def _resumo_itens(itens):
+        """Campos relevantes de cada item para conferência (preço, bruto, desconto, tributo)."""
+        out = []
+        for it in (itens or []):
+            imp = it.get("impostos") or {}
+            out.append({
+                "codigo": it.get("codigo"),
+                "descricao": it.get("descricao"),
+                "quantidade": _num(it.get("quantidade")),
+                "valor": _num(it.get("valor")),
+                "valorTotal": _num(it.get("valorTotal")),
+                "desconto": it.get("desconto"),
+                "valorAproximadoTotalTributos": imp.get("valorAproximadoTotalTributos"),
+            })
+        return out
+
+    def _resumo_parcelas(parcelas):
+        return [{"data": p.get("data"), "valor": _parcela_val(p),
+                 "formaPagamento": p.get("formaPagamento"), "observacoes": p.get("observacoes")}
+                for p in (parcelas or [])]
+
+    soma_itens_pay = _r2(sum(_num(it.get("valorTotal")) - _num(it.get("desconto")) for it in itens_pay)
+                         + _num(payload.get("valorFrete")))
+
     return {
+        "bate": abs(soma_parc - total_calc) < 0.01,
+        "consistente_itens": abs(soma_itens_pay - total_calc) < 0.01,
+        "soma_parcelas_payload": soma_parc,
+        "soma_itens_payload": soma_itens_pay,
+        "total_calculado": total_calc,            # = valorNota do envio
+        # comparação lado a lado: o que está na nota HOJE × o que SERIA enviado
+        "comparacao": {
+            "original": {
+                "valorNota": _num(note.get("valorNota")),
+                "valorFrete": _num(note.get("valorFrete")),
+                "desconto_nota": _desconto_nota_valor(note),
+                "itens": _resumo_itens(note.get("itens") or note.get("itensNota")),
+                "parcelas": _resumo_parcelas(note.get("parcelas")),
+            },
+            "enviado": {
+                "valorNota": _num(payload.get("valorNota")),
+                "valorFrete": _num(payload.get("valorFrete")),
+                "desconto_nota": _desconto_nota_valor(payload),
+                "itens": _resumo_itens(itens_pay),
+                "parcelas": _resumo_parcelas(parc_pay),
+            },
+        },
         "raw": {
             "valorNota": note.get("valorNota"),
             "desconto_nota": _desconto_nota_valor(note),
@@ -249,16 +317,13 @@ def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, 
             "intermediador": note.get("intermediador"),
             "loja": note.get("loja"),
             "tem_parcelas": bool(note.get("parcelas")),
-            "parcelas": note.get("parcelas"),
             "chaves_nota": sorted([k for k in note.keys()]),
+            "campos_numericos_raiz": {k: v for k, v in note.items()
+                                      if isinstance(v, (int, float)) and not isinstance(v, bool)},
         },
-        "payload": {
-            "parcelas": parc_pay,
-            "itens_desconto": [it.get("desconto") for it in itens_pay],
-        },
-        "soma_parcelas_payload": soma_parc,
-        "total_calculado": total_calc,
-        "bate": abs(soma_parc - total_calc) < 0.01,
+        # objetos COMPLETOS para conferência total (o botão "copiar" leva tudo)
+        "payload_completo": payload,
+        "nota_original": note,
         "resumo": edicao["resumo"],
     }
 
@@ -463,7 +528,7 @@ def detalhar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
 _NFE_READONLY = {
     "id", "situacao", "chaveAcesso", "linkDanfe", "linkPDF", "xml", "recibo",
     "protocolo", "digestValue", "dataAutorizacao", "dataInclusao", "dataAlteracao",
-    "valorNota", "tipoIntegracao",
+    "tipoIntegracao",
 }
 
 
@@ -559,60 +624,61 @@ def _liquido_item(it: dict) -> float:
 def montar_alteracao(raw: dict, edicao: dict) -> dict:
     """Monta o payload de alteração (PUT) a partir do original do Bling + a edição.
 
-    Sobrescreve o desconto de cada item (ARREDONDADO a 2 casas), recalcula o novo total
-    somando os líquidos item a item (mesma conta do Bling) e REESCALA as parcelas para
-    esse total — evita o erro 'Total das parcelas difere do total da nota' por arredondamento.
-    Remove campos read-only e reduz objetos de referência a {id}.
+    Aplica o desconto NO CAMPO CORRETO de cada item (campo `desconto` = vDesc), PRESERVANDO
+    o preço de venda (`valor`) e usando `valorTotal` = bruto (valor × qtd). Em seguida define
+    o `valorNota` (total com desconto) e `valorFrete` DIRETAMENTE — porque o Bling usa esses
+    campos e valida soma(parcelas) == valorNota. Tudo fica consistente:
+    valorNota = Σ(valorTotal − desconto) + frete = soma das parcelas.
+    O tributo aproximado (IBPT) é escalado proporcionalmente (campo informativo).
     """
     nfe = dict(raw.get("data", raw))
     resumo = edicao.get("resumo", {})
-
     linhas = edicao["itens"]
     itens_raw = nfe.get("itens") or nfe.get("itensNota") or []
+
+    frete_depois = _r2(_num(resumo.get("frete_depois")))
+    novo_total_resumo = _r2(_num(resumo.get("total_nota")))
+    valor_original = _num(nfe.get("valorNota")) or 0.0
+    ratio = (novo_total_resumo / valor_original) if valor_original > 0 else 1.0
+
     for linha in linhas:
         idx = linha["indice"]
         if not (0 <= idx < len(itens_raw)):
             continue
         it = itens_raw[idx]
         qty = _num(it.get("quantidade")) or 1
-        desc = _r2(linha["desconto_reais"])
-        # PRESERVA o preço de venda (valor) do produto e aplica o desconto no campo 'desconto'
-        # (vDesc da NF-e). valorTotal = bruto (valor × qtd); o Bling calcula o total da nota
-        # como soma(valorTotal) − soma(desconto). Assim o preço do item não é alterado.
-        it["desconto"] = desc
-        it["valorTotal"] = _r2(_num(it.get("valor")) * qty)
+        it["valor"] = _r2(_num(it.get("valor")))            # PRESERVA o preço de venda
+        it["valorTotal"] = _r2(_num(it.get("valor")) * qty)  # bruto (valor × qtd)
+        it["desconto"] = _r2(linha["desconto_reais"])        # <-- DESCONTO no campo correto (vDesc)
+        imp = it.get("impostos")
+        if isinstance(imp, dict) and imp.get("valorAproximadoTotalTributos") is not None and ratio != 1.0:
+            imp["valorAproximadoTotalTributos"] = _r2(_num(imp["valorAproximadoTotalTributos"]) * ratio)
     if "itens" in nfe:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
         nfe["itensNota"] = itens_raw
 
-    # Zera descontos no NÍVEL DA NOTA. Marketplaces (ex.: NuvemShop) importam um desconto de
-    # PEDIDO aqui, fora dos itens. Como aplicamos o desconto item a item (campo 'desconto' do
-    # item), manter o desconto da nota DUPLICARIA a conta — o Bling calcularia vNF =
-    # soma(itens) − desconto_da_nota e a soma das parcelas não bateria ("Total das parcelas
-    # difere do total da nota"). Por isso o zeramos: o vNF passa a ser exatamente soma(itens).
+    # zera qualquer desconto no NÍVEL DA NOTA (o desconto agora está nos itens; evita dupla contagem)
     _zerar_desconto_nota(nfe)
 
-    # zera o frete no transporte (e no total, conforme o schema)
-    transporte = dict(nfe.get("transporte") or {})
-    frete_depois = _num(resumo.get("frete_depois"))
-    if frete_depois == 0:
-        if "frete" in transporte:
-            transporte["frete"] = 0
-        transporte["valorFrete"] = 0
-        nfe["transporte"] = transporte
-        if "frete" in nfe:
-            nfe["frete"] = 0
-        if "valorFrete" in nfe:
-            nfe["valorFrete"] = 0
-
-    # novo total = soma(valorTotal) − soma(desconto) + frete = exatamente o que o Bling gera como vNF
+    # total da nota = Σ(valorTotal − desconto) + frete — consistente com os itens enviados.
+    # Definimos DIRETAMENTE (o Bling confia nesses campos e valida soma(parcelas) == valorNota).
     total_itens = _r2(sum(_num(it.get("valorTotal")) - _num(it.get("desconto")) for it in itens_raw))
     novo_total = _r2(total_itens + frete_depois)
+    nfe["valorNota"] = novo_total
+    nfe["valorFrete"] = frete_depois
+    transporte = nfe.get("transporte")
+    if isinstance(transporte, dict) and frete_depois == 0:
+        if "frete" in transporte:
+            transporte["frete"] = 0
+        if "valorFrete" in transporte:
+            transporte["valorFrete"] = 0
+
+    # parcelas somam exatamente o novo total (== valorNota)
     if nfe.get("parcelas"):
         nfe["parcelas"] = _reescalar_parcelas(nfe["parcelas"], novo_total)
 
-    # remove campos gerados pelo Bling (read-only) — costumam causar 400 no PUT
+    # remove campos gerados pelo Bling (read-only) — MAS mantém valorNota e valorFrete
     for campo in list(nfe.keys()):
         if campo in _NFE_READONLY:
             nfe.pop(campo, None)

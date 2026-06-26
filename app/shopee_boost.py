@@ -111,9 +111,10 @@ def sincronizar_nomes(user_id: int) -> dict:
         db.close()
 
 
-def ciclo(user_id: int) -> dict:
+def ciclo(user_id: int, notificar: bool = True) -> dict:
     """Executa um ciclo: se houver vaga (até 5), impulsiona os próximos da fila.
-    Chamado periodicamente pelo agendador em background."""
+    Chamado periodicamente pelo agendador em background. `notificar=False` quando chamado
+    de dentro do boost condicional (que emite a própria notificação, evitando duplicar)."""
     db = SessionLocal()
     try:
         cfg = _config(db, user_id)
@@ -133,6 +134,7 @@ def ciclo(user_id: int) -> dict:
         if not escolhidos:
             return {"acao": "sem_candidatos"}
         ids = [e.item_id for e in escolhidos]
+        nomes = [e.nome for e in escolhidos]
         try:
             shopee.impulsionar(user_id, ids)
         except shopee.ShopeeError as e:
@@ -143,6 +145,16 @@ def ciclo(user_id: int) -> dict:
             e.boost_ate = fim
             e.impulsos = (e.impulsos or 0) + 1
         db.commit()
+        if notificar:
+            try:
+                from . import notificacoes as notif
+                amostra = ", ".join([n for n in nomes if n][:2])
+                notif.criar(user_id, "agente",
+                            f"Boost: {len(ids)} produto(s) impulsionado(s) na Shopee",
+                            (f"{amostra}… " if amostra else "") + f"Em destaque por {BOOST_HORAS}h.",
+                            ok=True, modulo="boost")
+            except Exception:  # noqa: BLE001
+                pass
         return {"acao": "impulsionado", "itens": ids, "termina_em": fim.isoformat()}
     finally:
         db.close()

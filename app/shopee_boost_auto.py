@@ -162,8 +162,19 @@ def aplicar(user_id: int, forcar: bool = False) -> dict:
     finally:
         db.close()
 
-    ciclo_res = shopee_boost.ciclo(user_id)
+    ciclo_res = shopee_boost.ciclo(user_id, notificar=False)
     sem_anuncio = [a for a in ameacados if not a["item_id"]]
+    if impulsionados or liberados:
+        try:
+            from . import notificacoes as notif
+            notif.criar(user_id, "concorrencia",
+                        f"Boost condicional: {len(impulsionados)} produto(s) sob ameaça",
+                        (f"{len(impulsionados)} priorizado(s) em boost"
+                         + (f", {len(liberados)} liberado(s)" if liberados else "")
+                         + ". Concorrentes pressionando — confira no Boost."),
+                        ok=True, modulo="boost")
+        except Exception:  # noqa: BLE001
+            pass
     return {
         "acao": "aplicado",
         "ameacados": len(ameacados),

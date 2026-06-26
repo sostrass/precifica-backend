@@ -442,6 +442,16 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
         except shopee.ShopeeError as e:
             erros.append(f"flash: {e}")
 
+    if criadas:
+        try:
+            from . import notificacoes as notif
+            notif.criar(user_id, "precificacao",
+                        f"{len(criadas)} promoção(ões) criada(s) na Shopee",
+                        (f"Origem: {motivo}. " if motivo and motivo != "manual" else "")
+                        + (f"{len(erros)} aviso(s)." if erros else "Tudo certo."),
+                        ok=True, modulo="promocoes")
+        except Exception:  # noqa: BLE001
+            pass
     return {"acao": "ok" if criadas else "erro", "criadas": criadas, "erros": erros}
 
 
