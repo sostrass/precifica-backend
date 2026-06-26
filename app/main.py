@@ -161,6 +161,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="BlingAI Manager — Backend", version="0.2.0", lifespan=lifespan)
 
+
+def _brl(v) -> str:
+    """Formata um número como moeda BR para textos de notificação."""
+    try:
+        return "R$ " + f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except (TypeError, ValueError):
+        return "R$ 0,00"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if settings.frontend_origin == "*" else [settings.frontend_origin],
@@ -2089,9 +2097,10 @@ def nfe_valores(payload: dict = Body(...), user: User = Depends(auth.get_current
     (IBPT), pedido, chave, links e motivo de rejeição. Chamado em background pela tela."""
     ids = payload.get("ids") or []
     out = {}
+    lojas_map = nfe._mapear_lojas_plataforma(user.id)  # cache 1h — resolve NuvemShop/site próprio
     for nid in ids[:100]:
         try:
-            out[str(nid)] = nfe.resumo_extra_raw(bling.obter_nfe(user.id, nid))
+            out[str(nid)] = nfe.resumo_extra_raw(bling.obter_nfe(user.id, nid), lojas_map)
         except Exception:
             out[str(nid)] = {"valor": 0, "plataforma": None}
     return out
@@ -2105,9 +2114,30 @@ def nfe_aplicar_selecionadas(payload: dict = Body(...), user: User = Depends(aut
         raise HTTPException(status_code=400, detail="Nenhuma nota selecionada.")
     cfg = _nfe_cfg(user.id)
     try:
-        return nfe.processar_ids(user.id, ids, cfg)
+        r = nfe.processar_ids(user.id, ids, cfg)
+        from . import notificacoes as notif
+        notif.criar(user.id, "nfe", f"Desconto aplicado em {r.get('aplicadas', 0)} nota(s)",
+                    "Seleção em massa concluída. Venha conferir e transmitir no Bling.",
+                    ok=(r.get("aplicadas", 0) > 0), modulo="nfe")
+        return r
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/nfe/faturamento")
+def nfe_faturamento(user: User = Depends(auth.get_current_user)):
+    """Monitor do teto do Simples: RBT12, total do ano, projeção e % do teto/sublimite
+    (estimativa por amostragem — a lista do Bling não traz valor). Lê o último snapshot."""
+    return nfe.resumo_faturamento(user.id)
+
+
+@app.post("/api/nfe/faturamento/recalcular")
+def nfe_faturamento_recalcular(background: BackgroundTasks,
+                               user: User = Depends(auth.get_current_user)):
+    """Dispara o recálculo do faturamento em background (job pesado). A tela busca o
+    resultado depois via GET /api/nfe/faturamento."""
+    background.add_task(nfe.recalcular_faturamento, user.id)
+    return {"iniciado": True, "mensagem": "Recálculo iniciado. Pode levar alguns minutos; atualize em instantes."}
 
 
 @app.post("/api/nfe/aplicar-todas")
@@ -2117,33 +2147,49 @@ def nfe_aplicar_todas(user: User = Depends(auth.get_current_user)):
     Não depende do modo automático estar ligado. Retorna um relatório por nota."""
     cfg = _nfe_cfg(user.id)
     try:
-        return nfe.processar_automatico(user.id, cfg)
+        r = nfe.processar_automatico(user.id, cfg)
+        from . import notificacoes as notif
+        if r.get("aplicadas", 0) > 0:
+            notif.criar(user.id, "nfe", f"Desconto aplicado em {r.get('aplicadas', 0)} nota(s) pendentes",
+                        "Aplicação em lote concluída. Venha conferir e transmitir no Bling.",
+                        ok=True, modulo="nfe")
+        return r
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
 
 @app.get("/api/notificacoes")
 def notificacoes(limite: int = 40, user: User = Depends(auth.get_current_user)):
-    """Centro de notificações da plataforma: tudo o que o Bling empurrou (NF-e, produtos,
-    pedidos, estoque…) e o que a aplicação fez com cada evento, em ordem cronológica."""
+    """Centro de notificações da plataforma: eventos do Bling (NF-e, produtos, pedidos…) +
+    o que os módulos fizeram (agentes aplicaram desconto, avaliações respondidas, radar de
+    concorrência…), em ordem cronológica."""
+    from . import notificacoes as notif
+    itens = list(notif.listar(user.id, limite))  # notificações próprias (app)
     db = SessionLocal()
     try:
         regs = (db.query(WebhookEvento)
                 .filter(WebhookEvento.user_id == user.id)
                 .order_by(WebhookEvento.id.desc())
                 .limit(max(1, min(limite, 100))).all())
-        out = []
         for e in regs:
             cat, titulo, texto, ok = webhooks.descrever_evento(e.recurso, e.acao, e.resultado)
-            out.append({
-                "id": e.id, "categoria": cat, "titulo": titulo, "texto": texto, "ok": ok,
+            itens.append({
+                "id": f"w{e.id}", "categoria": cat, "titulo": titulo, "texto": texto, "ok": ok,
                 "recurso": e.recurso, "acao": e.acao, "entidade_id": e.entidade_id,
                 "quando": e.recebido_em.isoformat() if e.recebido_em else None,
                 "resultado": e.resultado,
             })
-        return out
     finally:
         db.close()
+    # ordena por horário desc (quando ausente vai pro fim) e corta no limite
+    itens.sort(key=lambda x: (x.get("quando") or ""), reverse=True)
+    return itens[:max(1, min(limite, 100))]
+
+
+@app.post("/api/notificacoes/marcar-lidas")
+def notificacoes_marcar_lidas(user: User = Depends(auth.get_current_user)):
+    from . import notificacoes as notif
+    return {"lidas": notif.marcar_lidas(user.id)}
 
 
 @app.get("/api/nfe/eventos")
@@ -2172,7 +2218,8 @@ def nfe_eventos(limite: int = 25, user: User = Depends(auth.get_current_user)):
 def nfe_obter(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Detalhe normalizado de uma nota (itens + frete) para o editor de desconto."""
     try:
-        return nfe.normalizar_nfe(bling.obter_nfe(user.id, nfe_id))
+        return nfe.normalizar_nfe(bling.obter_nfe(user.id, nfe_id),
+                                  nfe._mapear_lojas_plataforma(user.id))
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:
@@ -2183,7 +2230,8 @@ def nfe_obter(nfe_id: str, user: User = Depends(auth.get_current_user)):
 def nfe_completa(nfe_id: str, user: User = Depends(auth.get_current_user)):
     """Visão COMPLETA da nota: destinatário, totais, impostos, transporte, itens e links."""
     try:
-        return nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id))
+        return nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id),
+                                nfe._mapear_lojas_plataforma(user.id))
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:
@@ -2230,6 +2278,19 @@ def nfe_conciliacao_shopee_lote(payload: dict = Body(...), user: User = Depends(
         raise HTTPException(status_code=401, detail=str(e))
 
 
+@app.post("/api/nfe/{nfe_id}/enviar")
+def nfe_enviar(nfe_id: str, user: User = Depends(auth.get_current_user)):
+    """Retransmite uma NF-e ao Sefaz (para reprocessar notas rejeitadas já corrigidas)."""
+    try:
+        return {"ok": True, "resultado": bling.enviar_nfe(user.id, nfe_id)}
+    except bling.BlingNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except bling.BlingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
 @app.post("/api/nfe/{nfe_id}/aplicar")
 def nfe_aplicar(nfe_id: str, payload: dict = Body(...),
                 user: User = Depends(auth.get_current_user)):
@@ -2238,7 +2299,7 @@ def nfe_aplicar(nfe_id: str, payload: dict = Body(...),
     Body: {desconto_tipo, desconto_valor, descontos_por_item?, remover_frete, enviar}
     """
     try:
-        return nfe.editar_nota(
+        res = nfe.editar_nota(
             user.id, nfe_id,
             desconto_tipo=payload.get("desconto_tipo", "percentual"),
             desconto_valor=float(payload.get("desconto_valor", 0)),
@@ -2246,6 +2307,13 @@ def nfe_aplicar(nfe_id: str, payload: dict = Body(...),
             remover_frete=bool(payload.get("remover_frete", True)),
             enviar=bool(payload.get("enviar", False)),
         )
+        if res.get("enviado"):
+            from . import notificacoes as notif
+            total = (res.get("resumo") or {}).get("total_nota")
+            notif.criar(user.id, "nfe", f"Desconto aplicado na nota {res.get('numero') or nfe_id}",
+                        f"Novo total {_brl(total)}. Confira e transmita no Bling." if total is not None else "Confira a nota.",
+                        ok=True, modulo="nfe", entidade_id=nfe_id)
+        return res
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingError as e:

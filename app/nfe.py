@@ -105,7 +105,7 @@ def aplicar_edicao(itens, *, desconto_tipo="percentual", desconto_valor=0.0,
 # --------------------------------------------------------------------------- #
 # MAPEAMENTO Bling <-> visão normalizada (concentra os nomes de campo)
 # --------------------------------------------------------------------------- #
-def normalizar_nfe(raw: dict) -> dict:
+def normalizar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
     """Extrai do payload do Bling uma visão simples e editável da nota.
 
     Defensivo: aceita tanto {data:{...}} quanto o objeto direto, e nomes de campo
@@ -141,7 +141,7 @@ def normalizar_nfe(raw: dict) -> dict:
         "parcelas": [{"data": p.get("data"), "valor": _num(p.get("valor"))}
                      for p in (nfe.get("parcelas") or [])],
         "valor_nota": _num(nfe.get("valorNota")),
-        "plataforma": plataforma_nota(nfe),
+        "plataforma": plataforma_nota(nfe, lojas_map),
         "pedido_loja": nfe.get("numeroPedidoLoja"),
     }
 
@@ -169,12 +169,59 @@ _PLATAFORMA_CNPJ = {
 }
 
 
-def plataforma_nota(note: dict):
-    """Detecta o marketplace da nota pelo CNPJ do intermediador (Shopee, Mercado Livre…)."""
+# Palavras-chave no nome/integração da loja do Bling → plataforma (fallback quando a nota
+# não traz intermediador — caso de e-commerce próprio como NuvemShop).
+_LOJA_KW_PLATAFORMA = [
+    ("shopee", "Shopee"),
+    ("mercadolivre", "Mercado Livre"), ("mercado livre", "Mercado Livre"), ("meli", "Mercado Livre"),
+    ("nuvemshop", "NuvemShop"), ("nuvem shop", "NuvemShop"), ("tiendanube", "NuvemShop"), ("nuvem", "NuvemShop"),
+    ("amazon", "Amazon"),
+    ("magalu", "Magalu"), ("magazine", "Magalu"),
+    ("americanas", "Americanas"), ("b2w", "Americanas"), ("submarino", "Americanas"),
+    ("tiktok", "TikTok Shop"),
+    ("shein", "Shein"),
+    ("olist", "Olist"),
+    ("tray", "Tray"),
+    ("woocommerce", "WooCommerce"), ("woo", "WooCommerce"),
+    ("loja integrada", "Loja Integrada"), ("lojaintegrada", "Loja Integrada"),
+    ("vtex", "VTEX"),
+    ("shopify", "Shopify"),
+    ("site", "Site próprio"), ("e-commerce", "Site próprio"), ("ecommerce", "Site próprio"),
+]
+
+
+def _mapear_lojas_plataforma(user_id: int) -> dict:
+    """Mapa {loja_id(str): plataforma} a partir das lojas da conta no Bling (cache 1h).
+    Usa palavras-chave do nome/integração; se não casar, usa o próprio nome da loja."""
+    from . import bling
+    try:
+        lojas = bling.lojas_da_conta(user_id) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for lid, info in (lojas.items() if isinstance(lojas, dict) else []):
+        texto = f"{(info or {}).get('nome', '')} {(info or {}).get('integracao', '')}".lower()
+        plat = None
+        for kw, nome in _LOJA_KW_PLATAFORMA:
+            if kw in texto:
+                plat = nome
+                break
+        out[str(lid)] = plat or (info or {}).get("nome") or None
+    return out
+
+
+def plataforma_nota(note: dict, lojas_map: dict | None = None):
+    """Detecta a plataforma da nota: 1) pelo CNPJ do intermediador (Shopee, ML…);
+    2) se não houver, pela loja da conta no Bling (resolve NuvemShop, site próprio etc.)."""
     inter = note.get("intermediador") or {}
     cnpj = re.sub(r"\D", "", str(inter.get("cnpj") or ""))
     if cnpj[:8] in _PLATAFORMA_CNPJ:
         return _PLATAFORMA_CNPJ[cnpj[:8]]
+    if lojas_map:
+        loja = note.get("loja") or {}
+        lid = str(loja.get("id") if isinstance(loja, dict) else loja or "")
+        if lid and lojas_map.get(lid):
+            return lojas_map[lid]
     return None
 
 
@@ -197,6 +244,10 @@ def diagnosticar_edicao(user_id: int, nfe_id, *, desconto_tipo, desconto_valor, 
     return {
         "raw": {
             "valorNota": note.get("valorNota"),
+            "desconto_nota": _desconto_nota_valor(note),
+            "frete_nota": _num(note.get("valorFrete") or (note.get("transporte") or {}).get("frete") or (note.get("transporte") or {}).get("valorFrete")),
+            "intermediador": note.get("intermediador"),
+            "loja": note.get("loja"),
             "tem_parcelas": bool(note.get("parcelas")),
             "parcelas": note.get("parcelas"),
             "chaves_nota": sorted([k for k in note.keys()]),
@@ -221,7 +272,7 @@ def _motivo_rejeicao(n: dict):
     return None
 
 
-def resumo_extra_raw(raw: dict) -> dict:
+def resumo_extra_raw(raw: dict, lojas_map: dict | None = None) -> dict:
     """Extrai do payload bruto tudo que a lista não traz: valor, plataforma, UF, tributos
     aproximados (IBPT), pedido, chave de acesso, links e motivo de rejeição."""
     n = raw.get("data", raw) if isinstance(raw, dict) else {}
@@ -231,7 +282,7 @@ def resumo_extra_raw(raw: dict) -> dict:
         trib += _num((it.get("impostos") or {}).get("valorAproximadoTotalTributos"))
     return {
         "valor": valor_total_raw(raw),
-        "plataforma": plataforma_nota(n),
+        "plataforma": plataforma_nota(n, lojas_map),
         "uf": end.get("uf") or None,
         "municipio": end.get("municipio") or None,
         "tributos": _r2(trib),
@@ -319,7 +370,7 @@ def nota_editavel(cod) -> bool:
         return False
 
 
-def detalhar_nfe(raw: dict) -> dict:
+def detalhar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
     """Visão COMPLETA da nota (destinatário, totais, impostos, transporte, links).
 
     Validada contra o payload real do Bling v3 (NF-e modelo 55).
@@ -356,6 +407,12 @@ def detalhar_nfe(raw: dict) -> dict:
     _tipo = n.get("tipo")
     _modelo = n.get("modelo")
     _fin = n.get("finalidade")
+    _nat = n.get("naturezaOperacao")
+    natureza = _nat.get("descricao") if isinstance(_nat, dict) else (_nat or None)
+    _inter = n.get("intermediador") or {}
+    intermediador_nome = (_inter.get("nomeUsuario") or _inter.get("nome")
+                          or plataforma_nota(n, lojas_map)) if _inter else None
+    valor_produtos = _r2(sum(_num(it.get("valorTotal")) for it in (n.get("itens") or [])))
     return {
         "id": n.get("id"),
         "numero": n.get("numero"),
@@ -370,12 +427,19 @@ def detalhar_nfe(raw: dict) -> dict:
         "finalidade": _fin,
         "finalidade_label": FINALIDADE_NFE.get(str(_fin)) if _fin not in (None, "") else None,
         "data_emissao": n.get("dataEmissao"),
+        "data_operacao": n.get("dataOperacao"),
+        "natureza_operacao": natureza,
+        "observacoes": (n.get("observacoes") or n.get("informacoesAdicionais") or "").strip() or None,
+        "vendedor": (n.get("vendedor") or {}).get("nome") if isinstance(n.get("vendedor"), dict) else None,
+        "intermediador": intermediador_nome,
         "chave_acesso": n.get("chaveAcesso"),
+        "valor_produtos": valor_produtos,
         "valor_nota": _num(n.get("valorNota")),
         "valor_frete": _num(n.get("valorFrete")),
+        "desconto_nota": _desconto_nota_valor(n),
         "simples_nacional": bool(n.get("optanteSimplesNacional")),
         "pedido_loja": n.get("numeroPedidoLoja"),
-        "plataforma": plataforma_nota(n),
+        "plataforma": plataforma_nota(n, lojas_map),
         "link_danfe": n.get("linkDanfe"),
         "link_pdf": n.get("linkPDF"),
         "link_xml": n.get("xml"),
@@ -427,6 +491,34 @@ def _set_parcela_val(p: dict, v: float):
             p[k] = v
             return
     p["valor"] = v
+
+
+_CAMPOS_DESCONTO_NOTA = ("desconto", "valorDesconto", "descontoTotal", "valorDescontos")
+
+
+def _desconto_nota_valor(nfe: dict) -> float:
+    """Lê o desconto no nível da nota (escalar ou objeto {valor/percentual}), se houver."""
+    total = 0.0
+    for campo in _CAMPOS_DESCONTO_NOTA:
+        v = nfe.get(campo)
+        if isinstance(v, dict):
+            total += _num(v.get("valor") or v.get("valorDesconto") or 0)
+        elif v is not None:
+            total += _num(v)
+    return _r2(total)
+
+
+def _zerar_desconto_nota(nfe: dict) -> None:
+    """Zera qualquer desconto no nível da nota (in-place)."""
+    for campo in _CAMPOS_DESCONTO_NOTA:
+        if campo not in nfe:
+            continue
+        v = nfe[campo]
+        if isinstance(v, dict):
+            nfe[campo] = {k: (0 if k in ("valor", "percentual", "valorDesconto") else val)
+                          for k, val in v.items()}
+        elif v not in (None, 0):
+            nfe[campo] = 0
 
 
 def _reescalar_parcelas(parcelas: list, novo_total: float) -> list:
@@ -493,6 +585,13 @@ def montar_alteracao(raw: dict, edicao: dict) -> dict:
         nfe["itens"] = itens_raw
     elif "itensNota" in nfe:
         nfe["itensNota"] = itens_raw
+
+    # Zera descontos no NÍVEL DA NOTA. Marketplaces (ex.: NuvemShop) importam um desconto de
+    # PEDIDO aqui, fora dos itens. Como aplicamos o desconto item a item (campo 'desconto' do
+    # item), manter o desconto da nota DUPLICARIA a conta — o Bling calcularia vNF =
+    # soma(itens) − desconto_da_nota e a soma das parcelas não bateria ("Total das parcelas
+    # difere do total da nota"). Por isso o zeramos: o vNF passa a ser exatamente soma(itens).
+    _zerar_desconto_nota(nfe)
 
     # zera o frete no transporte (e no total, conforme o schema)
     transporte = dict(nfe.get("transporte") or {})
@@ -586,6 +685,143 @@ def conciliar_shopee_lote(user_id: int, ids: list) -> dict:
         "soma_pago": _r2(sum(l.get("pago_produto") or 0 for l in ok)),
         "soma_recebido": _r2(sum(l.get("recebido_liquido") or 0 for l in ok if l.get("recebido_liquido") is not None)),
         "linhas": linhas,
+    }
+
+
+_TETO_SIMPLES = 4_800_000.0       # teto anual do Simples Nacional (RBT12)
+_SUBLIMITE_SIMPLES = 3_600_000.0  # sublimite p/ ICMS/ISS dentro do Simples
+
+
+def _meses_trailing(qtd: int = 12):
+    """Lista [(ano, mes)] dos últimos `qtd` meses, do mais antigo ao mês atual."""
+    import datetime as _dt
+    hoje = _dt.date.today()
+    out = []
+    a, m = hoje.year, hoje.month
+    for _ in range(qtd):
+        out.append((a, m))
+        m -= 1
+        if m == 0:
+            m = 12; a -= 1
+    return list(reversed(out))
+
+
+def _ultimo_dia(ano: int, mes: int) -> int:
+    import calendar
+    return calendar.monthrange(ano, mes)[1]
+
+
+def recalcular_faturamento(user_id: int, meses: int = 12,
+                           amostra_max: int = 30, max_paginas: int = 40) -> dict:
+    """Job PESADO (rodar em background): para cada um dos últimos `meses`, conta as NF-e de
+    saída autorizadas (situação 5/6) do mês e estima o faturamento por média amostral
+    (a lista do Bling não traz o valor). Grava um snapshot por mês. Idempotente."""
+    from . import bling
+    from .db import SessionLocal
+    from .models import NfeFaturamentoMes
+
+    resumo_meses = []
+    for ano, mes in _meses_trailing(meses):
+        d_ini = f"{ano:04d}-{mes:02d}-01"
+        d_fim = f"{ano:04d}-{mes:02d}-{_ultimo_dia(ano, mes):02d}"
+        autorizadas_ids = []
+        parcial = False
+        pagina = 1
+        while pagina <= max_paginas:
+            try:
+                raw = bling.listar_nfe(user_id, pagina=pagina, limite=100,
+                                       data_ini=d_ini, data_fim=d_fim)
+            except Exception:  # noqa: BLE001
+                break
+            linhas = resumir_lista(raw)
+            if not linhas:
+                break
+            for n in linhas:
+                tipo = n.get("tipo")
+                eh_saida = (tipo in (1, "1", None))
+                if n.get("situacao") in (5, 6) and eh_saida and n.get("id"):
+                    autorizadas_ids.append(n["id"])
+            if len(linhas) < 100:
+                break
+            pagina += 1
+        else:
+            parcial = True
+
+        qtd = len(autorizadas_ids)
+        # média amostral do valor (busca nota a nota só na amostra)
+        soma_amostra, lidas = 0.0, 0
+        for nid in autorizadas_ids[:amostra_max]:
+            try:
+                soma_amostra += valor_total_raw(bling.obter_nfe(user_id, nid))
+                lidas += 1
+            except Exception:  # noqa: BLE001
+                continue
+        media = (soma_amostra / lidas) if lidas else 0.0
+        total_est = _r2(media * qtd)
+
+        with SessionLocal() as db:
+            row = (db.query(NfeFaturamentoMes)
+                     .filter_by(user_id=user_id, ano=ano, mes=mes).first())
+            if row is None:
+                row = NfeFaturamentoMes(user_id=user_id, ano=ano, mes=mes)
+                db.add(row)
+            row.qtd = qtd
+            row.amostra = lidas
+            row.total_estimado = total_est
+            row.parcial = parcial
+            db.commit()
+        resumo_meses.append({"ano": ano, "mes": mes, "qtd": qtd, "amostra": lidas,
+                             "total_estimado": total_est, "parcial": parcial})
+
+    return {"ok": True, "meses": resumo_meses, "atualizado": True}
+
+
+def resumo_faturamento(user_id: int) -> dict:
+    """Lê os snapshots e monta o painel: RBT12, total do ano, projeção e % do teto/sublimite."""
+    import datetime as _dt
+    from .db import SessionLocal
+    from .models import NfeFaturamentoMes
+
+    with SessionLocal() as db:
+        rows = (db.query(NfeFaturamentoMes)
+                  .filter_by(user_id=user_id)
+                  .order_by(NfeFaturamentoMes.ano, NfeFaturamentoMes.mes).all())
+        dados = [{"ano": r.ano, "mes": r.mes, "qtd": r.qtd, "amostra": r.amostra,
+                  "total_estimado": float(r.total_estimado or 0), "parcial": bool(r.parcial),
+                  "atualizado_em": r.atualizado_em.isoformat() if r.atualizado_em else None}
+                 for r in rows]
+
+    if not dados:
+        return {"tem_dados": False, "teto": _TETO_SIMPLES, "sublimite": _SUBLIMITE_SIMPLES}
+
+    hoje = _dt.date.today()
+    trailing = set(_meses_trailing(12))
+    rbt12 = _r2(sum(d["total_estimado"] for d in dados if (d["ano"], d["mes"]) in trailing))
+    total_ano = _r2(sum(d["total_estimado"] for d in dados if d["ano"] == hoje.year))
+    meses_ano = max(1, hoje.month)
+    projecao_ano = _r2(total_ano / meses_ano * 12)
+
+    pct_teto = _r2(rbt12 / _TETO_SIMPLES * 100)
+    pct_sublimite = _r2(rbt12 / _SUBLIMITE_SIMPLES * 100)
+    if rbt12 >= _TETO_SIMPLES:
+        alerta = "estourou"
+    elif rbt12 >= 0.9 * _TETO_SIMPLES:
+        alerta = "critico"
+    elif rbt12 >= _SUBLIMITE_SIMPLES:
+        alerta = "sublimite"
+    elif rbt12 >= 0.8 * _SUBLIMITE_SIMPLES:
+        alerta = "atencao"
+    else:
+        alerta = "ok"
+
+    atualizado = max((d["atualizado_em"] for d in dados if d["atualizado_em"]), default=None)
+    parcial = any(d["parcial"] for d in dados if (d["ano"], d["mes"]) in trailing)
+    return {
+        "tem_dados": True, "rbt12": rbt12, "total_ano": total_ano, "ano": hoje.year,
+        "projecao_ano": projecao_ano, "teto": _TETO_SIMPLES, "sublimite": _SUBLIMITE_SIMPLES,
+        "pct_teto": pct_teto, "pct_sublimite": pct_sublimite, "alerta": alerta,
+        "parcial": parcial, "atualizado_em": atualizado,
+        "meses": dados[-12:],
     }
 
 

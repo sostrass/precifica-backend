@@ -417,6 +417,16 @@ def _rodar_mutirao(user_id: int, completo: bool = False):
                   fim=datetime.utcnow().isoformat(),
                   resumo={"respondidos": respondidos, "falhas": falhas,
                           "total_fila": len(pendentes), "interrompido": interrompido})
+        if respondidos > 0:
+            try:
+                from . import notificacoes as notif
+                notif.criar(user_id, "avaliacao",
+                            f"Agente respondeu {respondidos} avaliação(ões)",
+                            ("Mutirão interrompido. " if interrompido else "Mutirão concluído. ")
+                            + (f"{falhas} falha(s)." if falhas else "Sem falhas."),
+                            ok=(falhas == 0), modulo="avaliacoes")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -486,6 +496,15 @@ def auto_responder(user_id: int, limite: int = 100) -> dict:
         if cache and respondidos:
             cache["respondidas"] = cache.get("respondidas", 0) + respondidos
             cache["pendentes"] = max(0, cache.get("pendentes", 0) - respondidos)
+        if respondidos > 0:
+            try:
+                from . import notificacoes as notif
+                notif.criar(user_id, "avaliacao",
+                            f"{respondidos} avaliação(ões) respondida(s) automaticamente",
+                            "O agente automático respondeu novas avaliações na Shopee.",
+                            ok=True, modulo="avaliacoes")
+            except Exception:  # noqa: BLE001
+                pass
 
     return {"acao": "auto", "respondidos": respondidos,
             "ignorados_para_revisao": ignorados, "vistos": len(comentarios),

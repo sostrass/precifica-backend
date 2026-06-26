@@ -65,6 +65,25 @@ class NfeConfig(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class NfeFaturamentoMes(Base):
+    """Snapshot mensal de faturamento (NF-e de saída autorizadas) por tenant, para o monitor
+    do teto do Simples. Como a lista do Bling não traz o valor, guardamos contagem EXATA +
+    total ESTIMADO por média amostral, recalculado sob demanda (job pesado em background)."""
+
+    __tablename__ = "nfe_faturamento_mes"
+    __table_args__ = (UniqueConstraint("user_id", "ano", "mes", name="uq_faturamento_mes"),)
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    ano = Column(Integer, nullable=False)
+    mes = Column(Integer, nullable=False)
+    qtd = Column(Integer, default=0, nullable=False)            # contagem exata de notas autorizadas (saída)
+    amostra = Column(Integer, default=0, nullable=False)        # quantas notas foram lidas p/ a média
+    total_estimado = Column(Float, default=0.0, nullable=False)
+    parcial = Column(Boolean, default=False, nullable=False)    # True se o mês passou do teto de páginas
+    atualizado_em = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class RadarAlvo(Base):
     """Um anúncio de concorrente monitorado, por tenant e por SKU."""
 
@@ -131,6 +150,24 @@ class OAuthState(Base):
     state = Column(String, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     criado_em = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Notificacao(Base):
+    """Notificação da plataforma gerada por QUALQUER módulo (NF-e, precificação, avaliações,
+    radar de concorrência, agentes…). Alimenta o sino global. Separado do log de webhooks."""
+
+    __tablename__ = "notificacao"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    categoria = Column(String, default="outro", nullable=False)  # nfe|precificacao|avaliacao|radar|concorrencia|pedido|estoque|agente|outro
+    titulo = Column(String, nullable=False)
+    texto = Column(String, nullable=True)
+    ok = Column(Boolean, default=True, nullable=False)
+    modulo = Column(String, nullable=True)
+    entidade_id = Column(String, nullable=True)
+    criado_em = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    lido = Column(Boolean, default=False, nullable=False)
 
 
 class WebhookEvento(Base):

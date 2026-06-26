@@ -125,36 +125,69 @@ def registrar_snapshot(user_id, alvo_id, preco_oferta=None, preco_normal=None) -
         return {"ok": True, "id": snap.id, "coletado_em": snap.coletado_em.isoformat() + "Z"}
 
 
+def _ultimo_preco_alvo(alvo_id):
+    """Último preço registrado de um alvo (oferta ou normal), antes do novo snapshot."""
+    with SessionLocal() as db:
+        s = (db.query(RadarSnapshot).filter(RadarSnapshot.alvo_id == alvo_id)
+             .order_by(RadarSnapshot.coletado_em.desc()).first())
+        if not s:
+            return None
+        return s.preco_oferta if s.preco_oferta is not None else s.preco_normal
+
+
 def varrer(user_id, sku) -> dict:
     """Roda o scraper em cada alvo ativo do SKU e guarda o snapshot.
 
-    Não testável aqui (depende de internet). Retorna o preço encontrado por alvo.
+    Não testável aqui (depende de internet). Retorna o preço encontrado por alvo e a lista
+    de MUDANÇAS de preço (>1%) frente ao último snapshot — usada para notificar o lojista.
     """
     from . import scraper  # import tardio
 
     alvos = [a for a in listar_alvos(user_id, sku) if a["ativo"]]
-    resultados = []
+    resultados, mudancas = [], []
     for a in alvos:
+        anterior = _ultimo_preco_alvo(a["id"])
         achado = scraper.preco_de_url(a["url"], a.get("marketplace"))
         preco = achado.get("preco")
         if preco is not None:
             registrar_snapshot(user_id, a["id"], preco_oferta=preco)
+            if anterior and abs(preco - anterior) / anterior > 0.01:
+                mudancas.append({"sku": sku, "nome": a["nome"], "marketplace": a["marketplace"],
+                                 "de": _r2(anterior), "para": _r2(preco),
+                                 "queda": preco < anterior})
         resultados.append({"alvo_id": a["id"], "nome": a["nome"],
                            "marketplace": a["marketplace"], "preco": _r2(preco),
                            "fonte": achado.get("fonte"), "erro": achado.get("erro")})
-    return {"sku": sku, "varridos": len(resultados), "resultados": resultados}
+    return {"sku": sku, "varridos": len(resultados), "resultados": resultados, "mudancas": mudancas}
 
 
 def varrer_usuario(user_id) -> dict:
     """Varre todos os SKUs com alvos ativos de um tenant (botão 'varrer tudo')."""
     skus = sorted({a["sku"] for a in listar_alvos(user_id) if a["ativo"]})
     total = 0
+    mudancas = []
     for sku in skus:
         try:
-            total += varrer(user_id, sku).get("varridos", 0)
+            r = varrer(user_id, sku)
+            total += r.get("varridos", 0)
+            mudancas.extend(r.get("mudancas", []))
         except Exception:  # noqa: BLE001 — um SKU que falha não derruba o resto
             continue
-    return {"skus": len(skus), "varridos": total}
+    # notifica SÓ quando há mudança real de preço de concorrente (evita spam por varredura)
+    if mudancas:
+        try:
+            from . import notificacoes as notif
+            m0 = mudancas[0]
+            seta = "baixou" if m0["queda"] else "subiu"
+            cab = f"{m0['nome']} {seta} de R$ {m0['de']:.2f} para R$ {m0['para']:.2f}".replace(".", ",")
+            extra = f" e mais {len(mudancas) - 1} mudança(s)" if len(mudancas) > 1 else ""
+            notif.criar(user_id, "concorrencia",
+                        f"Concorrente mudou preço ({len(mudancas)})",
+                        cab + extra + ". Veja o Radar para decidir reação.",
+                        ok=True, modulo="radar")
+        except Exception:  # noqa: BLE001
+            pass
+    return {"skus": len(skus), "varridos": total, "mudancas": len(mudancas)}
 
 
 def varrer_todos() -> dict:

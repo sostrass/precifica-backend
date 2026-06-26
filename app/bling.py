@@ -342,11 +342,16 @@ def atualizar_preco_canal(user_id: int, produto_id: int, id_loja, preco: float) 
 
 
 def listar_nfe(user_id: int, pagina: int = 1, limite: int = 100,
-               situacao: int | None = None) -> dict:
-    """Lista NF-e (resumidas). Filtra por situação quando informado (ex.: pendente)."""
+               situacao: int | None = None,
+               data_ini: str | None = None, data_fim: str | None = None) -> dict:
+    """Lista NF-e (resumidas). Filtra por situação e/ou intervalo de dataEmissão (YYYY-MM-DD)."""
     params = {"pagina": pagina, "limite": limite}
     if situacao is not None:
         params["situacao"] = situacao
+    if data_ini:
+        params["dataEmissaoInicial"] = data_ini
+    if data_fim:
+        params["dataEmissaoFinal"] = data_fim
     r = _request(user_id, "GET", "/nfe", params=params)
     r.raise_for_status()
     return r.json()
@@ -543,6 +548,28 @@ def _resumir_erro_bling(corpo: dict) -> str:
             else:
                 partes.append(str(f))
     return " | ".join(p for p in partes if p) or str(corpo)[:300]
+
+
+def enviar_nfe(user_id: int, nfe_id) -> dict:
+    """Envia/retransmite uma NF-e ao Sefaz (POST /nfe/{id}/enviar).
+
+    Usado para reprocessar notas REJEITADAS após corrigi-las. O Bling faz a transmissão
+    com o certificado A1 configurado na conta. Em erro, levanta BlingError com a mensagem
+    EXATA do Bling (útil porque o endpoint pode variar conforme a versão/conta)."""
+    r = _request(user_id, "POST", f"/nfe/{nfe_id}/enviar")
+    if r.status_code == 404:
+        raise BlingNotFound(f"Endpoint de envio da NF-e {nfe_id} não encontrado (404). "
+                            f"Confirme no Bling se a transmissão por API está habilitada na sua conta.")
+    if r.status_code >= 400:
+        try:
+            corpo = r.json()
+        except Exception:  # noqa: BLE001
+            corpo = {"raw": (r.text or "")[:400]}
+        raise BlingError(f"Bling recusou a transmissão da NF-e {nfe_id} ({r.status_code}): {_resumir_erro_bling(corpo)}")
+    try:
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return {"ok": True}
 
 
 def atualizar_nfe(user_id: int, nfe_id, payload: dict) -> dict:
