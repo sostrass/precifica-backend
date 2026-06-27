@@ -5,12 +5,24 @@ e manter atualizado via webhook (produto.created/updated/deleted). As telas leem
 deste cache — rápido e sem martelar a API do Bling.
 """
 from datetime import datetime
+import re as _re
+import html as _html
 
 from sqlalchemy import or_
 
 from . import bling
 from .db import SessionLocal
 from .models import ProdutoCache, CatalogoSync
+
+
+def _strip_html(s) -> str:
+    """Remove tags HTML e decodifica entidades — o Bling devolve descrições como
+    '<p>Embalagem com 100ml</p>'. Sem isso, a impressão mostra as tags como texto."""
+    if not s:
+        return ""
+    txt = _re.sub(r"<[^>]+>", " ", str(s))
+    txt = _html.unescape(txt)
+    return _re.sub(r"\s+", " ", txt).strip()
 
 
 def _f(v) -> float:
@@ -186,7 +198,7 @@ def descricao_complementar(user_id: int, sku: str) -> str:
             return ""
         dados = reg.dados or {}
         if "descricaoComplementar" in dados:
-            v = (dados.get("descricaoComplementar") or "").strip()
+            v = _strip_html(dados.get("descricaoComplementar"))
             _DESC_COMPL_CACHE[chave] = v
             return v
         # ainda não cacheado: busca no Bling (1 chamada) e grava no cache local
@@ -194,7 +206,7 @@ def descricao_complementar(user_id: int, sku: str) -> str:
             prod = (bling.obter_produto(user_id, reg.produto_id) or {}).get("data") or {}
         except Exception:  # noqa: BLE001
             return ""  # erro transitório: não cacheia, tenta de novo na próxima
-        v = (prod.get("descricaoComplementar") or "").strip()
+        v = _strip_html(prod.get("descricaoComplementar"))
         dados["descricaoComplementar"] = v
         reg.dados = dados
         try:

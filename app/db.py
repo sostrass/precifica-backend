@@ -67,6 +67,7 @@ def garantir_colunas_extras():
         ],
         "webhook_eventos": [
             ("resultado", "JSON"),
+            ("recebido_em", "DATETIME"),
         ],
         "nfe_config": [
             ("desconto_plataformas", "JSON"),

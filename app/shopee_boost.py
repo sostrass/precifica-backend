@@ -75,6 +75,7 @@ def status(user_id: int) -> dict:
             "qtd_auto": sum(1 for i in itens if getattr(i, "auto", False)),
             "qtd_manual": sum(1 for i in itens if not getattr(i, "auto", False)),
             "total": len(itens), "fixos": sum(1 for i in itens if i.fixo),
+            "itens_ids": [i.item_id for i in itens],
             "impulsionando": [{
                 "item_id": i.item_id, "nome": _nome(i), "fixo": i.fixo, "auto": getattr(i, "auto", False),
                 "termina_em": i.boost_ate.isoformat() if i.boost_ate else None,

@@ -356,6 +356,32 @@ class ShopeePromoConfig(Base):
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
 
+class ShopeeImpressaoConfig(Base):
+    """Dados do emitente + o que aparece nas impressões (folha de separação e etiqueta).
+    Multi-tenant: cada conta personaliza o seu cabeçalho e os campos visíveis."""
+
+    __tablename__ = "shopee_impressao_config"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    # Emitente (remetente) — sai no cabeçalho da folha e no bloco REMETENTE da etiqueta
+    emitente_nome = Column(String, default="")
+    emitente_cnpj = Column(String, default="")
+    emitente_endereco = Column(String, default="")     # ex.: "Rua Comendador, 120"
+    emitente_cidade = Column(String, default="")        # ex.: "Limeira - SP · CEP 13480-000"
+    # O que mostrar
+    mostrar_timeline = Column(Boolean, default=True)
+    mostrar_nfe = Column(Boolean, default=True)
+    mostrar_rastreio = Column(Boolean, default=True)
+    mostrar_destinatario = Column(Boolean, default=True)
+    mostrar_miniaturas = Column(Boolean, default=True)
+    mostrar_complemento = Column(Boolean, default=True)
+    mostrar_nota_comprador = Column(Boolean, default=True)
+    mostrar_codigo_barras = Column(Boolean, default=True)
+    mostrar_qr = Column(Boolean, default=True)
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+
 class ShopeeVendaSnapshot(Base):
     """Fotografia periódica de pedidos para detectar queda de vendas — total do dia
     e da janela de 6h, com a faixa de horário (bucket) para comparar mesmo horário."""

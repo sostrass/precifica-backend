@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_promo_auto, shopee_reviews, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_impressao, shopee_promo_auto, shopee_reviews, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
@@ -136,10 +136,12 @@ async def lifespan(app: FastAPI):
     try:
         from .models import (ProdutoSync, ProdutoCache, CatalogoSync,
                              ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
-                             ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog)
+                             ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog,
+                             ShopeeImpressaoConfig, Notificacao)
         for M in (WebhookEvento, ProdutoSync, ProdutoCache, CatalogoSync,
                   ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
-                  ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog):
+                  ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog,
+                  ShopeeImpressaoConfig, Notificacao):
             M.__table__.create(bind=engine, checkfirst=True)
     except Exception:  # noqa: BLE001
         pass
@@ -648,6 +650,17 @@ def shopee_boost_sincronizar_nomes(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/api/shopee/boost/desempenho")
+def shopee_boost_desempenho(user: User = Depends(auth.get_current_user)):
+    """Vendas dos últimos 30 dias por produto do boost — pra avaliar se o impulso está
+    convertendo. Chama a Shopee (cacheada ~30min), por isso fica fora do status."""
+    try:
+        vendas = shopee.vendas_por_item(user.id, dias=30)  # {item_id(int): qtd}
+    except Exception:  # noqa: BLE001
+        vendas = {}
+    return {"dias": 30, "vendas": {str(k): int(v) for k, v in (vendas or {}).items()}}
+
+
 # ---- Avaliações ----
 @app.get("/api/shopee/avaliacoes")
 def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "",
@@ -696,6 +709,17 @@ def shopee_review_config_get(user: User = Depends(auth.get_current_user)):
 @app.put("/api/shopee/avaliacoes/config")
 def shopee_review_config_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     return shopee_reviews.salvar_config(user.id, payload)
+
+
+@app.get("/api/shopee/impressao/config")
+def shopee_impressao_config_get(user: User = Depends(auth.get_current_user)):
+    """Config de impressão da conta: dados do emitente + campos visíveis na folha/etiqueta."""
+    return shopee_impressao.obter_config(user.id)
+
+
+@app.put("/api/shopee/impressao/config")
+def shopee_impressao_config_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    return shopee_impressao.salvar_config(user.id, payload)
 
 
 @app.post("/api/shopee/avaliacoes/sugerir")
@@ -776,6 +800,18 @@ def shopee_promo_diagnosticar(user: User = Depends(auth.get_current_user)):
     pra revelar o motivo exato do '0 produtos'. Apaga o desconto de teste no fim."""
     try:
         return shopee_promo_auto.diagnosticar_desconto(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/promo/diagnosticar-flash")
+def shopee_promo_diagnosticar_flash(user: User = Depends(auth.get_current_user)):
+    """Testa criar 1 oferta relâmpago (Flash Sale da loja) e devolve as respostas CRUAS da
+    Shopee, revelando se a loja tem slots/elegibilidade. Apaga a oferta de teste no fim."""
+    try:
+        return shopee_promo_auto.diagnosticar_flash(user.id)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:  # noqa: BLE001
@@ -2217,22 +2253,25 @@ def notificacoes(limite: int = 40, user: User = Depends(auth.get_current_user)):
     concorrência…), em ordem cronológica."""
     from . import notificacoes as notif
     itens = list(notif.listar(user.id, limite))  # notificações próprias (app)
-    db = SessionLocal()
     try:
-        regs = (db.query(WebhookEvento)
-                .filter(WebhookEvento.user_id == user.id)
-                .order_by(WebhookEvento.id.desc())
-                .limit(max(1, min(limite, 100))).all())
-        for e in regs:
-            cat, titulo, texto, ok = webhooks.descrever_evento(e.recurso, e.acao, e.resultado)
-            itens.append({
-                "id": f"w{e.id}", "categoria": cat, "titulo": titulo, "texto": texto, "ok": ok,
-                "recurso": e.recurso, "acao": e.acao, "entidade_id": e.entidade_id,
-                "quando": e.recebido_em.isoformat() if e.recebido_em else None,
-                "resultado": e.resultado,
-            })
-    finally:
-        db.close()
+        db = SessionLocal()
+        try:
+            regs = (db.query(WebhookEvento)
+                    .filter(WebhookEvento.user_id == user.id)
+                    .order_by(WebhookEvento.id.desc())
+                    .limit(max(1, min(limite, 100))).all())
+            for e in regs:
+                cat, titulo, texto, ok = webhooks.descrever_evento(e.recurso, e.acao, e.resultado)
+                itens.append({
+                    "id": f"w{e.id}", "categoria": cat, "titulo": titulo, "texto": texto, "ok": ok,
+                    "recurso": e.recurso, "acao": e.acao, "entidade_id": e.entidade_id,
+                    "quando": e.recebido_em.isoformat() if e.recebido_em else None,
+                    "resultado": e.resultado,
+                })
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 — schema de webhook desatualizado não pode derrubar o sino
+        pass
     # ordena por horário desc (quando ausente vai pro fim) e corta no limite
     itens.sort(key=lambda x: (x.get("quando") or ""), reverse=True)
     return itens[:max(1, min(limite, 100))]

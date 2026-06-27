@@ -333,6 +333,95 @@ def diagnosticar_desconto(user_id: int) -> dict:
     return out
 
 
+def diagnosticar_flash(user_id: int) -> dict:
+    """Testa criar UMA oferta relâmpago (Flash Sale da loja) com 1 produto e devolve as
+    respostas CRUAS da Shopee (slots, create, add_items) pra revelar o motivo exato de o
+    relâmpago não ser criado. A causa quase sempre é a loja não ter horários (slots) liberados
+    — a Shopee concede slots de Flash Sale da Loja por elegibilidade. Apaga a oferta de teste
+    (criada num horário FUTURO, invisível ao comprador) no fim."""
+    out: dict = {"ok": False, "etapas": []}
+    cfg_v = _ConfigView(obter_config(user_id))
+    cands, diag = _funil(user_id, cfg_v)
+    out["diagnostico_funil"] = diag
+    if not cands:
+        out["motivo"] = _motivo_funil(diag, cfg_v)
+        return out
+    cand = cands[0]
+    out["produto"] = {k: cand.get(k) for k in ("item_id", "nome", "sku", "preco_atual", "preco_promo", "desconto_pct", "estoque")}
+    iid = int(cand["item_id"])
+
+    # Passo 1 — slots disponíveis (é aqui que a elegibilidade aparece)
+    slots_raw = None
+    try:
+        slots_raw = shopee.flash_slots(user_id, dias=3)
+        out["etapas"].append({"passo": "get_time_slot", "resposta": slots_raw})
+    except Exception as e:
+        out["etapas"].append({"passo": "get_time_slot", "erro": str(e)})
+    resp_s = (slots_raw or {}).get("response")
+    lista = resp_s.get("timeslot_list") if isinstance(resp_s, dict) else (resp_s if isinstance(resp_s, list) else [])
+    lista = lista or []
+    out["slots_disponiveis"] = len(lista)
+    slot = None
+    if lista:
+        primeiro = lista[0]
+        slot = primeiro.get("timeslot_id") if isinstance(primeiro, dict) else primeiro
+        out["primeiro_slot"] = primeiro
+    if not slot:
+        out["motivo"] = ("Sua loja não tem horários (slots) de Flash Sale liberados agora. A Shopee "
+                         "concede slots de Flash Sale da Loja por elegibilidade (reputação e histórico "
+                         "da loja). Sem slot, o relâmpago não pode ser criado — não é um erro do sistema, "
+                         "é uma limitação da Shopee para a sua loja. O agente continua criando os "
+                         "Descontos normalmente.")
+        return out
+
+    # Passo 2 — criar a flash sale no slot futuro
+    fid = None
+    try:
+        cr = shopee._chamar(user_id, "/api/v2/shop_flash_sale/create_shop_flash_sale", metodo="POST",
+                            extra={"timeslot_id": int(slot)})
+        out["etapas"].append({"passo": "create_shop_flash_sale", "resposta": cr})
+        fid = (cr.get("response") or {}).get("flash_sale_id")
+    except Exception as e:
+        out["etapas"].append({"passo": "create_shop_flash_sale", "erro": str(e)})
+    if not fid:
+        out["motivo"] = ("Havia slot disponível, mas a Shopee não criou a oferta relâmpago. Veja a "
+                         "resposta crua de create_shop_flash_sale acima para o motivo exato.")
+        return out
+
+    # Passo 3 — adicionar 1 item
+    reserva = int(getattr(cfg_v, "reserva_estoque", 0) or 0)
+    estoque = int(cand.get("estoque") or 0)
+    try:
+        itens = shopee._expandir_itens_flash(user_id, [
+            {"item_id": iid, "preco": cand["preco_promo"], "stock": max(1, estoque - reserva)}])
+        out["payload_enviado"] = itens
+        adi = shopee._chamar(user_id, "/api/v2/shop_flash_sale/add_shop_flash_sale_items", metodo="POST",
+                             extra={"flash_sale_id": fid, "items": itens})
+        out["etapas"].append({"passo": "add_shop_flash_sale_items", "resposta": adi})
+        resp = adi.get("response") or {}
+        out["failed_items"] = resp.get("failed_items") or resp.get("fail_list") or []
+        out["ok"] = not out["failed_items"]
+        if out["failed_items"]:
+            out["motivo"] = ("A oferta foi criada, mas o produto foi rejeitado ao ser anexado (preço "
+                             "promocional abaixo do permitido, estoque insuficiente, ou produto inelegível). "
+                             "Veja failed_items acima.")
+    except Exception as e:
+        out["etapas"].append({"passo": "add_shop_flash_sale_items", "erro": str(e)})
+
+    # limpeza — apaga a oferta de teste (está num horário futuro, invisível ao comprador)
+    try:
+        shopee._chamar(user_id, "/api/v2/shop_flash_sale/delete_shop_flash_sale", metodo="POST",
+                       extra={"flash_sale_id": int(fid)})
+        out["teste_apagado"] = True
+    except Exception:
+        out["teste_apagado"] = False
+        out["aviso"] = f"Não consegui apagar a oferta de teste (id {fid}); apague manualmente na Shopee se aparecer (está em Ofertas Relâmpago futuras)."
+    if out["ok"]:
+        out["motivo"] = ("Tudo certo! Sua loja TEM slots e o produto foi aceito na Flash Sale. O agente "
+                         "consegue criar relâmpagos — a oferta de teste foi apagada.")
+    return out
+
+
 def propor(user_id: int) -> dict:
     """Monta as propostas de promoção (não cria nada). Para revisão no modo sugerir."""
     db = SessionLocal()
