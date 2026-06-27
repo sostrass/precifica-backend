@@ -882,10 +882,32 @@ def shopee_pedido_detalhe(order_sn: str, user: User = Depends(auth.get_current_u
 
 
 @app.get("/api/shopee/pedidos/painel")
-def shopee_pedidos_painel(status: str = "A_ENVIAR", dias: int = 15, user: User = Depends(auth.get_current_user)):
-    """Pedidos enriquecidos + análise de valor (pago x preço de tabela)."""
+def shopee_pedidos_painel(status: str = "A_ENVIAR", dias: int = 15, page: int = 1, page_size: int = 20,
+                          busca: str = "", busca_tipo: str = "tudo", grupo: str = "todos", nf: str = "todos",
+                          user: User = Depends(auth.get_current_user)):
+    """Pedidos enriquecidos + análise de valor (pago x preço de tabela), PAGINADO.
+    Filtros: status (Meus Pedidos), grupo (aberto/concluído), nf (situação da NF), busca+busca_tipo."""
     try:
-        return shopee.pedidos_painel(user.id, status=status, dias=dias)
+        return shopee.pedidos_painel(user.id, status=status, dias=dias, page=page, page_size=page_size,
+                                     busca=busca, busca_tipo=busca_tipo, grupo=grupo, nf=nf)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/pedidos/contagens")
+def shopee_pedidos_contagens(dias: int = 15, user: User = Depends(auth.get_current_user)):
+    """Contadores por status (selos das abas) — chamada barata, só lista de SNs."""
+    try:
+        return shopee.contagens_status(user.id, dias=dias)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/pedidos/contagens-nf")
+def shopee_pedidos_contagens_nf(status: str = "TODOS", dias: int = 15, user: User = Depends(auth.get_current_user)):
+    """Contadores por situação de NF (Bling) + selos por pedido. Chamado de forma assíncrona."""
+    try:
+        return shopee.contagens_nf(user.id, status=status, dias=dias)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

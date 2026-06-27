@@ -346,13 +346,18 @@ def responder_avaliacao(user_id: int, comment_id, texto: str) -> dict:
 
 
 # ------------------------------- Pedidos ---------------------------------- #
+_ABERTOS = ["UNPAID", "READY_TO_SHIP", "PROCESSED", "RETRY_SHIP", "SHIPPED", "TO_CONFIRM_RECEIVE"]
 _STATUS_PEDIDO = {
-    "A_ENVIAR": ["READY_TO_SHIP", "PROCESSED"],
-    "ENVIADO": ["SHIPPED"],
-    "CONCLUIDO": ["COMPLETED"],
-    "CANCELADO": ["CANCELLED", "IN_CANCEL"],
+    "TODOS": _ABERTOS + ["COMPLETED", "IN_CANCEL", "CANCELLED", "TO_RETURN"],
     "NAO_PAGO": ["UNPAID"],
+    "A_ENVIAR": ["READY_TO_SHIP", "PROCESSED", "RETRY_SHIP"],
+    "ENVIADO": ["SHIPPED", "TO_CONFIRM_RECEIVE"],
+    "CONCLUIDO": ["COMPLETED"],
+    "RETORNOS": ["CANCELLED", "IN_CANCEL", "TO_RETURN"],
+    "CANCELADO": ["CANCELLED", "IN_CANCEL", "TO_RETURN"],
 }
+# agrupamento "Status do Pedido": aberto x concluído
+_ABERTOS_SET = set(_ABERTOS)
 
 
 def _margem_real_shopee(cfg_prec: dict, preco: float, custo) -> dict | None:
@@ -380,40 +385,44 @@ def _margem_real_shopee(cfg_prec: dict, preco: float, custo) -> dict | None:
             "margem_pct": round(lucro / preco * 100, 1) if tem_custo else None}
 
 
-def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limite: int = 100) -> dict:
-    """Pedidos enriquecidos (produto, SKU, imagem, valor pago) + análise de valor:
-    compara o que o comprador pagou com o seu preço de tabela (catálogo) e marca
-    quando a venda saiu abaixo do preço. Ordena pelos mais urgentes (ship_by)."""
-    from . import catalogo
-    agora = int(time.time())
-    inicio = agora - max(1, dias) * 86400
-    statuses = _STATUS_PEDIDO.get(status, ["READY_TO_SHIP"])
-
-    sns = []
+def _coletar_sns(user_id: int, statuses: list, inicio: int, agora: int, limite: int = 500) -> list:
+    """Coleta SÓ os order_sn (chamada barata get_order_list, sem detalhes). Ordena por
+    create_time desc (mais recentes primeiro) quando disponível."""
+    pares = []  # (create_time, order_sn)
+    vistos = set()
     for st in statuses:
         cursor = ""
-        for _ in range(6):
-            r = _chamar(user_id, "/api/v2/order/get_order_list",
-                        extra={"time_range_field": "create_time", "time_from": inicio, "time_to": agora,
-                               "page_size": 100, "cursor": cursor, "order_status": st})
+        for _ in range(8):
+            try:
+                r = _chamar(user_id, "/api/v2/order/get_order_list",
+                            extra={"time_range_field": "create_time", "time_from": inicio, "time_to": agora,
+                                   "page_size": 100, "cursor": cursor, "order_status": st,
+                                   "response_optional_fields": "order_status"})
+            except ShopeeError:
+                break
             resp = r.get("response") or {}
             for o in (resp.get("order_list") or []):
-                if o.get("order_sn"):
-                    sns.append(o["order_sn"])
+                sn = o.get("order_sn")
+                if sn and sn not in vistos:
+                    vistos.add(sn)
+                    pares.append((o.get("create_time") or 0, sn))
             cursor = resp.get("next_cursor") or ""
-            if not resp.get("more") or not cursor or len(sns) >= limite:
+            if not resp.get("more") or not cursor or len(pares) >= limite:
                 break
-        if len(sns) >= limite:
+        if len(pares) >= limite:
             break
-    sns = sns[:limite]
+    pares.sort(key=lambda x: x[0], reverse=True)
+    return [sn for _, sn in pares[:limite]]
 
-    from . import catalogo, precificacao
-    cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
-    cfg_prec = precificacao.obter_config(user_id)
-    margem_alvo = float(cfg_prec.get("margem_padrao") or 0)
-    pedidos = []
+
+def _detalhar_pedidos(user_id: int, sns: list, cat: dict, cfg_prec: dict, margem_alvo: float) -> list:
+    """Busca get_order_detail em lotes de 50 e monta os pedidos enriquecidos (margem real,
+    comprador, endereço, itens). Preserva a ordem de `sns`."""
+    por_sn = {}
     for i in range(0, len(sns), 50):
         lote = sns[i:i + 50]
+        if not lote:
+            continue
         try:
             rd = _chamar(user_id, "/api/v2/order/get_order_detail",
                          extra={"order_sn_list": ",".join(lote),
@@ -452,8 +461,9 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
                     "liquido": mr.get("liquido") if mr else None, "taxas_mkt": mr.get("taxas") if mr else None,
                 })
             rec = o.get("recipient_address") or {}
-            pedidos.append({
-                "order_sn": o.get("order_sn"), "status": o.get("order_status"),
+            sn = o.get("order_sn")
+            por_sn[sn] = {
+                "order_sn": sn, "status": o.get("order_status"),
                 "comprador": o.get("buyer_username") or rec.get("name") or "—",
                 "cliente": rec.get("name"), "cidade": rec.get("city"), "uf": rec.get("state"),
                 "endereco": {"nome": rec.get("name"), "telefone": rec.get("phone"),
@@ -464,17 +474,196 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
                 "total_pago": round(total, 2), "abaixo_meta": abaixo_meta, "prejuizo": prejuizo,
                 "sem_cadastro": sem_cad, "lucro_real": round(lucro_pedido, 2) if tem_lucro else None,
                 "itens": itens,
-            })
-    pedidos.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
+            }
+    return [por_sn[sn] for sn in sns if sn in por_sn]
+
+
+def _resumo_pedidos(pedidos: list, margem_alvo: float, total_geral: int | None = None) -> dict:
     lucros = [p["lucro_real"] for p in pedidos if p.get("lucro_real") is not None]
-    resumo = {"total": len(pedidos),
-              "abaixo_meta": sum(1 for p in pedidos if p["abaixo_meta"] or p["prejuizo"]),
-              "prejuizo": sum(1 for p in pedidos if p["prejuizo"]),
-              "receita": round(sum(p["total_pago"] for p in pedidos), 2),
-              "unidades": sum(sum(i["qtd"] for i in p["itens"]) for p in pedidos),
-              "lucro_real": round(sum(lucros), 2) if lucros else None,
-              "margem_alvo": margem_alvo, "cobertura_lucro": len(lucros)}
-    return {"status": status, "pedidos": pedidos, "resumo": resumo, "margem_alvo": margem_alvo}
+    return {"total": total_geral if total_geral is not None else len(pedidos),
+            "total_pagina": len(pedidos),
+            "abaixo_meta": sum(1 for p in pedidos if p["abaixo_meta"] or p["prejuizo"]),
+            "prejuizo": sum(1 for p in pedidos if p["prejuizo"]),
+            "receita": round(sum(p["total_pago"] for p in pedidos), 2),
+            "unidades": sum(sum(i["qtd"] for i in p["itens"]) for p in pedidos),
+            "lucro_real": round(sum(lucros), 2) if lucros else None,
+            "margem_alvo": margem_alvo, "cobertura_lucro": len(lucros)}
+
+
+def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limite: int = 100,
+                   page: int = 1, page_size: int = 20, busca: str = "", busca_tipo: str = "tudo",
+                   grupo: str = "todos", nf: str = "todos") -> dict:
+    """Pedidos enriquecidos + análise de valor, PAGINADO. Carrega só os order_sn de início
+    (barato) e detalha apenas a página atual — assim não trava com volume alto.
+
+    busca/busca_tipo: filtra (pedido | comprador | produto | tudo). grupo: aberto|concluido|todos.
+    nf: filtra por situação da NF (pendente|recusado|autorizado|sem_nota|todos) — usa Bling.
+    `limite>page_size` (compat): se page_size>=limite (chamada antiga p/ separação), devolve tudo."""
+    from . import catalogo, precificacao
+    agora = int(time.time())
+    inicio = agora - max(1, dias) * 86400
+    statuses = _STATUS_PEDIDO.get(status, ["READY_TO_SHIP"])
+
+    # modo legado (lista_separacao chama com limite=300 e sem paginação): devolve tudo
+    legado = page_size >= limite
+
+    sns = _coletar_sns(user_id, statuses, inicio, agora, limite=max(limite, 600 if not legado else limite))
+
+    # filtro do grupo "Status do Pedido" (aberto x concluído) por status do SN — feito no detalhe
+    busca = (busca or "").strip()
+    bt = (busca_tipo or "tudo").lower()
+
+    cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    cfg_prec = precificacao.obter_config(user_id)
+    margem_alvo = float(cfg_prec.get("margem_padrao") or 0)
+
+    # busca por #pedido é barata (na lista de SNs); demais precisam do detalhe
+    if busca and bt in ("pedido", "tudo"):
+        bl = busca.lower()
+        sns_match = [s for s in sns if bl in s.lower()]
+    else:
+        sns_match = list(sns)
+
+    precisa_detalhe_total = bool(busca and bt in ("comprador", "produto", "tudo")) or grupo in ("aberto", "concluido") or nf not in ("todos", "", None)
+
+    if legado:
+        pedidos_full = _detalhar_pedidos(user_id, sns_match[:limite], cat, cfg_prec, margem_alvo)
+        pedidos_full.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
+        return {"status": status, "pedidos": pedidos_full,
+                "resumo": _resumo_pedidos(pedidos_full, margem_alvo), "margem_alvo": margem_alvo}
+
+    # mapa de NF (situação) para filtro/contagem, se necessário — Bling, cacheado, limitado
+    mapa_nf = {}
+    if precisa_detalhe_total or nf not in ("todos", "", None):
+        try:
+            from . import nfe as nfe_mod
+            mapa_nf = nfe_mod.nfe_por_pedidos(user_id, sns_match[:200], dias=max(dias, 30))
+        except Exception:  # noqa: BLE001
+            mapa_nf = {}
+
+    if precisa_detalhe_total:
+        # detalha um conjunto maior pra poder filtrar por comprador/produto/grupo/NF antes de paginar
+        base = _detalhar_pedidos(user_id, sns_match[:200], cat, cfg_prec, margem_alvo)
+        if busca and bt in ("comprador", "produto", "tudo"):
+            bl = busca.lower()
+            def _bate(p):
+                if bt == "comprador":
+                    return bl in (p.get("comprador") or "").lower() or bl in (p.get("cliente") or "").lower()
+                if bt == "produto":
+                    return any(bl in (i.get("nome") or "").lower() or bl in (i.get("sku") or "").lower() for i in p.get("itens") or [])
+                return (bl in (p.get("comprador") or "").lower() or bl in (p.get("cliente") or "").lower()
+                        or bl in (p.get("order_sn") or "").lower()
+                        or any(bl in (i.get("nome") or "").lower() or bl in (i.get("sku") or "").lower() for i in p.get("itens") or []))
+            base = [p for p in base if _bate(p)]
+        if grupo == "aberto":
+            base = [p for p in base if (p.get("status") in _ABERTOS_SET)]
+        elif grupo == "concluido":
+            base = [p for p in base if p.get("status") == "COMPLETED"]
+        if nf not in ("todos", "", None):
+            base = [p for p in base if _nf_situacao_grupo((mapa_nf.get(p["order_sn"]) or {}).get("nfe_situacao")) == nf]
+        base.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
+        total = len(base)
+        ini = (max(1, page) - 1) * page_size
+        pagina = base[ini:ini + page_size]
+    else:
+        total = len(sns_match)
+        ini = (max(1, page) - 1) * page_size
+        page_sns = sns_match[ini:ini + page_size]
+        pagina = _detalhar_pedidos(user_id, page_sns, cat, cfg_prec, margem_alvo)
+        pagina.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
+        # NF da página (best-effort) pra mostrar selo
+        if not mapa_nf:
+            try:
+                from . import nfe as nfe_mod
+                mapa_nf = nfe_mod.nfe_por_pedidos(user_id, [p["order_sn"] for p in pagina], dias=max(dias, 30))
+            except Exception:  # noqa: BLE001
+                mapa_nf = {}
+
+    for p in pagina:
+        info = mapa_nf.get(p["order_sn"])
+        if info:
+            p["nfe_numero"] = info.get("nfe_numero")
+            p["nfe_situacao"] = info.get("nfe_situacao")
+            p["nfe_situacao_label"] = info.get("nfe_situacao_label")
+
+    paginas = max(1, (total + page_size - 1) // page_size)
+    return {"status": status, "pedidos": pagina, "resumo": _resumo_pedidos(pagina, margem_alvo, total_geral=total),
+            "margem_alvo": margem_alvo, "page": max(1, page), "page_size": page_size,
+            "paginas": paginas, "total": total, "tem_mais": max(1, page) < paginas}
+
+
+def _nf_situacao_grupo(cod) -> str:
+    """Códigos Bling -> grupo da aba de NF. 1=Pendente, 4=Rejeitada(Recusado), 5/6=Autorizada."""
+    try:
+        c = int(cod)
+    except (TypeError, ValueError):
+        return "sem_nota"
+    if c in (1, 3, 8):
+        return "pendente"
+    if c in (4, 9):
+        return "recusado"
+    if c in (5, 6, 7):
+        return "autorizado"
+    return "sem_nota"
+
+
+def contagens_status(user_id: int, dias: int = 15) -> dict:
+    """Contadores por status (chamada barata: lista de SNs SEM detalhes, numa passada só).
+    Alimenta os selos das abas 'Meus Pedidos' e 'Status do Pedido' (aberto x concluído)."""
+    agora = int(time.time())
+    inicio = agora - max(1, dias) * 86400
+    buckets: dict = {}
+    cursor = ""
+    total = 0
+    for _ in range(20):
+        try:
+            r = _chamar(user_id, "/api/v2/order/get_order_list",
+                        extra={"time_range_field": "create_time", "time_from": inicio, "time_to": agora,
+                               "page_size": 100, "cursor": cursor, "response_optional_fields": "order_status"})
+        except ShopeeError:
+            break
+        resp = r.get("response") or {}
+        lista = resp.get("order_list") or []
+        for o in lista:
+            st = o.get("order_status") or "?"
+            buckets[st] = buckets.get(st, 0) + 1
+            total += 1
+        cursor = resp.get("next_cursor") or ""
+        if not resp.get("more") or not cursor or total >= 3000:
+            break
+    g = lambda *sts: sum(buckets.get(s, 0) for s in sts)  # noqa: E731
+    nao_pago = g("UNPAID")
+    a_enviar = g("READY_TO_SHIP", "PROCESSED", "RETRY_SHIP")
+    enviado = g("SHIPPED", "TO_CONFIRM_RECEIVE")
+    concluido = g("COMPLETED")
+    retornos = g("CANCELLED", "IN_CANCEL", "TO_RETURN")
+    em_aberto = nao_pago + a_enviar + enviado
+    return {"nao_pago": nao_pago, "a_enviar": a_enviar, "enviado": enviado,
+            "concluido": concluido, "retornos": retornos,
+            "em_aberto": em_aberto, "todos": total}
+
+
+def contagens_nf(user_id: int, status: str = "TODOS", dias: int = 15) -> dict:
+    """Contadores por situação de NF (Bling, cacheado, limitado) para o status atual, +
+    o mapa {order_sn: situacao} pra o front mostrar os selos sem recarregar."""
+    agora = int(time.time())
+    inicio = agora - max(1, dias) * 86400
+    statuses = _STATUS_PEDIDO.get(status, _STATUS_PEDIDO["TODOS"])
+    sns = _coletar_sns(user_id, statuses, inicio, agora, limite=300)
+    try:
+        from . import nfe as nfe_mod
+        mapa = nfe_mod.nfe_por_pedidos(user_id, sns, dias=max(dias, 30))
+    except Exception:  # noqa: BLE001
+        mapa = {}
+    cont = {"pendente": 0, "recusado": 0, "autorizado": 0, "sem_nota": 0}
+    selos = {}
+    for sn in sns:
+        g = _nf_situacao_grupo((mapa.get(sn) or {}).get("nfe_situacao"))
+        cont[g] = cont.get(g, 0) + 1
+        if g != "sem_nota":
+            selos[sn] = {"grupo": g, "numero": (mapa.get(sn) or {}).get("nfe_numero"),
+                         "label": (mapa.get(sn) or {}).get("nfe_situacao_label")}
+    return {"contagens": cont, "selos": selos, "total": len(sns)}
 
 
 def lista_separacao(user_id: int, status: str = "A_ENVIAR", dias: int = 15) -> dict:

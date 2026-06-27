@@ -501,6 +501,8 @@ def nfe_por_pedidos(user_id: int, order_sns: list, dias: int = 60,
                 "nfe_emissao": _fmt_data_br(det.get("data_emissao")),
                 "valor_total": det.get("valor_nota"),
                 "nfe_chave": det.get("chave_acesso"),
+                "nfe_situacao": det.get("situacao"),
+                "nfe_situacao_label": det.get("situacao_label") or situacao_label(det.get("situacao")),
             }
             faltam.discard(ped)
         if len(linhas) < 100:
