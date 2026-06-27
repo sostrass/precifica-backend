@@ -426,7 +426,7 @@ def _detalhar_pedidos(user_id: int, sns: list, cat: dict, cfg_prec: dict, margem
         try:
             rd = _chamar(user_id, "/api/v2/order/get_order_detail",
                          extra={"order_sn_list": ",".join(lote),
-                                "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time,note"})
+                                "response_optional_fields": "item_list,recipient_address,buyer_username,pay_time,note,payment_method,cod"})
         except ShopeeError:
             continue
         for o in ((rd.get("response") or {}).get("order_list") or []):
@@ -464,6 +464,7 @@ def _detalhar_pedidos(user_id: int, sns: list, cat: dict, cfg_prec: dict, margem
             sn = o.get("order_sn")
             por_sn[sn] = {
                 "order_sn": sn, "status": o.get("order_status"),
+                "pagamento": o.get("payment_method"), "cod": bool(o.get("cod")),
                 "comprador": o.get("buyer_username") or rec.get("name") or "—",
                 "cliente": rec.get("name"), "cidade": rec.get("city"), "uf": rec.get("state"),
                 "endereco": {"nome": rec.get("name"), "telefone": rec.get("phone"),
