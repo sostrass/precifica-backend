@@ -1118,9 +1118,21 @@ def shopee_devolucoes(dias: int = 30, user: User = Depends(auth.get_current_user
 # ---- Divergência Bling × Shopee ----
 @app.get("/api/shopee/divergencia")
 def shopee_divergencia(user: User = Depends(auth.get_current_user)):
-    """Cruza preço do anúncio Shopee × preço registrado no Bling (cache), por SKU."""
+    """Margem real de cada anúncio Shopee × custo do Bling (por SKU): prejuízo, margem baixa
+    ou saudável, com preço de equilíbrio e preço para a margem alvo."""
     try:
         return shopee.divergencia_bling_shopee(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/item/preco")
+def shopee_item_preco(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Ajusta o preço de um anúncio na Shopee (todas as variações). Body: {item_id, preco}."""
+    try:
+        return shopee.atualizar_preco_item(user.id, payload["item_id"], payload["preco"])
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Informe item_id e preco.")
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

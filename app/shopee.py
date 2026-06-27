@@ -1651,33 +1651,128 @@ def catalogo_shopee(user_id: int, paginas: int = 5) -> list:
     return out
 
 
+def _taxa_shopee_faixa(faixas, preco):
+    from . import precificacao
+    fx = precificacao._faixa_para_preco(faixas, preco) if faixas else {}
+    return preco * (float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)) / 100.0 + float(fx.get("fixo") or 0)
+
+
+def _lucro_shopee(faixas, imposto, embalagem, custo, preco):
+    return preco - _taxa_shopee_faixa(faixas, preco) - preco * imposto / 100.0 - embalagem - custo
+
+
+def _preco_para_margem_shopee(faixas, imposto, embalagem, custo, alvo_pct):
+    """Menor preço de lista onde a margem real >= alvo_pct (busca binária — o lucro cresce
+    com o preço). alvo_pct=0 dá o preço de equilíbrio (zero a zero)."""
+    if custo <= 0:
+        return None
+    lo, hi = 0.5, max(custo * 6, custo + 80, 20)
+    for _ in range(8):  # garante que o teto atinge a meta
+        l = _lucro_shopee(faixas, imposto, embalagem, custo, hi)
+        if (l / hi * 100 if hi > 0 else -999) >= alvo_pct:
+            break
+        hi *= 1.8
+    for _ in range(46):
+        mid = (lo + hi) / 2
+        l = _lucro_shopee(faixas, imposto, embalagem, custo, mid)
+        m = (l / mid * 100) if mid > 0 else -999
+        if m < alvo_pct:
+            lo = mid
+        else:
+            hi = mid
+    return round(hi, 2)
+
+
 def divergencia_bling_shopee(user_id: int) -> dict:
-    """Cruza o preço do anúncio na Shopee com o preço registrado no Bling (cache),
-    casando por SKU. Aponta divergências e prejuízo (Shopee < custo Bling)."""
+    """Margem REAL de cada anúncio da Shopee — não a comparação crua de preços. Para cada anúncio
+    casado por SKU com o Bling: lucro = preço − taxa Shopee (comissão+fixo da faixa) − imposto −
+    embalagem − custo. Classifica em PREJUÍZO, MARGEM BAIXA (abaixo do alvo) e SAUDÁVEL, e calcula
+    o preço de equilíbrio e o preço para a margem alvo."""
     from .models import ProdutoCache
+    from . import precificacao
     db = SessionLocal()
     try:
         cache = {p.sku: p for p in db.query(ProdutoCache).filter_by(user_id=user_id).all() if p.sku}
     finally:
         db.close()
+    cfg = precificacao.obter_config(user_id)
+    canal = precificacao._canal_cfg(cfg, "shopee") or {}
+    faixas = canal.get("faixas") or []
+    imposto = float(cfg.get("imposto") or 0)
+    embalagem = float(cfg.get("embalagem") or 0)
+    alvo = float(cfg.get("margem_padrao") or 0)
+
     itens = catalogo_shopee(user_id)
-    linhas, sem_match = [], 0
+    linhas, sem_match, sem_custo = [], 0, 0
     for it in itens:
         p = cache.get(it["sku"])
         if not p:
             sem_match += 1
             continue
-        diff = it["preco"] - (p.preco or 0)
+        preco = float(it["preco"] or 0)
+        custo = float(p.custo or 0)
+        tem_custo = custo > 0 and preco > 0
+        taxa = round(_taxa_shopee_faixa(faixas, preco), 2)
+        imp = round(preco * imposto / 100.0, 2)
+        emb = round(embalagem, 2)
+        lucro = round(preco - taxa - imp - emb - custo, 2) if tem_custo else None
+        margem = round(lucro / preco * 100, 1) if (tem_custo and preco > 0) else None
+        preco_min = _preco_para_margem_shopee(faixas, imposto, embalagem, custo, 0) if tem_custo else None
+        preco_alvo = _preco_para_margem_shopee(faixas, imposto, embalagem, custo, alvo) if (tem_custo and alvo > 0) else None
+        prejuizo = bool(tem_custo and lucro is not None and lucro < 0)
+        margem_baixa = bool(tem_custo and not prejuizo and alvo > 0 and margem is not None and margem < alvo)
+        if not tem_custo:
+            sem_custo += 1
         linhas.append({
             "item_id": it["item_id"], "nome": it["nome"], "sku": it["sku"],
-            "preco_shopee": it["preco"], "preco_bling": p.preco, "custo": p.custo,
-            "diferenca": round(diff, 2),
-            "divergente": abs(diff) > 0.01,
-            "prejuizo": bool(it["preco"] > 0 and p.custo and it["preco"] < p.custo),
+            "preco": round(preco, 2), "custo": round(custo, 2) if custo > 0 else None,
+            "preco_bling": p.preco,
+            "taxa_shopee": taxa, "imposto": imp, "embalagem": emb,
+            "lucro_real": lucro, "margem_real": margem,
+            "preco_min": preco_min, "preco_alvo": preco_alvo,
+            "sem_custo": not tem_custo, "prejuizo": prejuizo, "margem_baixa": margem_baixa,
+            "saudavel": bool(tem_custo and not prejuizo and not margem_baixa),
         })
-    return {"total": len(itens), "casados": len(linhas), "sem_match": sem_match,
-            "divergentes": sum(1 for l in linhas if l["divergente"]),
-            "prejuizo": sum(1 for l in linhas if l["prejuizo"]), "itens": linhas}
+
+    def _sev(l):
+        if l["prejuizo"]:
+            return (0, l["lucro_real"] if l["lucro_real"] is not None else 0)
+        if l["margem_baixa"]:
+            return (1, l["margem_real"] if l["margem_real"] is not None else 0)
+        if l["sem_custo"]:
+            return (3, str(l["nome"] or ""))
+        return (2, l["margem_real"] if l["margem_real"] is not None else 0)
+    linhas.sort(key=_sev)
+
+    return {
+        "total": len(itens), "casados": len(linhas), "sem_match": sem_match, "sem_custo": sem_custo,
+        "prejuizo": sum(1 for l in linhas if l["prejuizo"]),
+        "margem_baixa": sum(1 for l in linhas if l["margem_baixa"]),
+        "saudavel": sum(1 for l in linhas if l["saudavel"]),
+        "alvo": alvo, "imposto": imposto, "embalagem": embalagem,
+        "itens": linhas,
+    }
+
+
+def atualizar_preco_item(user_id: int, item_id, novo_preco: float) -> dict:
+    """Atualiza o preço de um anúncio na Shopee, aplicando o mesmo preço a TODAS as variações
+    (modelos). Usado pela tela Bling × Shopee para corrigir produtos no prejuízo."""
+    item_id = int(item_id)
+    novo_preco = round(float(novo_preco), 2)
+    if novo_preco <= 0:
+        raise ShopeeError("Preço inválido.")
+    try:
+        modelos = modelos_item(user_id, item_id)
+    except ShopeeError:
+        modelos = []
+    price_list = [{"model_id": m.get("model_id"), "original_price": novo_preco}
+                  for m in modelos if m.get("model_id") is not None]
+    if not price_list:
+        price_list = [{"model_id": 0, "original_price": novo_preco}]
+    r = _chamar(user_id, "/api/v2/product/update_price", metodo="POST",
+                extra={"item_id": item_id, "price_list": price_list})
+    return {"ok": True, "item_id": str(item_id), "novo_preco": novo_preco,
+            "modelos_atualizados": len(price_list), "response": r.get("response")}
 
 
 # --------------------------- Bundle Deal ---------------------------------- #
