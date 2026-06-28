@@ -1828,6 +1828,7 @@ def catalogo_shopee(user_id: int, paginas: int = 5) -> list:
             for b in base:
                 out.append({"item_id": str(b.get("item_id")), "nome": b.get("item_name"),
                             "sku": b.get("item_sku"), "preco": _preco_item(b),
+                            "imagem": ((b.get("image") or {}).get("image_url_list") or [None])[0],
                             "status": b.get("item_status")})
         if not resp.get("has_next_page"):
             break
@@ -1886,6 +1887,9 @@ def divergencia_bling_shopee(user_id: int) -> dict:
     embalagem = float(cfg.get("embalagem") or 0)
     alvo = float(cfg.get("margem_padrao") or 0)
 
+    from . import radar as _radar
+    monitorados = set(_radar.skus_monitorados(user_id))
+
     itens = catalogo_shopee(user_id)
     linhas, sem_match, sem_custo = [], 0, 0
     for it in itens:
@@ -1905,17 +1909,24 @@ def divergencia_bling_shopee(user_id: int) -> dict:
         preco_alvo = _preco_para_margem_shopee(faixas, imposto, embalagem, custo, alvo) if (tem_custo and alvo > 0) else None
         prejuizo = bool(tem_custo and lucro is not None and lucro < 0)
         margem_baixa = bool(tem_custo and not prejuizo and alvo > 0 and margem is not None and margem < alvo)
+        saudavel = bool(tem_custo and not prejuizo and not margem_baixa)
+        monitorado = it["sku"] in monitorados
+        concorrente = _radar.menor_preco_concorrente(user_id, it["sku"]) if monitorado else None
+        em_competicao = bool(monitorado and concorrente is not None and not saudavel and preco_alvo is not None and preco_alvo > concorrente)
         if not tem_custo:
             sem_custo += 1
         linhas.append({
-            "item_id": it["item_id"], "nome": it["nome"], "sku": it["sku"],
+            "item_id": it["item_id"], "produto_id": p.produto_id, "nome": it["nome"], "sku": it["sku"],
+            "imagem": it.get("imagem"), "saldo": float(p.saldo or 0),
             "preco": round(preco, 2), "custo": round(custo, 2) if custo > 0 else None,
             "preco_bling": p.preco,
             "taxa_shopee": taxa, "imposto": imp, "embalagem": emb,
             "lucro_real": lucro, "margem_real": margem,
             "preco_min": preco_min, "preco_alvo": preco_alvo,
+            "concorrente": round(concorrente, 2) if concorrente is not None else None,
+            "monitorado": monitorado, "em_competicao": em_competicao,
             "sem_custo": not tem_custo, "prejuizo": prejuizo, "margem_baixa": margem_baixa,
-            "saudavel": bool(tem_custo and not prejuizo and not margem_baixa),
+            "saudavel": saudavel,
         })
 
     def _sev(l):

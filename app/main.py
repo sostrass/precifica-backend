@@ -1365,6 +1365,12 @@ def atualizar_produto(produto_id: int, payload: dict = Body(...),
             raise HTTPException(status_code=401, detail=str(e))
         sku = payload.get("sku") or payload.get("codigo")
         webhooks.registrar_envio(db, user.id, produto_id, sku, sorted(payload.keys()))
+        if "precoCusto" in campos:  # reflete o novo custo no cache local (sem esperar o webhook)
+            from .models import ProdutoCache
+            pc = db.query(ProdutoCache).filter_by(user_id=user.id, produto_id=str(produto_id)).first()
+            if pc:
+                pc.custo = float(campos["precoCusto"] or 0)
+                db.commit()
     finally:
         db.close()
     return {"ok": True, "atualizados": sorted(campos.keys())}
