@@ -1812,19 +1812,22 @@ def _preco_item(info: dict) -> float:
     return float(info.get("current_price") or 0)
 
 
-def catalogo_shopee(user_id: int, paginas: int = 5) -> list:
-    """Lista anúncios da Shopee com preço e SKU (até N páginas de 50)."""
+def catalogo_shopee(user_id: int, max_paginas: int = 400) -> list:
+    """Lista TODOS os anúncios da Shopee com preço e SKU. Pagina por offset (100/página)
+    até a Shopee dizer que não há mais (has_next_page False), com um teto de segurança alto.
+    O get_item_base_info aceita no máx. 50 item_ids por chamada, então o info é fatiado em 50."""
     out = []
     offset = 0
-    for _ in range(paginas):
-        r = listar_itens(user_id, offset=offset, limite=50)
+    for _ in range(max_paginas):
+        r = listar_itens(user_id, offset=offset, limite=100)
         resp = r.get("response") or {}
         lista = resp.get("item") or []
         if not lista:
             break
         ids = [it.get("item_id") for it in lista if it.get("item_id")]
-        if ids:
-            base = (info_itens(user_id, ids).get("response") or {}).get("item_list") or []
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            base = (info_itens(user_id, chunk).get("response") or {}).get("item_list") or []
             for b in base:
                 out.append({"item_id": str(b.get("item_id")), "nome": b.get("item_name"),
                             "sku": b.get("item_sku"), "preco": _preco_item(b),
@@ -1832,7 +1835,7 @@ def catalogo_shopee(user_id: int, paginas: int = 5) -> list:
                             "status": b.get("item_status")})
         if not resp.get("has_next_page"):
             break
-        offset = resp.get("next_offset", offset + 50)
+        offset = resp.get("next_offset", offset + 100)
     return out
 
 
