@@ -533,9 +533,9 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
         return {"status": status, "pedidos": pedidos_full,
                 "resumo": _resumo_pedidos(pedidos_full, margem_alvo), "margem_alvo": margem_alvo}
 
-    # mapa de NF (situação) para filtro/contagem, se necessário — Bling, cacheado, limitado
+    # mapa de NF só quando há filtro de NF (evita travar a lista esperando o Bling)
     mapa_nf = {}
-    if precisa_detalhe_total or nf not in ("todos", "", None):
+    if nf not in ("todos", "", None):
         try:
             from . import nfe as nfe_mod
             mapa_nf = nfe_mod.nfe_por_pedidos(user_id, sns_match[:200], dias=max(dias, 30))
@@ -572,13 +572,7 @@ def pedidos_painel(user_id: int, status: str = "A_ENVIAR", dias: int = 15, limit
         page_sns = sns_match[ini:ini + page_size]
         pagina = _detalhar_pedidos(user_id, page_sns, cat, cfg_prec, margem_alvo)
         pagina.sort(key=lambda x: x.get("ship_by") or 9_000_000_000_000)
-        # NF da página (best-effort) pra mostrar selo
-        if not mapa_nf:
-            try:
-                from . import nfe as nfe_mod
-                mapa_nf = nfe_mod.nfe_por_pedidos(user_id, [p["order_sn"] for p in pagina], dias=max(dias, 30))
-            except Exception:  # noqa: BLE001
-                mapa_nf = {}
+        # selo de NF vem da chamada separada (contagens_nf) — não bloqueia a lista
 
     for p in pagina:
         info = mapa_nf.get(p["order_sn"])
