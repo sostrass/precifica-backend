@@ -1869,10 +1869,11 @@ def _preco_para_margem_shopee(faixas, imposto, embalagem, custo, alvo_pct):
 
 
 def divergencia_bling_shopee(user_id: int) -> dict:
-    """Margem REAL de cada anúncio da Shopee — não a comparação crua de preços. Para cada anúncio
-    casado por SKU com o Bling: lucro = preço − taxa Shopee (comissão+fixo da faixa) − imposto −
-    embalagem − custo. Classifica em PREJUÍZO, MARGEM BAIXA (abaixo do alvo) e SAUDÁVEL, e calcula
-    o preço de equilíbrio e o preço para a margem alvo."""
+    """Líquido REAL de cada anúncio da Shopee. O Preço Bling é o valor que o lojista quer RECEBER
+    líquido (o custo já está embutido nele). Para cada anúncio casado por SKU: líquido = preço Shopee
+    − taxa Shopee (comissão+fixo da faixa) − imposto − embalagem. Compara o líquido com o Preço Bling
+    e calcula o preço ideal — aquele em que o líquido bate exatamente o Preço Bling. Classifica em
+    PREJUÍZO (líquido < 0), ABAIXO (líquido < Preço Bling) e NO PADRÃO (líquido >= Preço Bling)."""
     from .models import ProdutoCache
     from . import precificacao
     db = SessionLocal()
@@ -1885,66 +1886,61 @@ def divergencia_bling_shopee(user_id: int) -> dict:
     faixas = canal.get("faixas") or []
     imposto = float(cfg.get("imposto") or 0)
     embalagem = float(cfg.get("embalagem") or 0)
-    alvo = float(cfg.get("margem_padrao") or 0)
 
     from . import radar as _radar
     monitorados = set(_radar.skus_monitorados(user_id))
 
     itens = catalogo_shopee(user_id)
-    linhas, sem_match, sem_custo = [], 0, 0
+    linhas, sem_match = [], 0
     for it in itens:
         p = cache.get(it["sku"])
         if not p:
             sem_match += 1
             continue
         preco = float(it["preco"] or 0)
-        custo = float(p.custo or 0)
-        tem_custo = custo > 0 and preco > 0
+        base = float(p.preco or 0)  # Preço Bling = líquido que o lojista quer receber
         taxa = round(_taxa_shopee_faixa(faixas, preco), 2)
         imp = round(preco * imposto / 100.0, 2)
         emb = round(embalagem, 2)
-        lucro = round(preco - taxa - imp - emb - custo, 2) if tem_custo else None
-        margem = round(lucro / preco * 100, 1) if (tem_custo and preco > 0) else None
-        preco_min = _preco_para_margem_shopee(faixas, imposto, embalagem, custo, 0) if tem_custo else None
-        preco_alvo = _preco_para_margem_shopee(faixas, imposto, embalagem, custo, alvo) if (tem_custo and alvo > 0) else None
-        prejuizo = bool(tem_custo and lucro is not None and lucro < 0)
-        margem_baixa = bool(tem_custo and not prejuizo and alvo > 0 and margem is not None and margem < alvo)
-        saudavel = bool(tem_custo and not prejuizo and not margem_baixa)
+        liquido = round(preco - taxa - imp - emb, 2) if preco > 0 else None
+        tem_base = base > 0 and preco > 0
+        preco_ideal = _preco_para_margem_shopee(faixas, imposto, embalagem, base, 0) if tem_base else None
+        diferenca = round(liquido - base, 2) if (tem_base and liquido is not None) else None
+        prejuizo = bool(tem_base and liquido is not None and liquido < 0)
+        abaixo = bool(tem_base and liquido is not None and not prejuizo and liquido < base)
+        cobre = bool(tem_base and liquido is not None and liquido >= base)
+        sem_base = not tem_base
         monitorado = it["sku"] in monitorados
         concorrente = _radar.menor_preco_concorrente(user_id, it["sku"]) if monitorado else None
-        em_competicao = bool(monitorado and concorrente is not None and not saudavel and preco_alvo is not None and preco_alvo > concorrente)
-        if not tem_custo:
-            sem_custo += 1
+        em_competicao = bool(monitorado and concorrente is not None and not cobre and preco_ideal is not None and preco_ideal > concorrente)
         linhas.append({
             "item_id": it["item_id"], "produto_id": p.produto_id, "nome": it["nome"], "sku": it["sku"],
             "imagem": it.get("imagem"), "saldo": float(p.saldo or 0),
-            "preco": round(preco, 2), "custo": round(custo, 2) if custo > 0 else None,
-            "preco_bling": p.preco,
+            "preco": round(preco, 2), "preco_bling": round(base, 2) if base > 0 else None,
             "taxa_shopee": taxa, "imposto": imp, "embalagem": emb,
-            "lucro_real": lucro, "margem_real": margem,
-            "preco_min": preco_min, "preco_alvo": preco_alvo,
+            "liquido": liquido, "diferenca": diferenca, "preco_ideal": preco_ideal,
             "concorrente": round(concorrente, 2) if concorrente is not None else None,
             "monitorado": monitorado, "em_competicao": em_competicao,
-            "sem_custo": not tem_custo, "prejuizo": prejuizo, "margem_baixa": margem_baixa,
-            "saudavel": saudavel,
+            "sem_base": sem_base, "prejuizo": prejuizo, "abaixo": abaixo, "cobre": cobre,
         })
 
     def _sev(l):
         if l["prejuizo"]:
-            return (0, l["lucro_real"] if l["lucro_real"] is not None else 0)
-        if l["margem_baixa"]:
-            return (1, l["margem_real"] if l["margem_real"] is not None else 0)
-        if l["sem_custo"]:
+            return (0, l["liquido"] if l["liquido"] is not None else 0)
+        if l["abaixo"]:
+            return (1, l["diferenca"] if l["diferenca"] is not None else 0)
+        if l["sem_base"]:
             return (3, str(l["nome"] or ""))
-        return (2, l["margem_real"] if l["margem_real"] is not None else 0)
+        return (2, l["diferenca"] if l["diferenca"] is not None else 0)
     linhas.sort(key=_sev)
 
     return {
-        "total": len(itens), "casados": len(linhas), "sem_match": sem_match, "sem_custo": sem_custo,
+        "total": len(itens), "casados": len(linhas), "sem_match": sem_match,
+        "sem_base": sum(1 for l in linhas if l["sem_base"]),
         "prejuizo": sum(1 for l in linhas if l["prejuizo"]),
-        "margem_baixa": sum(1 for l in linhas if l["margem_baixa"]),
-        "saudavel": sum(1 for l in linhas if l["saudavel"]),
-        "alvo": alvo, "imposto": imposto, "embalagem": embalagem,
+        "abaixo": sum(1 for l in linhas if l["abaixo"]),
+        "cobre": sum(1 for l in linhas if l["cobre"]),
+        "imposto": imposto, "embalagem": embalagem,
         "itens": linhas,
     }
 
@@ -1968,6 +1964,58 @@ def atualizar_preco_item(user_id: int, item_id, novo_preco: float) -> dict:
                 extra={"item_id": item_id, "price_list": price_list})
     return {"ok": True, "item_id": str(item_id), "novo_preco": novo_preco,
             "modelos_atualizados": len(price_list), "response": r.get("response")}
+
+
+def _resumo_motivos(pulados: list) -> dict:
+    r = {}
+    for p in pulados:
+        m = p.get("motivo", "outros")
+        r[m] = r.get(m, 0) + 1
+    return r
+
+
+def reprecificar_shopee(user_id: int, item_ids=None, aplicar: bool = False) -> dict:
+    """Ajuste em lote: leva os anúncios da Shopee ao preço que NETA o Preço Bling (o líquido desejado).
+    Só SOBE preço (nunca corta), pula SKUs em competição (Radar no comando) e sem Preço Bling.
+    dry-run por padrão; com aplicar=True grava na Shopee item a item, registra falha por item e segue."""
+    d = divergencia_bling_shopee(user_id)
+    itens = d.get("itens") or []
+    if item_ids is not None:
+        ids = {int(i) for i in item_ids}
+        itens = [l for l in itens if int(l["item_id"]) in ids]
+    plano, pulados = [], []
+    for l in itens:
+        base = {"item_id": l["item_id"], "nome": l["nome"], "sku": l["sku"], "preco": l["preco"]}
+        if l.get("sem_base") or l.get("preco_ideal") is None:
+            pulados.append({**base, "motivo": "sem preço Bling"}); continue
+        if l.get("em_competicao"):
+            pulados.append({**base, "motivo": "em competição"}); continue
+        novo = round(float(l["preco_ideal"]), 2)
+        if novo <= float(l["preco"]) + 0.01:
+            pulados.append({**base, "motivo": "já no líquido"}); continue
+        plano.append({**base, "para": novo, "delta": round(novo - float(l["preco"]), 2)})
+    resultado = {"total": len(itens), "plano": plano, "pulados": pulados,
+                 "resumo_pulados": _resumo_motivos(pulados), "dry_run": not aplicar}
+    if not aplicar:
+        return resultado
+    ok, erros = 0, []
+    for p in plano:
+        try:
+            atualizar_preco_item(user_id, p["item_id"], p["para"])
+            ok += 1
+        except Exception as e:  # noqa: BLE001 — registra falha por item, segue o lote
+            erros.append({"item_id": p["item_id"], "nome": p["nome"], "erro": str(e)})
+    resultado["aplicados"] = ok
+    resultado["erros"] = erros
+    if ok:
+        try:
+            from . import notificacoes as notif
+            notif.criar(user_id, "precificacao", f"{ok} anúncio(s) reprecificado(s) na Shopee",
+                        "Preços ajustados para netar o Preço Bling. Recalcule para conferir o líquido.",
+                        ok=True, modulo="shopee")
+        except Exception:  # noqa: BLE001 — notificação é best-effort
+            pass
+    return resultado
 
 
 # --------------------------- Bundle Deal ---------------------------------- #

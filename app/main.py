@@ -1159,6 +1159,18 @@ def shopee_item_preco(payload: dict = Body(...), user: User = Depends(auth.get_c
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/api/shopee/reprecificar")
+def shopee_reprecificar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Ajuste de preço em lote na Shopee para a margem alvo. dry-run por padrão (mostra o plano).
+    Body: { item_ids?: [int], aplicar: bool }. Respeita piso e pula SKUs em competição/sem custo."""
+    item_ids = payload.get("item_ids")
+    aplicar = bool(payload.get("aplicar", False))
+    try:
+        return shopee.reprecificar_shopee(user.id, item_ids=item_ids, aplicar=aplicar)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 # ---- Bundle Deal ----
 @app.get("/api/shopee/bundles")
 def shopee_bundles(status: str = "ongoing", user: User = Depends(auth.get_current_user)):
@@ -1370,6 +1382,12 @@ def atualizar_produto(produto_id: int, payload: dict = Body(...),
             pc = db.query(ProdutoCache).filter_by(user_id=user.id, produto_id=str(produto_id)).first()
             if pc:
                 pc.custo = float(campos["precoCusto"] or 0)
+                db.commit()
+        if "preco" in campos:  # reflete o novo Preço Bling no cache local (sem esperar o webhook)
+            from .models import ProdutoCache
+            pc = db.query(ProdutoCache).filter_by(user_id=user.id, produto_id=str(produto_id)).first()
+            if pc:
+                pc.preco = float(campos["preco"] or 0)
                 db.commit()
     finally:
         db.close()
