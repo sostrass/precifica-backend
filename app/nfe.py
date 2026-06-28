@@ -495,6 +495,7 @@ def nfe_por_pedidos(user_id: int, order_sns: list, dias: int = 60,
             ped = str(det.get("pedido_loja") or "").strip()
             if not ped:
                 continue
+            dst = det.get("destinatario") or {}
             cache[ped] = {
                 "nfe_numero": det.get("numero"),
                 "nfe_serie": det.get("serie"),
@@ -503,6 +504,13 @@ def nfe_por_pedidos(user_id: int, order_sns: list, dias: int = 60,
                 "nfe_chave": det.get("chave_acesso"),
                 "nfe_situacao": det.get("situacao"),
                 "nfe_situacao_label": det.get("situacao_label") or situacao_label(det.get("situacao")),
+                # Destinatário COMPLETO da NF do Bling (não mascarado, ao contrário da Shopee)
+                "nf_nome": dst.get("nome"),
+                "nf_endereco": dst.get("endereco"),
+                "nf_cidade": dst.get("municipio"),
+                "nf_uf": dst.get("uf"),
+                "nf_cep": dst.get("cep"),
+                "nf_tel": dst.get("telefone"),
             }
             faltam.discard(ped)
         if len(linhas) < 100:
