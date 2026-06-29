@@ -1142,10 +1142,11 @@ def resumo_faturamento(user_id: int) -> dict:
     }
 
 
-def contagens_situacao(user_id: int, max_paginas: int = 30) -> dict:
-    """Conta notas por situação paginando a lista resumida (barato, sem detalhe).
-    Pendentes/Rejeitadas costumam ser poucas (exato). Categorias grandes podem ser
-    limitadas pelo teto de páginas — nesse caso marca `aproximado`."""
+def contagens_situacao(user_id: int, max_paginas: int = 25) -> dict:
+    """Contagem de notas por situação paginando a lista resumida (barato, sem detalhe).
+    Autorizadas = situação 5 + 6 (a conta pode usar qualquer uma). Todas = soma das
+    categorias (o /nfe desta conta não lista sem filtro de situação). Categorias grandes
+    podem ser limitadas pelo teto de páginas — nesse caso marca `aproximado`."""
     def _conta(situacao):
         total, aprox = 0, False
         for p in range(1, max_paginas + 1):
@@ -1161,16 +1162,18 @@ def contagens_situacao(user_id: int, max_paginas: int = 30) -> dict:
                 aprox = True
         return total, aprox
 
-    cods = {"pendentes": 1, "rejeitadas": 4, "autorizadas": 6, "canceladas": 2}
-    out, aproximado = {}, False
-    for nome, cod in cods.items():
-        t, a = _conta(cod)
-        out[nome] = t
-        aproximado = aproximado or a
-    tt, ta = _conta(None)
-    out["todas"] = tt
-    out["aproximado"] = aproximado or ta
-    return out
+    pend, a1 = _conta(1)
+    aut5, a2 = _conta(5)
+    aut6, a3 = _conta(6)
+    rej, a4 = _conta(4)
+    canc, a5 = _conta(2)
+    autorizadas = aut5 + aut6
+    todas = pend + autorizadas + rej + canc
+    return {
+        "pendentes": pend, "autorizadas": autorizadas, "rejeitadas": rej,
+        "canceladas": canc, "todas": todas,
+        "aproximado": any([a1, a2, a3, a4, a5]),
+    }
 
 
 def pedidos_sem_nfe(user_id: int, dias: int = 30) -> dict:

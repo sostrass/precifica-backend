@@ -2435,30 +2435,43 @@ def nfe_pendentes(pagina: int = 1, limite: int = 100,
 def nfe_pendentes_todas(situacao: int | None = None, max_paginas: int = 80,
                         user: User = Depends(auth.get_current_user)):
     """Lista TODAS as NF-e da situação, paginando o Bling até esgotar (sem o limite de 100).
-    A lista é leve (sem valor/UF — esses vêm do /valores em lote). Teto de páginas por segurança."""
+    A lista é leve (sem valor/UF — esses vêm do /valores em lote). Teto de páginas por segurança.
+
+    Categorias: situacao=6 => Autorizadas (situação 5 E 6, pois a conta pode usar qualquer uma);
+    situacao=0 => Todas (mescla as situações usuais, já que o Bling desta conta não lista sem filtro);
+    None => padrão (pendentes); demais => filtra por aquela situação."""
     import time as _t
     cfg = _nfe_cfg(user.id)
-    # situacao=0 => "Todas" (sem filtro de situação); None => padrão (pendentes); demais => filtra
     if situacao == 0:
-        sit = None
+        sits = [cfg.situacao_pendente, 5, 6, 4, 2, 7]   # Todas (mescla)
+    elif situacao == 6:
+        sits = [5, 6]                                    # Autorizadas (5 ou 6)
     elif situacao is not None:
-        sit = situacao
+        sits = [situacao]
     else:
-        sit = cfg.situacao_pendente
-    todas = []
+        sits = [cfg.situacao_pendente]
+    # remove duplicatas preservando ordem
+    sits = list(dict.fromkeys([s for s in sits if s is not None]))
+
+    todas, vistos = [], set()
     try:
-        pagina = 1
-        while pagina <= max_paginas:
-            raw = bling.listar_nfe(user.id, pagina=pagina, limite=100, situacao=sit)
-            lote = nfe.resumir_lista(raw)
-            if not lote:
-                break
-            todas.extend(lote)
-            if len(lote) < 100:
-                break
-            pagina += 1
-            _t.sleep(0.2)  # respeita o rate limit do Bling
-        return {"notas": todas, "situacao": sit, "total": len(todas), "paginas": pagina}
+        for s in sits:
+            pagina = 1
+            while pagina <= max_paginas:
+                raw = bling.listar_nfe(user.id, pagina=pagina, limite=100, situacao=s)
+                lote = nfe.resumir_lista(raw)
+                if not lote:
+                    break
+                for n in lote:
+                    nid = n.get("id")
+                    if nid not in vistos:
+                        vistos.add(nid)
+                        todas.append(n)
+                if len(lote) < 100:
+                    break
+                pagina += 1
+                _t.sleep(0.2)  # respeita o rate limit do Bling
+        return {"notas": todas, "situacao": situacao, "situacoes": sits, "total": len(todas)}
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
