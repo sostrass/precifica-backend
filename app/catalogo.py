@@ -173,6 +173,7 @@ def enriquecer_vinculos(user_id: int) -> None:
         feito = 0
         for pid in ids:
             canais = []
+            raw = {}
             try:
                 raw = (bling.obter_produto(user_id, pid) or {}).get("data", {}) or {}
                 for chave in ("vinculosLojas", "lojas", "produtosLojas"):
@@ -190,6 +191,21 @@ def enriquecer_vinculos(user_id: int) -> None:
             reg = db.query(ProdutoCache).filter_by(user_id=user_id, produto_id=pid).first()
             if reg is not None:
                 reg.marketplaces = canais
+                # O GET por produto traz o que a lista NÃO traz: aproveita imagem, custo e saldo
+                # (sem isso a lista fica com imagem quebrada e "sem custo").
+                if raw:
+                    try:
+                        img = _img(raw)
+                        if img:
+                            reg.imagem = img
+                        pc = _f(raw.get("precoCusto"))
+                        if pc and pc > 0:
+                            reg.custo = pc
+                        saldo = (raw.get("estoque") or {}).get("saldoVirtualTotal")
+                        if saldo is not None:
+                            reg.saldo = _f(saldo)
+                    except Exception:  # noqa: BLE001
+                        pass
             feito += 1
             if feito % 25 == 0 or feito == len(ids):
                 est = _estado_vinculos(db, user_id); est.processados = feito; db.commit()

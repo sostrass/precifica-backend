@@ -1967,11 +1967,16 @@ def monitoramento(payload: dict = Body(default={}),
                                      ProdutoCache.saldo, ProdutoCache.marketplaces, ProdutoCache.atualizado_em))
                   .filter_by(user_id=user.id).all())
         try:
-            shopee_skus = {s[0] for s in db.query(ShopeeItemCache.sku).filter(
-                ShopeeItemCache.user_id == user.id, ShopeeItemCache.sku.isnot(None)).all() if s[0]}
-        except Exception:  # noqa: BLE001 — cache da Shopee ainda sem tabela: segue sem badge Shopee
+            shopee_img = {}
+            for s in db.query(ShopeeItemCache.sku, ShopeeItemCache.imagem).filter(
+                    ShopeeItemCache.user_id == user.id, ShopeeItemCache.sku.isnot(None)).all():
+                if s[0]:
+                    shopee_img[s[0]] = s[1]
+            shopee_skus = set(shopee_img.keys())
+        except Exception:  # noqa: BLE001 — cache da Shopee ainda sem tabela: segue sem badge/imagem Shopee
             db.rollback()
             shopee_skus = set()
+            shopee_img = {}
     finally:
         db.close()
 
@@ -1984,7 +1989,8 @@ def monitoramento(payload: dict = Body(default={}),
 
     if linhas:
         itens = [_monta(p.produto_id, p.sku, p.nome, float(p.preco or 0), float(p.custo or 0),
-                        float(p.saldo or 0), p.atualizado_em, p.imagem, _mk(p.marketplaces, p.sku), 0) for p in linhas]
+                        float(p.saldo or 0), p.atualizado_em, p.imagem or shopee_img.get(p.sku),
+                        _mk(p.marketplaces, p.sku), 0) for p in linhas]
         return {"canal": canal, "fonte": "cache", "total": len(itens), "itens": itens}
 
     # Fallback: cache ainda não sincronizado — lê o Bling ao vivo (limitado).
