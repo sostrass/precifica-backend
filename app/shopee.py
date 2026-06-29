@@ -1918,6 +1918,23 @@ def _preco_para_margem_shopee(faixas, imposto, embalagem, custo, alvo_pct):
     return round(hi, 2)
 
 
+def _itens_shopee_cache_ou_vivo(user_id: int) -> list:
+    """Itens da Shopee (item_id, sku, nome, preço, preço original, imagem, status).
+    Lê do cache local (ShopeeItemCache) se houver; senão cai pra leitura ao vivo
+    (catalogo_shopee). É isso que tira as ~150 chamadas sequenciais da Divergência."""
+    from .models import ShopeeItemCache
+    db = SessionLocal()
+    try:
+        regs = db.query(ShopeeItemCache).filter_by(user_id=user_id).all()
+    finally:
+        db.close()
+    if regs:
+        return [{"item_id": r.item_id, "sku": r.sku, "nome": r.nome,
+                 "preco": float(r.preco or 0), "preco_original": float(r.preco_original or 0),
+                 "imagem": r.imagem, "status": r.status} for r in regs]
+    return catalogo_shopee(user_id)
+
+
 def divergencia_bling_shopee(user_id: int) -> dict:
     """Líquido REAL de cada anúncio da Shopee. O Preço Bling é o valor que o lojista quer RECEBER
     líquido (o custo já está embutido nele). Para cada anúncio casado por SKU: líquido = preço Shopee
@@ -1944,7 +1961,7 @@ def divergencia_bling_shopee(user_id: int) -> dict:
     except Exception:
         promo_map = {}
 
-    itens = catalogo_shopee(user_id)
+    itens = _itens_shopee_cache_ou_vivo(user_id)
     linhas, sem_match = [], 0
     for it in itens:
         p = cache.get(it["sku"])

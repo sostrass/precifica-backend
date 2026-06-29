@@ -688,10 +688,10 @@ def shopee_boost_desempenho(user: User = Depends(auth.get_current_user)):
 
 # ---- Avaliações ----
 @app.get("/api/shopee/avaliacoes")
-def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "",
+def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "", item_id: str = "",
                       user: User = Depends(auth.get_current_user)):
     try:
-        return shopee.listar_avaliacoes(user.id, status=status, cursor=cursor)
+        return shopee.listar_avaliacoes(user.id, item_id=item_id or None, status=status, cursor=cursor)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
