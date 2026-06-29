@@ -1280,6 +1280,7 @@ _VENDAS_SKU_CACHE: dict = {}  # user_id -> (ts, {sku: unidades})
 
 _VENDAS_ITEM_CACHE: dict = {}  # (user_id, dias) -> (ts, {item_id: unidades})
 _CAMP_ITENS_CACHE: dict = {}   # user_id -> (ts, set(item_id))
+_CAMP_NOME_CACHE: dict = {}    # user_id -> (ts, {item_id: nome_campanha_ativa})
 
 
 def vendas_por_item(user_id: int, dias: int = 30, ttl: int = 1800) -> dict:
@@ -1341,6 +1342,43 @@ def itens_em_campanha(user_id: int, ttl: int = 600) -> set:
                 page += 1
     _CAMP_ITENS_CACHE[user_id] = (ag, ids)
     return ids
+
+
+def campanhas_ativas_itens(user_id: int, ttl: int = 600) -> dict:
+    """{item_id(int): nome_da_campanha} para campanhas de desconto ATIVAS (ongoing) — usado
+    para sinalizar no painel que o anúncio está em promoção (o líquido cai pelo preço
+    promocional, não por erro de preço). Cacheia ~10 min."""
+    ag = time.time()
+    cache = _CAMP_NOME_CACHE.get(user_id)
+    if cache and ag - cache[0] < ttl:
+        return cache[1]
+    mapa: dict = {}
+    try:
+        r = listar_descontos(user_id, status="ongoing", limite=100)
+    except ShopeeError:
+        r = {}
+    for d in ((r.get("response") or {}).get("discount_list") or []):
+        did = d.get("discount_id")
+        if not did:
+            continue
+        nome = d.get("discount_name") or "Campanha de desconto"
+        page = 1
+        for _ in range(20):
+            try:
+                rr = _chamar(user_id, "/api/v2/discount/get_discount",
+                             extra={"discount_id": int(did), "page_no": page, "page_size": 100})
+            except ShopeeError:
+                break
+            lote = (rr.get("response") or {}).get("item_list") or []
+            for it in lote:
+                iid = it.get("item_id")
+                if iid:
+                    mapa.setdefault(int(iid), nome)
+            if len(lote) < 100:
+                break
+            page += 1
+    _CAMP_NOME_CACHE[user_id] = (ag, mapa)
+    return mapa
 
 
 def vendas_por_sku(user_id: int, dias: int = 30, ttl: int = 1800) -> dict:
@@ -1812,6 +1850,14 @@ def _preco_item(info: dict) -> float:
     return float(info.get("current_price") or 0)
 
 
+def _preco_original_item(info: dict) -> float:
+    """Preço original (de tabela) do item — quando há campanha ativa, é maior que o current_price."""
+    pl = info.get("price_info") or []
+    if isinstance(pl, list) and pl:
+        return float(pl[0].get("original_price") or pl[0].get("current_price") or 0)
+    return float(info.get("original_price") or info.get("current_price") or 0)
+
+
 def catalogo_shopee(user_id: int, max_paginas: int = 400) -> list:
     """Lista TODOS os anúncios da Shopee com preço e SKU. Pagina por offset (100/página)
     até a Shopee dizer que não há mais (has_next_page False), com um teto de segurança alto.
@@ -1831,6 +1877,7 @@ def catalogo_shopee(user_id: int, max_paginas: int = 400) -> list:
             for b in base:
                 out.append({"item_id": str(b.get("item_id")), "nome": b.get("item_name"),
                             "sku": b.get("item_sku"), "preco": _preco_item(b),
+                            "preco_original": _preco_original_item(b),
                             "imagem": ((b.get("image") or {}).get("image_url_list") or [None])[0],
                             "status": b.get("item_status")})
         if not resp.get("has_next_page"):
@@ -1892,6 +1939,10 @@ def divergencia_bling_shopee(user_id: int) -> dict:
 
     from . import radar as _radar
     monitorados = set(_radar.skus_monitorados(user_id))
+    try:
+        promo_map = campanhas_ativas_itens(user_id)
+    except Exception:
+        promo_map = {}
 
     itens = catalogo_shopee(user_id)
     linhas, sem_match = [], 0
@@ -1916,14 +1967,30 @@ def divergencia_bling_shopee(user_id: int) -> dict:
         monitorado = it["sku"] in monitorados
         concorrente = _radar.menor_preco_concorrente(user_id, it["sku"]) if monitorado else None
         em_competicao = bool(monitorado and concorrente is not None and not cobre and preco_ideal is not None and preco_ideal > concorrente)
+        preco_orig = float(it.get("preco_original") or 0) or preco
+        try:
+            iid_int = int(it["item_id"])
+        except (TypeError, ValueError):
+            iid_int = None
+        promo_nome = promo_map.get(iid_int) if iid_int is not None else None
+        em_promocao = bool((preco_orig > preco + 0.01) or promo_nome)
+        if tem_base and preco_orig > 0:
+            liquido_normal = round(preco_orig - round(_taxa_shopee_faixa(faixas, preco_orig), 2)
+                                   - round(preco_orig * imposto / 100.0, 2) - emb, 2)
+        else:
+            liquido_normal = None
+        cobre_normal = bool(tem_base and liquido_normal is not None and liquido_normal >= base)
         linhas.append({
             "item_id": it["item_id"], "produto_id": p.produto_id, "nome": it["nome"], "sku": it["sku"],
             "imagem": it.get("imagem"), "saldo": float(p.saldo or 0),
             "preco": round(preco, 2), "preco_bling": round(base, 2) if base > 0 else None,
+            "preco_original": round(preco_orig, 2),
             "taxa_shopee": taxa, "imposto": imp, "embalagem": emb,
             "liquido": liquido, "diferenca": diferenca, "preco_ideal": preco_ideal,
             "concorrente": round(concorrente, 2) if concorrente is not None else None,
             "monitorado": monitorado, "em_competicao": em_competicao,
+            "em_promocao": em_promocao, "promo_nome": promo_nome,
+            "liquido_normal": liquido_normal, "cobre_normal": cobre_normal,
             "sem_base": sem_base, "prejuizo": prejuizo, "abaixo": abaixo, "cobre": cobre,
         })
 
@@ -1943,6 +2010,7 @@ def divergencia_bling_shopee(user_id: int) -> dict:
         "prejuizo": sum(1 for l in linhas if l["prejuizo"]),
         "abaixo": sum(1 for l in linhas if l["abaixo"]),
         "cobre": sum(1 for l in linhas if l["cobre"]),
+        "em_promocao": sum(1 for l in linhas if l["em_promocao"]),
         "imposto": imposto, "embalagem": embalagem,
         "itens": linhas,
     }

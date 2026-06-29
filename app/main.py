@@ -356,6 +356,31 @@ def catalogo_sync_status(user: User = Depends(auth.get_current_user)):
     return catalogo.status(user.id)
 
 
+@app.post("/api/shopee/catalogo/sincronizar")
+def shopee_catalogo_sincronizar(background_tasks: BackgroundTasks, user: User = Depends(auth.get_current_user)):
+    """Dispara a sincronização do catálogo da Shopee pro cache (item_id, sku, preço, promoção).
+    Roda em background; acompanhe por /api/shopee/catalogo/status."""
+    from . import shopee_catalogo
+    est = shopee_catalogo.status(user.id)
+    if est["status"] == "rodando":
+        return {"ok": True, "ja_rodando": True, **est}
+    background_tasks.add_task(shopee_catalogo.sincronizar, user.id)
+    return {"ok": True, "iniciado": True}
+
+
+@app.get("/api/shopee/catalogo/status")
+def shopee_catalogo_status(user: User = Depends(auth.get_current_user)):
+    from . import shopee_catalogo
+    return shopee_catalogo.status(user.id)
+
+
+@app.get("/api/shopee/item")
+def shopee_item_lookup(sku: str, user: User = Depends(auth.get_current_user)):
+    """Anúncio da Shopee (preço, preço original, promoção) por SKU — lê do cache."""
+    from . import shopee_catalogo
+    return shopee_catalogo.item_por_sku(user.id, sku) or {"encontrado": False}
+
+
 @app.get("/api/catalogo")
 def catalogo_listar(busca: str = "", pagina: int = 1, limite: int = 50, situacao: str = "",
                     user: User = Depends(auth.get_current_user)):
@@ -1785,39 +1810,102 @@ def lote_ia(payload: dict = Body(...), user: User = Depends(auth.get_current_use
     return "critico"
 
 
+def _img_do_payload(dados):
+    """Primeira imagem do payload bruto do Bling (lista ou GET)."""
+    if not isinstance(dados, dict):
+        return None
+    ext = (((dados.get("midia") or {}).get("imagens") or {}).get("externas") or [])
+    for i in ext:
+        if isinstance(i, dict) and i.get("link"):
+            return i["link"]
+    return dados.get("imagemURL") or None
+
+
+def _marketplaces_do_payload(dados):
+    """Canais onde o produto está anunciado (vinculosLojas, se vier no payload)."""
+    if not isinstance(dados, dict):
+        return []
+    for chave in ("vinculosLojas", "lojas", "produtosLojas"):
+        arr = dados.get(chave)
+        if isinstance(arr, list) and arr:
+            vins = bling.parse_vinculos_multiloja(arr)
+            return [{"canal": v.get("canal"), "nome": v.get("nome"), "publicado": bool(v.get("publicado"))}
+                    for v in vins if v.get("canal")]
+    return []
+
+
 @app.post("/api/monitoramento")
 def monitoramento(payload: dict = Body(default={}),
                   user: User = Depends(auth.get_current_user)):
-    """Lista produtos do Bling com margem líquida e status tipado por canal.
+    """Catálogo no modelo LÍQUIDO. O preço do Bling é o líquido que o lojista quer
+    receber. Por canal de marketplace, calcula o preço de LISTA que neta o Preço Bling
+    (gross-up pelas taxas daquele canal). Canal 'bling' (padrão) = só o Preço Bling +
+    margem real vs custo. Lê do cache local (todos os produtos); se vazio, cai pro
+    Bling ao vivo (limitado). Enriquece com imagem, marketplaces e vendas 30d."""
+    from .models import ProdutoCache
+    canal = payload.get("canal", "bling")
+    cfg = precificacao.obter_config(user.id)
+    canal_cfg = precificacao._canal_cfg(cfg, canal) if (canal and canal != "bling") else None
+    try:
+        vendas = shopee.vendas_por_sku(user.id)
+    except Exception:
+        vendas = {}
 
-    Body opcional: {custos_globais, taxas_por_canal?, canal, pagina, limite}
-    O front pinta os badges a partir do 'status' (enum), não de texto.
-    """
-    canal = payload.get("canal", "mercadolivre")
+    def _monta(produto_id, sku, nome, preco_bling, custo, estoque, atualizado, imagem=None, marketplaces=None, vendas_un=0):
+        margem = round((preco_bling - custo) / preco_bling * 100, 1) if (preco_bling > 0 and custo > 0) else None
+        if preco_bling <= 0:
+            status = "sem_base"
+        elif custo <= 0:
+            status = "sem_custo"
+        elif preco_bling <= custo:
+            status = "critico"            # netando abaixo do custo
+        elif margem is not None and margem < 10:
+            status = "atencao"
+        else:
+            status = "lucro_ideal"
+        pra_netar = None
+        if canal_cfg and preco_bling > 0:
+            sug = precificacao.precificar_venda_canal(
+                preco_bling, canal_cfg["faixas"], cfg["imposto"], cfg["cartao"], cfg["embalagem"])
+            pra_netar = sug["preco"] if sug else None
+        return {
+            "id": produto_id, "sku": sku, "nome": nome,
+            "custo": custo, "estoque": estoque,
+            "imagem": imagem, "marketplaces": marketplaces or [], "vendas": vendas_un,
+            "preco_bling": preco_bling, "pra_netar": pra_netar,
+            "margem_real": margem, "status": status,
+            "atualizado": atualizado.isoformat() if atualizado else None,
+            # compat com as chaves antigas que o front ainda lê
+            "preco_atual": preco_bling, "preco_sugerido": pra_netar, "margem_liquida": margem or 0,
+        }
+
+    db = SessionLocal()
+    try:
+        linhas = db.query(ProdutoCache).filter_by(user_id=user.id).all()
+    finally:
+        db.close()
+
+    if linhas:
+        itens = [_monta(p.produto_id, p.sku, p.nome, float(p.preco or 0), float(p.custo or 0),
+                        float(p.saldo or 0), p.atualizado_em,
+                        _img_do_payload(p.dados), _marketplaces_do_payload(p.dados),
+                        int(vendas.get(p.sku, 0) or 0)) for p in linhas]
+        return {"canal": canal, "fonte": "cache", "total": len(itens), "itens": itens}
+
+    # Fallback: cache ainda não sincronizado — lê o Bling ao vivo (limitado).
     try:
         bruto = bling.listar_produtos(user.id, pagina=payload.get("pagina", 1),
                                       limite=payload.get("limite", 100))
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
-
-    cfg = precificacao.obter_config(user.id)
     itens = []
     for p in bruto.get("data", []):
         custo = float(p.get("precoCusto") or (p.get("fornecedor") or {}).get("precoCusto") or 0)
-        preco_atual = float(p.get("preco") or 0)
-        av = precificacao.avaliar_com_cfg(cfg, custo, preco_atual, canal)
-        margem = av["margem_atual"] if av["margem_atual"] is not None else (av["margem_sugerida"] or 0)
-        itens.append({
-            "id": p.get("id"),
-            "sku": p.get("codigo"),
-            "nome": p.get("nome"),
-            "custo": custo,
-            "preco_atual": preco_atual,
-            "preco_sugerido": av["preco_sugerido"],
-            "margem_liquida": margem,
-            "status": _status(margem),
-        })
-    return {"canal": canal, "itens": itens}
+        itens.append(_monta(p.get("id"), p.get("codigo"), p.get("nome"),
+                            float(p.get("preco") or 0), custo, 0.0, None,
+                            _img_do_payload(p), _marketplaces_do_payload(p),
+                            int(vendas.get(p.get("codigo"), 0) or 0)))
+    return {"canal": canal, "fonte": "bling", "total": len(itens), "itens": itens}
 
 
 # ------------------------------ Concorrência ------------------------------ #

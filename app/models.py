@@ -426,3 +426,38 @@ class ShopeeReviewLog(Base):
     trecho = Column(String, default="")        # começo da resposta enviada
     modo = Column(String, default="auto")      # auto | manual
     criado_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ShopeeItemCache(Base):
+    """Cache local dos anúncios da Shopee (sku -> item_id, preço, promoção...).
+    Alimenta o cockpit (promoção) e acelera a divergência, sem martelar a API."""
+
+    __tablename__ = "shopee_item_cache"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    item_id = Column(String, nullable=False, index=True)
+    sku = Column(String, nullable=True, index=True)
+    nome = Column(String, nullable=True)
+    preco = Column(Float, default=0.0)            # preço atual (pode ser promo)
+    preco_original = Column(Float, default=0.0)   # preço normal/cheio
+    em_promocao = Column(Boolean, default=False)
+    promo_nome = Column(String, nullable=True)
+    imagem = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "item_id", name="uq_shopee_user_item"),)
+
+
+class ShopeeSync(Base):
+    """Estado da sincronização do catálogo da Shopee (uma linha por usuário)."""
+
+    __tablename__ = "shopee_sync"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    status = Column(String, default="ocioso")   # ocioso | rodando | concluido | erro
+    total = Column(Integer, default=0)
+    erro = Column(String, nullable=True)
+    iniciado_em = Column(DateTime, nullable=True)
+    concluido_em = Column(DateTime, nullable=True)
