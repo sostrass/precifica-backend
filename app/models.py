@@ -220,15 +220,47 @@ class ProdutoCache(Base):
     produto_id = Column(String, nullable=False, index=True)
     sku = Column(String, nullable=True, index=True)
     nome = Column(String, nullable=True)
-    preco = Column(Float, default=0.0)
+    imagem = Column(String, nullable=True)
+    preco = Column(Float, default=0.0)            # preço-base / líquido a receber
     custo = Column(Float, default=0.0)
     saldo = Column(Float, default=0.0)
     situacao = Column(String, nullable=True)   # Ativo / Inativo
     tipo = Column(String, nullable=True)
+    marketplaces = Column(JSON, nullable=True)  # canais onde está anunciado (enriquecido sob demanda)
     dados = Column(JSON, nullable=True)        # payload bruto do produto
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("user_id", "produto_id", name="uq_cache_user_produto"),)
+
+
+class ProdutoPrecoSnapshot(Base):
+    """Histórico do Preço Bling (preço-base) por produto — um ponto por dia, gravado no
+    sync. Alimenta o gráfico de histórico de preço no cockpit do Catálogo."""
+
+    __tablename__ = "produto_preco_snapshot"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    produto_id = Column(String, nullable=False, index=True)
+    sku = Column(String, nullable=True)
+    preco = Column(Float, default=0.0)
+    dia = Column(Date, index=True)
+    criado_em = Column(DateTime, default=datetime.utcnow)
+
+
+class VinculosSync(Base):
+    """Estado do job de enriquecimento de vínculos (mapear canais por produto no Bling)."""
+
+    __tablename__ = "vinculos_sync"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True, unique=True)
+    status = Column(String, default="ocioso")   # ocioso/rodando/concluido/erro
+    total = Column(Integer, default=0)
+    processados = Column(Integer, default=0)
+    erro = Column(String, nullable=True)
+    iniciado_em = Column(DateTime, nullable=True)
+    concluido_em = Column(DateTime, nullable=True)
 
 
 class CatalogoSync(Base):

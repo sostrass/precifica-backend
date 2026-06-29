@@ -4,7 +4,7 @@ Estratégia: puxar o catálogo inteiro UMA vez (paginando tudo), gravar no banco
 e manter atualizado via webhook (produto.created/updated/deleted). As telas leem
 deste cache — rápido e sem martelar a API do Bling.
 """
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import re as _re
 import html as _html
 
@@ -38,6 +38,15 @@ def _f(v) -> float:
         return 0.0
 
 
+def _img(p: dict):
+    """Primeira imagem do payload do Bling (lista ou GET)."""
+    ext = (((p.get("midia") or {}).get("imagens") or {}).get("externas") or [])
+    for i in ext:
+        if isinstance(i, dict) and i.get("link"):
+            return i["link"]
+    return p.get("imagemURL") or None
+
+
 def _resumo(p: dict) -> dict:
     """Extrai os campos indexados de um produto do Bling."""
     est = p.get("estoque") or {}
@@ -45,6 +54,7 @@ def _resumo(p: dict) -> dict:
         "produto_id": str(p.get("id")),
         "sku": p.get("codigo"),
         "nome": p.get("nome"),
+        "imagem": _img(p),
         "preco": _f(p.get("preco")),
         "custo": _f(p.get("precoCusto")),
         "saldo": _f(est.get("saldoVirtualTotal")),
@@ -63,6 +73,7 @@ def upsert_produto(db, user_id: int, p: dict) -> None:
         reg = ProdutoCache(user_id=user_id, produto_id=r["produto_id"])
         db.add(reg)
     reg.sku = r["sku"]; reg.nome = r["nome"]; reg.preco = r["preco"]
+    reg.imagem = r["imagem"]
     reg.custo = r["custo"]; reg.saldo = r["saldo"]; reg.situacao = r["situacao"]
     reg.tipo = r["tipo"]; reg.dados = p; reg.atualizado_em = datetime.utcnow()
     db.commit()
@@ -94,6 +105,112 @@ def _estado(db, user_id: int) -> CatalogoSync:
     return est
 
 
+def registrar_snapshot_precos(user_id: int) -> None:
+    """Grava um ponto de Preço Bling por produto por dia (idempotente). Roda no fim do sync.
+    Mantém só os últimos ~120 dias para o gráfico de histórico de preço no cockpit."""
+    from .models import ProdutoPrecoSnapshot
+    hoje = date.today()
+    db = SessionLocal()
+    try:
+        db.query(ProdutoPrecoSnapshot).filter(
+            ProdutoPrecoSnapshot.user_id == user_id,
+            ProdutoPrecoSnapshot.dia == hoje).delete(synchronize_session=False)
+        db.query(ProdutoPrecoSnapshot).filter(
+            ProdutoPrecoSnapshot.user_id == user_id,
+            ProdutoPrecoSnapshot.dia < hoje - timedelta(days=120)).delete(synchronize_session=False)
+        regs = db.query(ProdutoCache.produto_id, ProdutoCache.sku, ProdutoCache.preco).filter(
+            ProdutoCache.user_id == user_id).all()
+        db.bulk_save_objects([
+            ProdutoPrecoSnapshot(user_id=user_id, produto_id=r[0], sku=r[1], preco=float(r[2] or 0), dia=hoje)
+            for r in regs if r[0] and float(r[2] or 0) > 0
+        ])
+        db.commit()
+    except Exception:  # noqa: BLE001 — nunca derruba o sync por causa do histórico
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _estado_vinculos(db, user_id):
+    from .models import VinculosSync
+    est = db.query(VinculosSync).filter_by(user_id=user_id).first()
+    if not est:
+        est = VinculosSync(user_id=user_id, status="ocioso")
+        db.add(est); db.commit(); db.refresh(est)
+    return est
+
+
+def status_vinculos(user_id: int) -> dict:
+    db = SessionLocal()
+    try:
+        est = _estado_vinculos(db, user_id)
+        return {"status": est.status, "total": est.total, "processados": est.processados,
+                "erro": est.erro,
+                "iniciado_em": est.iniciado_em.isoformat() if est.iniciado_em else None,
+                "concluido_em": est.concluido_em.isoformat() if est.concluido_em else None}
+    except Exception:  # noqa: BLE001 — tabela ainda não criada: não derruba a página
+        db.rollback()
+        return {"status": "ocioso", "total": 0, "processados": 0, "erro": None,
+                "iniciado_em": None, "concluido_em": None}
+    finally:
+        db.close()
+
+
+def enriquecer_vinculos(user_id: int) -> None:
+    """Mapeia, produto a produto, em quais marketplaces ele está anunciado (lê os vínculos
+    no Bling) e grava a lista de canais na coluna `marketplaces` do cache. Pesado: ~1
+    chamada por produto, respeitando o rate limit (~3/s). Roda em background, com progresso.
+    Idempotente: pode rodar de novo a qualquer momento."""
+    import time
+    from .models import ProdutoCache
+    db = SessionLocal()
+    try:
+        est = _estado_vinculos(db, user_id)
+        est.status = "rodando"; est.erro = None; est.processados = 0
+        est.iniciado_em = datetime.utcnow(); est.concluido_em = None; db.commit()
+        ids = [r[0] for r in db.query(ProdutoCache.produto_id).filter_by(user_id=user_id).all() if r[0]]
+        est.total = len(ids); db.commit()
+        feito = 0
+        for pid in ids:
+            canais = []
+            try:
+                raw = (bling.obter_produto(user_id, pid) or {}).get("data", {}) or {}
+                for chave in ("vinculosLojas", "lojas", "produtosLojas"):
+                    arr = raw.get(chave)
+                    if isinstance(arr, list) and arr:
+                        canais = [{"canal": v.get("canal"), "nome": v.get("nome"),
+                                   "publicado": bool(v.get("publicado"))}
+                                  for v in bling.parse_vinculos_multiloja(arr) if v.get("canal")]
+                        break
+            except bling.BlingAuthError:
+                est = _estado_vinculos(db, user_id)
+                est.status = "erro"; est.erro = "Bling não autorizado"; db.commit(); return
+            except Exception:  # noqa: BLE001 — um produto problemático não derruba o job
+                canais = []
+            reg = db.query(ProdutoCache).filter_by(user_id=user_id, produto_id=pid).first()
+            if reg is not None:
+                reg.marketplaces = canais
+            feito += 1
+            if feito % 25 == 0 or feito == len(ids):
+                est = _estado_vinculos(db, user_id); est.processados = feito; db.commit()
+            time.sleep(0.34)
+        est = _estado_vinculos(db, user_id)
+        est.status = "concluido"; est.processados = len(ids); est.concluido_em = datetime.utcnow(); db.commit()
+        try:
+            from . import notificacoes as notif
+            notif.criar(user_id, "produto", "Mapeamento de canais concluído",
+                        f"{len(ids)} produto(s) verificados nos marketplaces.", ok=True, modulo="catalogo")
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        try:
+            est = _estado_vinculos(db, user_id); est.status = "erro"; est.erro = str(e)[:200]; db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        db.close()
+
+
 def sincronizar_tudo(user_id: int) -> None:
     """Puxa o catálogo inteiro do Bling e grava no cache. Atualiza o progresso.
     Pensado para rodar em background (pode levar minutos em catálogos grandes)."""
@@ -116,6 +233,10 @@ def sincronizar_tudo(user_id: int) -> None:
             est.status = "concluido"; est.concluido_em = datetime.utcnow()
             est.total = db.query(ProdutoCache).filter_by(user_id=user_id).count()
             db.commit()
+            try:
+                registrar_snapshot_precos(user_id)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 from . import notificacoes as notif
                 notif.criar(user_id, "produto",

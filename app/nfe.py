@@ -377,7 +377,17 @@ def valor_total_raw(raw: dict) -> float:
         v = n.get("total")
     if v is None:
         v = n.get("valor")
-    return _num(v)
+    total = _num(v)
+    if total <= 0:
+        # Nota pendente às vezes não traz o total no topo — soma os itens (igual ao detalhe).
+        soma = 0.0
+        for it in (n.get("itens") or []):
+            vt = _num(it.get("valorTotal"))
+            if vt <= 0:
+                vt = _num(it.get("valor")) * (_num(it.get("quantidade")) or 1)
+            soma += vt
+        total = _r2(soma)
+    return total
 
 
 def enriquecer_valores(user_id: int, notas: list, limite: int = 60) -> list:
@@ -944,6 +954,53 @@ def conciliar_shopee_lote(user_id: int, ids: list) -> dict:
 _TETO_SIMPLES = 4_800_000.0       # teto anual do Simples Nacional (RBT12)
 _SUBLIMITE_SIMPLES = 3_600_000.0  # sublimite p/ ICMS/ISS dentro do Simples
 
+# Anexo I — Comércio (revenda). (faixa, teto_da_faixa, aliquota_nominal, parcela_a_deduzir)
+_ANEXO_I = [
+    (1, 180_000.0, 0.040, 0.0),
+    (2, 360_000.0, 0.073, 5_940.0),
+    (3, 720_000.0, 0.095, 13_860.0),
+    (4, 1_800_000.0, 0.107, 22_500.0),
+    (5, 3_600_000.0, 0.143, 87_300.0),
+    (6, 4_800_000.0, 0.190, 378_000.0),
+]
+
+
+def _simples_anexo1(rbt12: float) -> dict:
+    """Faixa e alíquota efetiva do Anexo I a partir do RBT12.
+    Alíquota efetiva = (RBT12 * aliquota_nominal - parcela_deduzir) / RBT12."""
+    rbt12 = float(rbt12 or 0)
+    faixa, _teto, aliq_nom, deduz = _ANEXO_I[-1]
+    for f, teto, an, d in _ANEXO_I:
+        if rbt12 <= teto:
+            faixa, aliq_nom, deduz = f, an, d
+            break
+    efetiva = ((rbt12 * aliq_nom - deduz) / rbt12 * 100) if rbt12 > 0 else (aliq_nom * 100)
+    efetiva = max(0.0, round(efetiva, 2))
+    return {
+        "faixa": faixa,
+        "aliquota_nominal": round(aliq_nom * 100, 2),
+        "parcela_deduzir": deduz,
+        "aliquota_efetiva": efetiva,
+    }
+
+
+def _meses_ate_sublimite(dados: list, rbt12: float, alvo: float) -> int | None:
+    """Projeção honesta: o RBT12 é uma soma móvel de 12 meses; ele cresce quando os
+    meses recentes faturam mais que os meses que vão sair da janela. Estima em quantos
+    meses o RBT12 atinge `alvo`. Retorna 0 se já atingiu, ou None se no ritmo atual não cresce."""
+    if rbt12 >= alvo:
+        return 0
+    serie = [float(d.get("total_estimado") or 0) for d in dados if not d.get("parcial")]
+    if len(serie) < 4:
+        return None
+    recentes = serie[-3:]
+    saindo = serie[:3]  # próximos a deixar a janela móvel
+    crescimento = (sum(recentes) / len(recentes)) - (sum(saindo) / len(saindo))
+    if crescimento <= 0:
+        return None
+    import math
+    return min(120, max(1, math.ceil((alvo - rbt12) / crescimento)))
+
 
 def _meses_trailing(qtd: int = 12):
     """Lista [(ano, mes)] dos últimos `qtd` meses, do mais antigo ao mês atual."""
@@ -1069,13 +1126,123 @@ def resumo_faturamento(user_id: int) -> dict:
 
     atualizado = max((d["atualizado_em"] for d in dados if d["atualizado_em"]), default=None)
     parcial = any(d["parcial"] for d in dados if (d["ano"], d["mes"]) in trailing)
+    simples = _simples_anexo1(rbt12)
     return {
         "tem_dados": True, "rbt12": rbt12, "total_ano": total_ano, "ano": hoje.year,
         "projecao_ano": projecao_ano, "teto": _TETO_SIMPLES, "sublimite": _SUBLIMITE_SIMPLES,
         "pct_teto": pct_teto, "pct_sublimite": pct_sublimite, "alerta": alerta,
         "parcial": parcial, "atualizado_em": atualizado,
+        "faixa": simples["faixa"],
+        "aliquota_nominal": simples["aliquota_nominal"],
+        "aliquota_efetiva": simples["aliquota_efetiva"],
+        "parcela_deduzir": simples["parcela_deduzir"],
+        "anexo": "I",
+        "meses_ate_sublimite": _meses_ate_sublimite(dados, rbt12, _SUBLIMITE_SIMPLES),
         "meses": dados[-12:],
     }
+
+
+def contagens_situacao(user_id: int, max_paginas: int = 30) -> dict:
+    """Conta notas por situação paginando a lista resumida (barato, sem detalhe).
+    Pendentes/Rejeitadas costumam ser poucas (exato). Categorias grandes podem ser
+    limitadas pelo teto de páginas — nesse caso marca `aproximado`."""
+    def _conta(situacao):
+        total, aprox = 0, False
+        for p in range(1, max_paginas + 1):
+            try:
+                data = bling.listar_nfe(user_id, pagina=p, limite=100, situacao=situacao)
+            except Exception:
+                break
+            lote = data.get("data", []) or []
+            total += len(lote)
+            if len(lote) < 100:
+                break
+            if p == max_paginas:
+                aprox = True
+        return total, aprox
+
+    cods = {"pendentes": 1, "rejeitadas": 4, "autorizadas": 6, "canceladas": 2}
+    out, aproximado = {}, False
+    for nome, cod in cods.items():
+        t, a = _conta(cod)
+        out[nome] = t
+        aproximado = aproximado or a
+    tt, ta = _conta(None)
+    out["todas"] = tt
+    out["aproximado"] = aproximado or ta
+    return out
+
+
+def pedidos_sem_nfe(user_id: int, dias: int = 30) -> dict:
+    """Pedidos de venda do Bling (TODOS os canais) sem NF-e emitida no período.
+    Cruza numeroLoja/numero do pedido com o numeroPedidoLoja das notas recentes —
+    sem precisar abrir pedido por pedido."""
+    import datetime as _dt
+    fim = _dt.date.today()
+    ini = fim - _dt.timedelta(days=dias)
+
+    # 1) Notas recentes -> conjunto de pedidos que JÁ têm nota (qualquer situação)
+    com_nota = set()
+    for p in range(1, 21):
+        try:
+            data = bling.listar_nfe(user_id, pagina=p, limite=100,
+                                    data_ini=ini.isoformat(), data_fim=fim.isoformat())
+        except Exception:
+            break
+        lote = data.get("data", []) or []
+        for n in lote:
+            ped = str(n.get("numeroPedidoLoja") or "").strip()
+            if ped:
+                com_nota.add(ped)
+        if len(lote) < 100:
+            break
+
+    # 2) Pedidos do período
+    try:
+        pedidos = bling.listar_pedidos_periodo(user_id, dias=dias, max_paginas=8)
+    except Exception:
+        pedidos = []
+
+    try:
+        lojas_map = _mapear_lojas_plataforma(user_id)
+    except Exception:
+        lojas_map = {}
+
+    sem = []
+    for p in pedidos:
+        if not isinstance(p, dict):
+            continue
+        # Sinal direto: se o pedido já traz a NF-e vinculada no payload, está coberto.
+        nf = p.get("notaFiscal") or p.get("notafiscal") or p.get("nfe")
+        if isinstance(nf, dict) and (nf.get("id") or nf.get("numero") or nf.get("chaveAcesso")):
+            continue
+        loja = str(p.get("numeroLoja") or p.get("numeroPedidoLoja") or p.get("numeroPedido") or "").strip()
+        num = str(p.get("numero") or "").strip()
+        chave = loja or num
+        if chave and chave in com_nota:
+            continue
+        loja_obj = p.get("loja") if isinstance(p.get("loja"), dict) else {}
+        loja_id = loja_obj.get("id") or loja_obj.get("idLoja")
+        plat = (lojas_map or {}).get(str(loja_id)) if loja_id else None
+        contato = p.get("contato") if isinstance(p.get("contato"), dict) else {}
+        valor = _num(p.get("total"))
+        if not valor:
+            for k in ("totalProdutos", "totalvenda", "totalVenda", "valor", "valorNota"):
+                valor = _num(p.get(k))
+                if valor:
+                    break
+        sem.append({
+            "id": p.get("id"),
+            "numero": num,
+            "numero_loja": loja,
+            "data": p.get("data") or p.get("dataEmissao") or p.get("dataSaida"),
+            "valor": valor,
+            "cliente": contato.get("nome"),
+            "plataforma": plat,
+        })
+    sem.sort(key=lambda x: x.get("data") or "", reverse=True)
+    valor_total = round(sum(s["valor"] for s in sem), 2)
+    return {"dias": dias, "total": len(sem), "valor_total": valor_total, "pedidos": sem[:50]}
 
 
 def editar_nota(user_id: int, nfe_id, *, desconto_tipo, desconto_valor,

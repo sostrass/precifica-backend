@@ -105,6 +105,10 @@ def status(user_id: int) -> dict:
             "iniciado_em": est.iniciado_em.isoformat() if est.iniciado_em else None,
             "concluido_em": est.concluido_em.isoformat() if est.concluido_em else None,
         }
+    except Exception:  # noqa: BLE001 — tabela ainda não criada / banco indisponível: não derruba a página
+        db.rollback()
+        return {"status": "ocioso", "total": 0, "erro": None,
+                "iniciado_em": None, "concluido_em": None}
     finally:
         db.close()
 

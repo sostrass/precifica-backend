@@ -72,6 +72,10 @@ def garantir_colunas_extras():
         "nfe_config": [
             ("desconto_plataformas", "JSON"),
         ],
+        "produto_cache": [
+            ("imagem", "VARCHAR"),
+            ("marketplaces", "JSON"),
+        ],
     }
     try:
         with engine.begin() as conn:

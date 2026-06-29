@@ -133,16 +133,23 @@ async def _agendador_promo():
 async def lifespan(app: FastAPI):
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
+    # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
+    # antes uma lista fixa engolia erros e podia pular tabelas novas (ex.: shopee_sync).
     try:
-        from .models import (ProdutoSync, ProdutoCache, CatalogoSync,
-                             ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
-                             ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog,
-                             ShopeeImpressaoConfig, Notificacao)
-        for M in (WebhookEvento, ProdutoSync, ProdutoCache, CatalogoSync,
-                  ShopeeConta, ShopeeBoostItem, ShopeeBoostConfig, ShopeeReviewConfig,
-                  ShopeePromoConfig, ShopeeVendaSnapshot, ShopeePromoLog, ShopeeReviewLog,
-                  ShopeeImpressaoConfig, Notificacao):
-            M.__table__.create(bind=engine, checkfirst=True)
+        from . import models as _modelos  # noqa: F401 — registra todos os modelos no metadata
+        Base.metadata.create_all(bind=engine)
+    except Exception:  # noqa: BLE001
+        pass
+    # Rede de segurança: cada tabela nova em seu próprio try — uma falha não trava as outras.
+    try:
+        from .models import (ProdutoCache, CatalogoSync, ProdutoPrecoSnapshot,
+                             ShopeeItemCache, ShopeeSync, VinculosSync, Notificacao)
+        for M in (ProdutoCache, CatalogoSync, ProdutoPrecoSnapshot,
+                  ShopeeItemCache, ShopeeSync, VinculosSync, Notificacao):
+            try:
+                M.__table__.create(bind=engine, checkfirst=True)
+            except Exception:  # noqa: BLE001
+                pass
     except Exception:  # noqa: BLE001
         pass
     garantir_colunas_extras()  # colunas novas em tabelas já existentes (auto-seleção do boost)
@@ -354,6 +361,22 @@ def catalogo_sincronizar(background_tasks: BackgroundTasks, user: User = Depends
 @app.get("/api/catalogo/sync_status")
 def catalogo_sync_status(user: User = Depends(auth.get_current_user)):
     return catalogo.status(user.id)
+
+
+@app.post("/api/catalogo/vinculos/enriquecer")
+def catalogo_vinculos_enriquecer(background_tasks: BackgroundTasks, user: User = Depends(auth.get_current_user)):
+    """Dispara o mapeamento de canais por produto (lê os vínculos no Bling, ~1 chamada por
+    produto). Roda em background; acompanhe por /api/catalogo/vinculos/status."""
+    st = catalogo.status_vinculos(user.id)
+    if st.get("status") == "rodando":
+        return {"ok": True, "ja_rodando": True, **st}
+    background_tasks.add_task(catalogo.enriquecer_vinculos, user.id)
+    return {"ok": True, "iniciado": True}
+
+
+@app.get("/api/catalogo/vinculos/status")
+def catalogo_vinculos_status(user: User = Depends(auth.get_current_user)):
+    return catalogo.status_vinculos(user.id)
 
 
 @app.post("/api/shopee/catalogo/sincronizar")
@@ -1480,9 +1503,68 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
         "preco_alvo": alvo_por_canal.get(v.get("canal")),
         "prejuizo": bool(v["preco"] > 0 and base > 0 and v["preco"] < base),
     } for v in vinc]
+
+    # Painel por canal: TODOS os canais ativos do config, com líquido realizado + status,
+    # mesclando os vínculos existentes. Alimenta a tabela e os badges do cockpit.
+    vinc_por_canal = {v.get("canal"): v for v in vinc if v.get("canal")}
+
+    def _liq_canal(faixas, preco):
+        if not preco or preco <= 0:
+            return None
+        fx = precificacao._faixa_para_preco(faixas, preco) if faixas else {}
+        taxa = preco * (float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)) / 100.0 + float(fx.get("fixo") or 0)
+        return round(preco - taxa - preco * float(cfg.get("imposto") or 0) / 100.0 - float(cfg.get("embalagem") or 0), 2)
+
+    canais_painel = []
+    for c in (cfg.get("canais") or []):
+        if not c.get("ativo"):
+            continue
+        cn = c.get("canal")
+        v = vinc_por_canal.get(cn)
+        preco_reg = float(v["preco"]) if (v and v.get("preco") and v["preco"] > 0) else None
+        publicado = bool(v and v.get("publicado") and preco_reg)
+        liquido = _liq_canal(c.get("faixas") or [], preco_reg) if preco_reg else None
+        if not publicado:
+            status = "falta_anunciar"
+        elif liquido is None:
+            status = "sem_preco"
+        elif liquido < 0:
+            status = "prejuizo"
+        elif base > 0 and liquido < base - 0.01:
+            status = "abaixo"
+        else:
+            status = "no_padrao"
+        canais_painel.append({
+            "canal": cn, "nome": c.get("nome") or cn, "publicado": publicado,
+            "preco_registrado": preco_reg, "preco_alvo": alvo_por_canal.get(cn),
+            "liquido": liquido, "status": status,
+            "id_loja": v.get("id_loja") if v else None,
+            "id_anuncio": v.get("id_anuncio") if v else None,
+        })
+
     return {"produto_id": raw.get("id"), "sku": raw.get("codigo"),
             "base_venda": round(base, 2), "canais": canais,
+            "canais_painel": canais_painel,
             "vinculos": vinculos, "fonte_lida": bool(vinc)}
+
+
+@app.get("/api/produtos/{produto_id}/preco_historico")
+def produto_preco_historico(produto_id, dias: int = 30, user: User = Depends(auth.get_current_user)):
+    """Histórico do Preço Bling por dia (gravado a cada sync). Alimenta o gráfico do cockpit."""
+    from .models import ProdutoPrecoSnapshot
+    from datetime import date, timedelta
+    limite = date.today() - timedelta(days=max(1, min(int(dias or 30), 180)))
+    db = SessionLocal()
+    try:
+        rows = (db.query(ProdutoPrecoSnapshot)
+                .filter(ProdutoPrecoSnapshot.user_id == user.id,
+                        ProdutoPrecoSnapshot.produto_id == str(produto_id),
+                        ProdutoPrecoSnapshot.dia >= limite)
+                .order_by(ProdutoPrecoSnapshot.dia.asc()).all())
+        pontos = [{"dia": r.dia.isoformat() if r.dia else None, "preco": float(r.preco or 0)} for r in rows]
+    finally:
+        db.close()
+    return {"produto_id": str(produto_id), "pontos": pontos}
 
 
 @app.get("/api/diagnostico/multiloja/{produto_id}")
@@ -1846,10 +1928,6 @@ def monitoramento(payload: dict = Body(default={}),
     canal = payload.get("canal", "bling")
     cfg = precificacao.obter_config(user.id)
     canal_cfg = precificacao._canal_cfg(cfg, canal) if (canal and canal != "bling") else None
-    try:
-        vendas = shopee.vendas_por_sku(user.id)
-    except Exception:
-        vendas = {}
 
     def _monta(produto_id, sku, nome, preco_bling, custo, estoque, atualizado, imagem=None, marketplaces=None, vendas_un=0):
         margem = round((preco_bling - custo) / preco_bling * 100, 1) if (preco_bling > 0 and custo > 0) else None
@@ -1879,17 +1957,34 @@ def monitoramento(payload: dict = Body(default={}),
             "preco_atual": preco_bling, "preco_sugerido": pra_netar, "margem_liquida": margem or 0,
         }
 
+    from sqlalchemy.orm import load_only
+    from .models import ShopeeItemCache
     db = SessionLocal()
     try:
-        linhas = db.query(ProdutoCache).filter_by(user_id=user.id).all()
+        linhas = (db.query(ProdutoCache)
+                  .options(load_only(ProdutoCache.produto_id, ProdutoCache.sku, ProdutoCache.nome,
+                                     ProdutoCache.imagem, ProdutoCache.preco, ProdutoCache.custo,
+                                     ProdutoCache.saldo, ProdutoCache.marketplaces, ProdutoCache.atualizado_em))
+                  .filter_by(user_id=user.id).all())
+        try:
+            shopee_skus = {s[0] for s in db.query(ShopeeItemCache.sku).filter(
+                ShopeeItemCache.user_id == user.id, ShopeeItemCache.sku.isnot(None)).all() if s[0]}
+        except Exception:  # noqa: BLE001 — cache da Shopee ainda sem tabela: segue sem badge Shopee
+            db.rollback()
+            shopee_skus = set()
     finally:
         db.close()
 
+    def _mk(reg_marketplaces, sku):
+        out = [m for m in (reg_marketplaces or []) if isinstance(m, dict) and m.get("canal")]
+        canais = {m.get("canal") for m in out}
+        if sku in shopee_skus and "shopee" not in canais:
+            out.append({"canal": "shopee", "publicado": True})
+        return out
+
     if linhas:
         itens = [_monta(p.produto_id, p.sku, p.nome, float(p.preco or 0), float(p.custo or 0),
-                        float(p.saldo or 0), p.atualizado_em,
-                        _img_do_payload(p.dados), _marketplaces_do_payload(p.dados),
-                        int(vendas.get(p.sku, 0) or 0)) for p in linhas]
+                        float(p.saldo or 0), p.atualizado_em, p.imagem, _mk(p.marketplaces, p.sku), 0) for p in linhas]
         return {"canal": canal, "fonte": "cache", "total": len(itens), "itens": itens}
 
     # Fallback: cache ainda não sincronizado — lê o Bling ao vivo (limitado).
@@ -1903,9 +1998,61 @@ def monitoramento(payload: dict = Body(default={}),
         custo = float(p.get("precoCusto") or (p.get("fornecedor") or {}).get("precoCusto") or 0)
         itens.append(_monta(p.get("id"), p.get("codigo"), p.get("nome"),
                             float(p.get("preco") or 0), custo, 0.0, None,
-                            _img_do_payload(p), _marketplaces_do_payload(p),
-                            int(vendas.get(p.get("codigo"), 0) or 0)))
+                            _img_do_payload(p), _mk(None, p.get("codigo")), 0))
     return {"canal": canal, "fonte": "bling", "total": len(itens), "itens": itens}
+
+
+@app.get("/api/catalogo/vendas")
+def catalogo_vendas(user: User = Depends(auth.get_current_user)):
+    """Vendas 30d por SKU (Shopee) — chamada à parte pra não travar a lista do Catálogo."""
+    try:
+        return {"vendas": shopee.vendas_por_sku(user.id)}
+    except Exception:  # noqa: BLE001
+        return {"vendas": {}}
+
+
+@app.post("/api/catalogo/ajustar_precos")
+def catalogo_ajustar_precos(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Ajuste em massa do Preço Bling dos produtos selecionados.
+    Body: {ids:[produto_id], modo:'pct'|'fixo', direcao:'mais'|'menos', valor:float}.
+    Recalcula cada preço-base, grava no Bling e atualiza o cache local."""
+    from .models import ProdutoCache
+    ids = [str(i) for i in (payload.get("ids") or [])]
+    modo = payload.get("modo", "pct")
+    direcao = payload.get("direcao", "mais")
+    valor = float(payload.get("valor") or 0)
+    if not ids or valor <= 0:
+        raise HTTPException(status_code=422, detail="Informe os itens e um valor positivo.")
+    sinal = 1 if direcao == "mais" else -1
+    db = SessionLocal()
+    resultados, aplicados = [], 0
+    try:
+        regs = {r.produto_id: r for r in db.query(ProdutoCache).filter(
+            ProdutoCache.user_id == user.id, ProdutoCache.produto_id.in_(ids)).all()}
+        for pid in ids:
+            reg = regs.get(pid)
+            base = float(reg.preco or 0) if reg else 0.0
+            if base <= 0:
+                resultados.append({"id": pid, "erro": "sem preço-base"})
+                continue
+            novo = base * (1 + sinal * valor / 100.0) if modo == "pct" else base + sinal * valor
+            novo = round(max(novo, 0.01), 2)
+            try:
+                bling.atualizar_preco(user.id, int(pid), novo)
+                if reg:
+                    reg.preco = novo
+                aplicados += 1
+                resultados.append({"id": pid, "de": round(base, 2), "para": novo, "ok": True})
+            except Exception as e:  # noqa: BLE001
+                resultados.append({"id": pid, "erro": str(e)[:120]})
+        db.commit()
+    finally:
+        db.close()
+    if aplicados:
+        from . import notificacoes as notif
+        notif.criar(user.id, "precificacao", f"{aplicados} preço(s) ajustado(s) em massa",
+                    f"Ajuste de Preço Bling aplicado a {aplicados} produto(s).", ok=True, modulo="catalogo")
+    return {"aplicados": aplicados, "total": len(ids), "itens": resultados}
 
 
 # ------------------------------ Concorrência ------------------------------ #
@@ -2284,6 +2431,38 @@ def nfe_pendentes(pagina: int = 1, limite: int = 100,
         raise HTTPException(status_code=401, detail=str(e))
 
 
+@app.get("/api/nfe/pendentes/todas")
+def nfe_pendentes_todas(situacao: int | None = None, max_paginas: int = 80,
+                        user: User = Depends(auth.get_current_user)):
+    """Lista TODAS as NF-e da situação, paginando o Bling até esgotar (sem o limite de 100).
+    A lista é leve (sem valor/UF — esses vêm do /valores em lote). Teto de páginas por segurança."""
+    import time as _t
+    cfg = _nfe_cfg(user.id)
+    # situacao=0 => "Todas" (sem filtro de situação); None => padrão (pendentes); demais => filtra
+    if situacao == 0:
+        sit = None
+    elif situacao is not None:
+        sit = situacao
+    else:
+        sit = cfg.situacao_pendente
+    todas = []
+    try:
+        pagina = 1
+        while pagina <= max_paginas:
+            raw = bling.listar_nfe(user.id, pagina=pagina, limite=100, situacao=sit)
+            lote = nfe.resumir_lista(raw)
+            if not lote:
+                break
+            todas.extend(lote)
+            if len(lote) < 100:
+                break
+            pagina += 1
+            _t.sleep(0.2)  # respeita o rate limit do Bling
+        return {"notas": todas, "situacao": sit, "total": len(todas), "paginas": pagina}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
 @app.post("/api/nfe/simular")
 def nfe_simular(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Revisão pura (sem tocar no Bling): recalcula desconto/frete sobre os itens.
@@ -2372,6 +2551,24 @@ def nfe_faturamento_recalcular(background: BackgroundTasks,
     resultado depois via GET /api/nfe/faturamento."""
     background.add_task(nfe.recalcular_faturamento, user.id)
     return {"iniciado": True, "mensagem": "Recálculo iniciado. Pode levar alguns minutos; atualize em instantes."}
+
+
+@app.get("/api/nfe/contagens")
+def nfe_contagens(user: User = Depends(auth.get_current_user)):
+    """Contagem de notas por situação (para as abas). Paginação leve da lista resumida."""
+    try:
+        return nfe.contagens_situacao(user.id)
+    except Exception:
+        return {"pendentes": 0, "rejeitadas": 0, "autorizadas": 0, "canceladas": 0, "todas": 0, "aproximado": False}
+
+
+@app.get("/api/nfe/pedidos-sem-nfe")
+def nfe_pedidos_sem_nfe(dias: int = 30, user: User = Depends(auth.get_current_user)):
+    """Pedidos de venda do Bling (todos os canais) sem NF-e emitida no período."""
+    try:
+        return nfe.pedidos_sem_nfe(user.id, dias=dias)
+    except Exception as e:
+        return {"dias": dias, "total": 0, "valor_total": 0, "pedidos": [], "erro": str(e)}
 
 
 @app.post("/api/nfe/aplicar-todas")
@@ -2475,10 +2672,23 @@ def nfe_obter(nfe_id: str, user: User = Depends(auth.get_current_user)):
 
 @app.get("/api/nfe/{nfe_id}/completa")
 def nfe_completa(nfe_id: str, user: User = Depends(auth.get_current_user)):
-    """Visão COMPLETA da nota: destinatário, totais, impostos, transporte, itens e links."""
+    """Visão COMPLETA da nota: emitente, destinatário, totais, impostos, transporte, itens e links."""
     try:
-        return nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id),
-                                nfe._mapear_lojas_plataforma(user.id))
+        det = nfe.detalhar_nfe(bling.obter_nfe(user.id, nfe_id),
+                               nfe._mapear_lojas_plataforma(user.id))
+        # Emitente (sua empresa) — reaproveita os dados do cadastro de impressão (etiqueta/folha).
+        try:
+            imp = shopee_impressao.obter_config(user.id) or {}
+            nome = (imp.get("emitente_nome") or "").strip()
+            det["emitente"] = {
+                "nome": nome,
+                "cnpj": (imp.get("emitente_cnpj") or "").strip(),
+                "endereco": (imp.get("emitente_endereco") or "").strip(),
+                "cidade": (imp.get("emitente_cidade") or "").strip(),
+            } if nome or imp.get("emitente_cnpj") else None
+        except Exception:
+            det["emitente"] = None
+        return det
     except bling.BlingNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except bling.BlingAuthError as e:
