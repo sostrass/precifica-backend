@@ -1505,6 +1505,16 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
                                 .order_by(ShopeeItemCache.atualizado_em.desc()).first())
         except Exception:  # noqa: BLE001
             shopee_cache = None
+    # Mercado Livre: API direta (igual à Shopee). Dormente até as credenciais existirem —
+    # configurado() é False sem ML_CLIENT_ID/SECRET/REFRESH_TOKEN, então isto vira no-op.
+    ml_item = None
+    if sku_prod:
+        try:
+            from . import mercadolivre as _ml
+            if _ml.configurado():
+                ml_item = _ml.buscar_item_por_sku(sku_prod)
+        except Exception:  # noqa: BLE001
+            ml_item = None
     precos = {v["canal"]: v["preco"] for v in vinc if v.get("canal") and v["preco"] > 0}
     canais = precificacao.divergencias(cfg, base, precos)
     alvo_por_canal = {c["canal"]: c.get("preco_alvo") for c in canais}
@@ -1565,6 +1575,15 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
                 cp = float(shopee_cache.preco_original or 0) or float(shopee_cache.preco or 0)
                 if cp > 0:
                     preco_reg = cp
+        # Mercado Livre: API direta. Marca publicado e completa preço/anúncio.
+        if cn == "mercadolivre" and ml_item:
+            publicado = True
+            if not item_id:
+                item_id = ml_item.get("item_id")
+            if preco_reg is None:
+                mp = float(ml_item.get("preco_original") or 0) or float(ml_item.get("preco") or 0)
+                if mp > 0:
+                    preco_reg = mp
         # mostra o canal se está ativo na config OU se o produto já está anunciado nele
         if not c.get("ativo") and not publicado:
             continue
@@ -1638,13 +1657,172 @@ def produto_simular_liquido(produto_id, canal: str, preco: float,
                 "taxa": None, "custo": round(custo, 2), "alvo": round(base, 2), "abaixo_alvo": False}
     fx = precificacao._faixa_para_preco(faixas, preco) if faixas else {}
     fx = fx or {}
-    taxa = preco * (float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)) / 100.0 + float(fx.get("fixo") or 0)
-    liquido = round(preco - taxa - preco * float(cfg.get("imposto") or 0) / 100.0 - float(cfg.get("embalagem") or 0), 2)
+    comissao_pct = float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)
+    taxa_fixa = float(fx.get("fixo") or 0)
+    taxa = preco * comissao_pct / 100.0 + taxa_fixa
+    imp_pct = float(cfg.get("imposto") or 0)
+    imp_val = preco * imp_pct / 100.0
+    emb = float(cfg.get("embalagem") or 0)
+    liquido = round(preco - taxa - imp_val - emb, 2)
     margem = round((liquido - custo) / liquido * 100, 1) if (custo > 0 and liquido) else None
+    # quebra do líquido (cascata "anatomia do líquido"): cada dedução do preço de lista
+    quebra = []
+    if taxa:
+        rot = f"Taxa {canal} {comissao_pct:.0f}%".strip() if comissao_pct else "Taxa fixa do canal"
+        quebra.append({"rotulo": rot, "valor": -round(taxa, 2)})
+    if imp_val:
+        quebra.append({"rotulo": f"Imposto {imp_pct:.0f}%", "valor": -round(imp_val, 2)})
+    if emb:
+        quebra.append({"rotulo": "Embalagem / custo fixo", "valor": -round(emb, 2)})
     return {"canal": canal, "preco": round(preco, 2), "liquido": liquido, "taxa": round(taxa, 2),
             "custo": round(custo, 2), "margem": margem, "alvo": round(base, 2),
-            "abaixo_alvo": bool(base > 0 and liquido < base - 0.01),
+            "lucro": round(liquido - custo, 2) if custo > 0 else None,
+            "imposto_pct": imp_pct, "comissao_pct": comissao_pct,
+            "quebra": quebra, "abaixo_alvo": bool(base > 0 and liquido < base - 0.01),
             "tem_faixas": bool(faixas)}
+
+
+@app.get("/api/produtos/{produto_id}/qualidade")
+def produto_qualidade(produto_id, user: User = Depends(auth.get_current_user)):
+    """Diagnóstico de qualidade do anúncio: funde o anúncio da Shopee (fotos, vídeo,
+    descrição) com a ficha do Bling (título, EAN, NCM, peso). Devolve nota 0-100,
+    componentes com status e um plano priorizado. Tudo dado real — nada inventado."""
+    try:
+        raw = (bling.obter_produto(user.id, produto_id) or {}).get("data", {}) or {}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    def _dig(v):
+        return "".join(c for c in str(v or "") if c.isdigit())
+
+    nome = (raw.get("nome") or "").strip()
+    sku = raw.get("codigo")
+    ean = raw.get("gtin") or raw.get("gtinEmbalagem") or ""
+    ncm = raw.get("ncm") or (raw.get("tributacao") or {}).get("ncm") or ""
+    peso = float(raw.get("pesoBruto") or raw.get("pesoLiquido") or 0)
+    desc_bling = (raw.get("descricaoCurta") or raw.get("descricaoComplementar")
+                  or raw.get("observacoes") or "")
+
+    # --- anúncio Shopee (fotos, vídeo, descrição, título) ---
+    fotos = None
+    tem_video = False
+    desc_shopee = ""
+    titulo_shopee = ""
+    tem_shopee = False
+    if sku:
+        try:
+            from .models import ShopeeItemCache
+            with SessionLocal() as _db:
+                cache = (_db.query(ShopeeItemCache)
+                         .filter_by(user_id=user.id, sku=sku)
+                         .order_by(ShopeeItemCache.atualizado_em.desc()).first())
+            if cache and cache.item_id:
+                info = shopee.info_itens(user.id, [cache.item_id])
+                lst = ((info.get("response") or {}).get("item_list") or [])
+                if lst:
+                    it = lst[0]
+                    tem_shopee = True
+                    img = (it.get("image") or {})
+                    fotos = len(img.get("image_url_list") or img.get("image_id_list") or [])
+                    vid = it.get("video_info") or it.get("video_upload_id") or []
+                    tem_video = bool(vid)
+                    desc_shopee = it.get("description") or ""
+                    titulo_shopee = it.get("item_name") or ""
+        except Exception:  # noqa: BLE001
+            tem_shopee = False
+
+    titulo = titulo_shopee or nome
+    desc = desc_shopee if len(desc_shopee) >= len(desc_bling) else desc_bling
+    len_tit = len(titulo)
+    len_desc = len(desc)
+
+    componentes = []
+    score = 0.0
+
+    # Título (peso 20)
+    if len_tit >= 40:
+        s, st = 20, "ok"
+    elif len_tit >= 30:
+        s, st = 15, "ok"
+    elif len_tit >= 15:
+        s, st = 8, "atencao"
+    else:
+        s, st = 0, "falta"
+    score += s
+    componentes.append({"chave": "titulo", "label": "Título", "valor": s, "max": 20, "status": st,
+                        "detalhe": f"{len_tit} caracteres" + (" · com palavras-chave" if len_tit >= 40 else ""),
+                        "acao": None if st == "ok" else "Use 40+ caracteres com material e medida."})
+
+    # Fotos (peso 25) — só Shopee tem essa info
+    if tem_shopee and fotos is not None:
+        s = round(25 * min(fotos, 9) / 9)
+        st = "ok" if fotos >= 9 else ("atencao" if fotos >= 4 else "falta")
+        det = f"{fotos}/9 fotos"
+        ac = None if fotos >= 9 else f"Adicione mais {9 - fotos} — anúncios com 9 fotos vendem mais."
+    else:
+        s, st, det, ac = 0, "sem_dados", "sem anúncio Shopee", "Vincule/sincronize a Shopee pra ler as fotos."
+    score += s
+    componentes.append({"chave": "fotos", "label": "Fotos", "valor": s, "max": 25, "status": st,
+                        "detalhe": det, "acao": ac, "fotos": fotos})
+
+    # Atributos da ficha (peso 20): EAN + NCM + peso
+    faltam = []
+    if len(_dig(ean)) not in (8, 12, 13, 14):
+        faltam.append("EAN/GTIN")
+    if len(_dig(ncm)) != 8:
+        faltam.append("NCM")
+    if peso <= 0:
+        faltam.append("peso")
+    ok_attr = 3 - len(faltam)
+    s = round(20 * ok_attr / 3)
+    st = "ok" if not faltam else ("atencao" if ok_attr >= 1 else "falta")
+    score += s
+    componentes.append({"chave": "atributos", "label": "Atributos", "valor": s, "max": 20, "status": st,
+                        "detalhe": "completos" if not faltam else f"faltam {len(faltam)}: {', '.join(faltam)}",
+                        "acao": None if not faltam else f"Preencha: {', '.join(faltam)}."})
+
+    # Descrição (peso 20)
+    if len_desc >= 200:
+        s, st = 20, "ok"
+    elif len_desc >= 80:
+        s, st = 12, "atencao"
+    else:
+        s, st = 0, "falta"
+    score += s
+    componentes.append({"chave": "descricao", "label": "Descrição", "valor": s, "max": 20, "status": st,
+                        "detalhe": f"{len_desc} caracteres" + (" · completa" if len_desc >= 200 else ""),
+                        "acao": None if st == "ok" else "Descreva medidas e benefícios (200+ caracteres)."})
+
+    # Vídeo (peso 15)
+    if tem_video:
+        s, st = 15, "ok"
+    elif tem_shopee:
+        s, st = 0, "falta"
+    else:
+        s, st = 0, "sem_dados"
+    score += s
+    componentes.append({"chave": "video", "label": "Vídeo", "valor": s, "max": 15, "status": st,
+                        "detalhe": "tem vídeo" if tem_video else ("sem vídeo" if tem_shopee else "sem anúncio Shopee"),
+                        "acao": None if tem_video else ("Anúncio com vídeo converte mais e aparece no feed." if tem_shopee else None)})
+
+    score = int(round(score))
+    if score >= 85:
+        label = "Excelente"
+    elif score >= 70:
+        label = "Bom — dá pra subir pra Excelente"
+    elif score >= 50:
+        label = "Regular — vale completar"
+    else:
+        label = "Precisa de atenção"
+
+    # plano priorizado (maior ganho primeiro)
+    plano = sorted([c for c in componentes if c["status"] in ("falta", "atencao", "sem_dados") and c.get("acao")],
+                   key=lambda c: (c["max"] - c["valor"]), reverse=True)
+    plano = [{"label": c["label"], "acao": c["acao"], "ganho": c["max"] - c["valor"]} for c in plano]
+    potencial = min(100, score + sum(p["ganho"] for p in plano))
+
+    return {"score": score, "label": label, "potencial": potencial,
+            "tem_shopee": tem_shopee, "componentes": componentes, "plano": plano}
 
 
 @app.get("/api/mercadolivre/status")
@@ -2049,6 +2227,28 @@ def monitoramento(payload: dict = Body(default={}),
     cfg = precificacao.obter_config(user.id)
     canal_cfg = precificacao._canal_cfg(cfg, canal) if (canal and canal != "bling") else None
 
+    # Preço praticado por canal: líquido que aquele preço de lista neta, e status vs Preço Bling (alvo).
+    canais_cfg = {c.get("canal"): c for c in (cfg.get("canais") or []) if c.get("canal")}
+    _imp = float(cfg.get("imposto") or 0)
+    _emb = float(cfg.get("embalagem") or 0)
+
+    def _status_canal(cn, preco_lista, preco_bling, custo):
+        if not preco_lista or preco_lista <= 0:
+            return None, None
+        ccfg = canais_cfg.get(cn)
+        fx = precificacao._faixa_para_preco(ccfg.get("faixas") or [], preco_lista) if (ccfg and ccfg.get("faixas")) else {}
+        taxa = preco_lista * (float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)) / 100.0 + float(fx.get("fixo") or 0)
+        liq = round(preco_lista - taxa - preco_lista * _imp / 100.0 - _emb, 2)
+        if custo and custo > 0 and liq <= custo:
+            flag = "prejuizo"
+        elif preco_bling and liq < preco_bling - 0.01:
+            flag = "abaixo"
+        elif preco_bling and liq > preco_bling + 0.01:
+            flag = "acima"
+        else:
+            flag = "ok"
+        return liq, flag
+
     def _monta(produto_id, sku, nome, preco_bling, custo, estoque, atualizado, imagem=None, marketplaces=None, vendas_un=0):
         margem = round((preco_bling - custo) / preco_bling * 100, 1) if (preco_bling > 0 and custo > 0) else None
         if preco_bling <= 0:
@@ -2087,30 +2287,62 @@ def monitoramento(payload: dict = Body(default={}),
                                      ProdutoCache.saldo, ProdutoCache.marketplaces, ProdutoCache.atualizado_em))
                   .filter_by(user_id=user.id).all())
         try:
-            shopee_img = {}
-            for s in db.query(ShopeeItemCache.sku, ShopeeItemCache.imagem).filter(
+            shopee_px = {}
+            for s in db.query(ShopeeItemCache.sku, ShopeeItemCache.imagem, ShopeeItemCache.preco,
+                              ShopeeItemCache.preco_original, ShopeeItemCache.em_promocao,
+                              ShopeeItemCache.promo_nome).filter(
                     ShopeeItemCache.user_id == user.id, ShopeeItemCache.sku.isnot(None)).all():
                 if s[0]:
-                    shopee_img[s[0]] = s[1]
-            shopee_skus = set(shopee_img.keys())
+                    prat = float(s[3] or 0) or float(s[2] or 0)   # preço cheio (original) ou atual
+                    promo = float(s[2] or 0)                      # preço corrente (promo, se houver)
+                    shopee_px[s[0]] = {"imagem": s[1], "preco": prat,
+                                       "preco_promo": promo if (s[4] and promo and promo < prat) else None,
+                                       "em_promocao": bool(s[4]), "promo_nome": s[5]}
+            shopee_img = {k: v["imagem"] for k, v in shopee_px.items()}
+            shopee_skus = set(shopee_px.keys())
         except Exception:  # noqa: BLE001 — cache da Shopee ainda sem tabela: segue sem badge/imagem Shopee
             db.rollback()
             shopee_skus = set()
             shopee_img = {}
+            shopee_px = {}
     finally:
         db.close()
 
-    def _mk(reg_marketplaces, sku):
-        out = [m for m in (reg_marketplaces or []) if isinstance(m, dict) and m.get("canal")]
+    def _mk(reg_marketplaces, sku, preco_bling=0.0, custo=0.0):
+        out = []
+        for m in (reg_marketplaces or []):
+            if not (isinstance(m, dict) and m.get("canal")):
+                continue
+            e = dict(m)
+            pl = float(e.get("preco") or 0)
+            if pl > 0:
+                e["liquido"], e["flag"] = _status_canal(e["canal"], pl, preco_bling, custo)
+            out.append(e)
         canais = {m.get("canal") for m in out}
-        if sku in shopee_skus and "shopee" not in canais:
+        # Shopee: cache direto é a fonte da verdade do preço praticado
+        sc = shopee_px.get(sku)
+        if sc:
+            sh = next((m for m in out if m.get("canal") == "shopee"), None)
+            if sh is None:
+                sh = {"canal": "shopee", "publicado": True}
+                out.append(sh)
+            sh["publicado"] = True
+            pl = float(sc.get("preco") or 0)
+            if pl > 0:
+                sh["preco"] = pl
+                sh["liquido"], sh["flag"] = _status_canal("shopee", pl, preco_bling, custo)
+            if sc.get("em_promocao"):
+                sh["promo"] = True
+                if sc.get("preco_promo"):
+                    sh["preco_promo"] = sc["preco_promo"]
+        elif sku in shopee_skus and "shopee" not in canais:
             out.append({"canal": "shopee", "publicado": True})
         return out
 
     if linhas:
         itens = [_monta(p.produto_id, p.sku, p.nome, float(p.preco or 0), float(p.custo or 0),
                         float(p.saldo or 0), p.atualizado_em, p.imagem or shopee_img.get(p.sku),
-                        _mk(p.marketplaces, p.sku), 0) for p in linhas]
+                        _mk(p.marketplaces, p.sku, float(p.preco or 0), float(p.custo or 0)), 0) for p in linhas]
         return {"canal": canal, "fonte": "cache", "total": len(itens), "itens": itens}
 
     # Fallback: cache ainda não sincronizado — lê o Bling ao vivo (limitado).
@@ -2124,7 +2356,7 @@ def monitoramento(payload: dict = Body(default={}),
         custo = float(p.get("precoCusto") or (p.get("fornecedor") or {}).get("precoCusto") or 0)
         itens.append(_monta(p.get("id"), p.get("codigo"), p.get("nome"),
                             float(p.get("preco") or 0), custo, 0.0, None,
-                            _img_do_payload(p), _mk(None, p.get("codigo")), 0))
+                            _img_do_payload(p), _mk(None, p.get("codigo"), float(p.get("preco") or 0), custo), 0))
     return {"canal": canal, "fonte": "bling", "total": len(itens), "itens": itens}
 
 
@@ -2401,6 +2633,23 @@ def radar_add_alvo(payload: dict = Body(...), user: User = Depends(auth.get_curr
 @app.get("/api/radar/alvos")
 def radar_list_alvos(sku: str | None = None, user: User = Depends(auth.get_current_user)):
     return {"alvos": radar.listar_alvos(user.id, sku)}
+
+
+@app.post("/api/radar/manual")
+def radar_add_manual(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Cadastra um concorrente digitado na mão e já grava o preço. Body: {sku, nome, preco, marketplace?}"""
+    sku = payload.get("sku")
+    nome = (payload.get("nome") or "").strip()
+    preco = payload.get("preco")
+    if not sku or not nome or preco in (None, ""):
+        raise HTTPException(status_code=422, detail="Informe 'sku', 'nome' e 'preco'.")
+    try:
+        p = float(str(preco).replace(",", "."))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="Preço inválido.")
+    if p <= 0:
+        raise HTTPException(status_code=422, detail="Preço deve ser maior que zero.")
+    return radar.adicionar_manual(user.id, sku, nome, p, payload.get("marketplace") or "shopee")
 
 
 @app.delete("/api/radar/alvos/{alvo_id}")

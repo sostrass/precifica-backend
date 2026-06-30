@@ -48,14 +48,21 @@ def estatisticas(precos) -> dict:
 # --------------------------------------------------------------------------- #
 # ALVOS (CRUD simples)
 # --------------------------------------------------------------------------- #
-def adicionar_alvo(user_id, sku, url, nome=None, marketplace=None) -> dict:
+def adicionar_alvo(user_id, sku, url=None, nome=None, marketplace=None) -> dict:
     with SessionLocal() as db:
-        alvo = RadarAlvo(user_id=user_id, sku=sku, url=url, nome=nome,
+        alvo = RadarAlvo(user_id=user_id, sku=sku, url=(url or "manual"), nome=nome,
                          marketplace=marketplace, ativo=True)
         db.add(alvo)
         db.commit()
         db.refresh(alvo)
         return _alvo_dict(alvo)
+
+
+def adicionar_manual(user_id, sku, nome, preco, marketplace="shopee") -> dict:
+    """Cadastra um concorrente digitado na mão (sem URL/scraping) e já registra o preço."""
+    alvo = adicionar_alvo(user_id, sku, url=None, nome=nome, marketplace=marketplace)
+    snap = registrar_snapshot(user_id, alvo["id"], preco_oferta=float(preco))
+    return {"alvo": alvo, "snapshot": snap}
 
 
 def menor_preco_concorrente(user_id, sku) -> float | None:
@@ -146,6 +153,8 @@ def varrer(user_id, sku) -> dict:
     alvos = [a for a in listar_alvos(user_id, sku) if a["ativo"]]
     resultados, mudancas = [], []
     for a in alvos:
+        if not str(a.get("url") or "").startswith("http"):
+            continue  # alvo manual (preço digitado) — não tem URL pra raspar
         anterior = _ultimo_preco_alvo(a["id"])
         achado = scraper.preco_de_url(a["url"], a.get("marketplace"))
         preco = achado.get("preco")
