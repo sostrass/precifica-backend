@@ -1516,17 +1516,20 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
         return round(preco - taxa - preco * float(cfg.get("imposto") or 0) / 100.0 - float(cfg.get("embalagem") or 0), 2)
 
     canais_painel = []
+    cobertos = set()
     for c in (cfg.get("canais") or []):
-        if not c.get("ativo"):
-            continue
         cn = c.get("canal")
         v = vinc_por_canal.get(cn)
+        # publicado = o produto está vinculado/anunciado nesse canal (independe de termos o preço)
+        publicado = bool(v and (v.get("publicado") or v.get("id_anuncio") or v.get("ativo") or v.get("preco")))
+        # mostra o canal se está ativo na config OU se o produto já está anunciado nele (ex.: Nuvemshop)
+        if not c.get("ativo") and not publicado:
+            continue
         preco_reg = float(v["preco"]) if (v and v.get("preco") and v["preco"] > 0) else None
-        publicado = bool(v and v.get("publicado") and preco_reg)
         liquido = _liq_canal(c.get("faixas") or [], preco_reg) if preco_reg else None
         if not publicado:
             status = "falta_anunciar"
-        elif liquido is None:
+        elif preco_reg is None or liquido is None:
             status = "sem_preco"
         elif liquido < 0:
             status = "prejuizo"
@@ -1537,15 +1540,67 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
         canais_painel.append({
             "canal": cn, "nome": c.get("nome") or cn, "publicado": publicado,
             "preco_registrado": preco_reg, "preco_alvo": alvo_por_canal.get(cn),
-            "liquido": liquido, "status": status,
+            "liquido": liquido, "status": status, "ativo_cfg": bool(c.get("ativo")),
             "id_loja": v.get("id_loja") if v else None,
             "id_anuncio": v.get("id_anuncio") if v else None,
         })
+        cobertos.add(cn)
+
+    # Canais onde o produto ESTÁ anunciado mas nem constam na config de precificação.
+    # Aparecem como publicados (pra não dizer "Anunciar" indevidamente); o líquido fica
+    # pendente até cadastrar as taxas do canal na configuração.
+    NOMES_CANAL = {"mercadolivre": "Mercado Livre", "shopee": "Shopee", "shein": "Shein",
+                   "tiktok": "TikTok", "nuvemshop": "Nuvemshop", "amazon": "Amazon",
+                   "magalu": "Magalu", "americanas": "Americanas", "tray": "Tray", "shopify": "Shopify"}
+    for v in vinc:
+        cn = v.get("canal") or ((v.get("integracao") or "").strip().lower() or None)
+        if not cn or cn in cobertos:
+            continue
+        if not (v.get("publicado") or v.get("id_anuncio") or v.get("ativo") or v.get("preco")):
+            continue
+        preco_reg = float(v["preco"]) if (v.get("preco") and v["preco"] > 0) else None
+        canais_painel.append({
+            "canal": cn, "nome": NOMES_CANAL.get(cn) or v.get("nome") or cn,
+            "publicado": True, "preco_registrado": preco_reg,
+            "preco_alvo": alvo_por_canal.get(cn), "liquido": None,
+            "status": "sem_preco" if preco_reg is None else "sem_taxas", "ativo_cfg": False,
+            "id_loja": v.get("id_loja"), "id_anuncio": v.get("id_anuncio"),
+        })
+        cobertos.add(cn)
 
     return {"produto_id": raw.get("id"), "sku": raw.get("codigo"),
             "base_venda": round(base, 2), "canais": canais,
             "canais_painel": canais_painel,
             "vinculos": vinculos, "fonte_lida": bool(vinc)}
+
+
+@app.get("/api/produtos/{produto_id}/simular")
+def produto_simular_liquido(produto_id, canal: str, preco: float,
+                            user: User = Depends(auth.get_current_user)):
+    """Simula o líquido e a margem de um preço hipotético num canal (sem gravar nada).
+    Usa as faixas/taxas do canal na config + imposto + embalagem + custo do produto.
+    Alimenta o cálculo ao vivo da Promoção e da edição manual por canal."""
+    try:
+        raw = (bling.obter_produto(user.id, produto_id) or {}).get("data", {}) or {}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    cfg = precificacao.obter_config(user.id)
+    base = float(raw.get("preco") or 0)
+    custo = float(raw.get("precoCusto") or (raw.get("fornecedor") or {}).get("precoCusto") or 0)
+    canal_cfg = next((c for c in (cfg.get("canais") or []) if c.get("canal") == canal), None)
+    faixas = (canal_cfg or {}).get("faixas") or []
+    if not preco or preco <= 0:
+        return {"canal": canal, "preco": preco, "liquido": None, "margem": None,
+                "taxa": None, "custo": round(custo, 2), "alvo": round(base, 2), "abaixo_alvo": False}
+    fx = precificacao._faixa_para_preco(faixas, preco) if faixas else {}
+    fx = fx or {}
+    taxa = preco * (float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)) / 100.0 + float(fx.get("fixo") or 0)
+    liquido = round(preco - taxa - preco * float(cfg.get("imposto") or 0) / 100.0 - float(cfg.get("embalagem") or 0), 2)
+    margem = round((liquido - custo) / liquido * 100, 1) if (custo > 0 and liquido) else None
+    return {"canal": canal, "preco": round(preco, 2), "liquido": liquido, "taxa": round(taxa, 2),
+            "custo": round(custo, 2), "margem": margem, "alvo": round(base, 2),
+            "abaixo_alvo": bool(base > 0 and liquido < base - 0.01),
+            "tem_faixas": bool(faixas)}
 
 
 @app.get("/api/produtos/{produto_id}/preco_historico")

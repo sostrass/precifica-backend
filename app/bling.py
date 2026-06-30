@@ -362,6 +362,8 @@ def listar_nfe(user_id: int, pagina: int = 1, limite: int = 100,
 MAPA_INTEGRACAO = {
     "mercadolivre": "mercadolivre", "shopee": "shopee", "amazon": "amazon",
     "magalu": "magalu", "americanas": "americanas", "via": "via",
+    "shein": "shein", "tiktok": "tiktok", "tiktokshop": "tiktok", "tiktok shop": "tiktok",
+    "nuvemshop": "nuvemshop", "nuvem": "nuvemshop", "tray": "tray", "shopify": "shopify",
 }
 
 
