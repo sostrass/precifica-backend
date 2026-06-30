@@ -1825,6 +1825,63 @@ def produto_qualidade(produto_id, user: User = Depends(auth.get_current_user)):
             "tem_shopee": tem_shopee, "componentes": componentes, "plano": plano}
 
 
+@app.post("/api/catalogo/kpi-snapshot")
+def catalogo_kpi_snapshot(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Upsert da foto de hoje dos KPIs do catálogo (1 linha por dia). O front manda os
+    números já calculados; aqui só guardamos pra alimentar tendência/sparkline."""
+    from datetime import date as _date
+    from .models import KpiSnapshot
+
+    def _i(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    if _i(payload.get("total")) <= 0:
+        return {"ok": False, "motivo": "catálogo ainda não carregado"}
+    hoje = _date.today()
+    with SessionLocal() as db:
+        row = db.query(KpiSnapshot).filter_by(user_id=user.id, dia=hoje).first()
+        if not row:
+            row = KpiSnapshot(user_id=user.id, dia=hoje)
+            db.add(row)
+        row.total = _i(payload.get("total"))
+        row.saudavel = _i(payload.get("saud"))
+        row.atencao = _i(payload.get("aten"))
+        row.prejuizo = _i(payload.get("prej"))
+        row.sem_custo = _i(payload.get("semCusto"))
+        row.val_estoque = float(payload.get("valEstoque") or 0)
+        row.marg_media = _f(payload.get("margMedia"))
+        row.cobertura = payload.get("cobertura") or []
+        row.criado_em = datetime.utcnow()
+        db.commit()
+    return {"ok": True, "dia": hoje.isoformat()}
+
+
+@app.get("/api/catalogo/kpi-historico")
+def catalogo_kpi_historico(dias: int = 30, user: User = Depends(auth.get_current_user)):
+    """Série diária dos KPIs pra desenhar tendência/sparkline no topo do Catálogo."""
+    from datetime import date as _date, timedelta as _td
+    from .models import KpiSnapshot
+    desde = _date.today() - _td(days=int(dias))
+    with SessionLocal() as db:
+        rows = (db.query(KpiSnapshot)
+                .filter(KpiSnapshot.user_id == user.id, KpiSnapshot.dia >= desde)
+                .order_by(KpiSnapshot.dia.asc()).all())
+        pontos = [{"dia": r.dia.isoformat(), "total": r.total, "saud": r.saudavel,
+                   "aten": r.atencao, "prej": r.prejuizo, "sem_custo": r.sem_custo,
+                   "val_estoque": r.val_estoque, "marg_media": r.marg_media,
+                   "cobertura": r.cobertura} for r in rows]
+    return {"pontos": pontos}
+
+
 @app.get("/api/mercadolivre/status")
 def mercadolivre_status(user: User = Depends(auth.get_current_user)):
     """Status da integração direta com o Mercado Livre (mesma ideia da Shopee)."""

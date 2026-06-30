@@ -493,3 +493,24 @@ class ShopeeSync(Base):
     erro = Column(String, nullable=True)
     iniciado_em = Column(DateTime, nullable=True)
     concluido_em = Column(DateTime, nullable=True)
+
+
+class KpiSnapshot(Base):
+    """Foto diária dos KPIs do catálogo (1 linha por dia por usuário). O acúmulo
+    alimenta as setas de tendência e os sparklines do topo do Catálogo."""
+
+    __tablename__ = "kpi_snapshot"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    dia = Column(Date, nullable=False, index=True)
+    total = Column(Integer, default=0)
+    saudavel = Column(Integer, default=0)
+    atencao = Column(Integer, default=0)
+    prejuizo = Column(Integer, default=0)
+    sem_custo = Column(Integer, default=0)
+    val_estoque = Column(Float, default=0.0)
+    marg_media = Column(Float, nullable=True)
+    cobertura = Column(JSON, nullable=True)
+    criado_em = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "dia", name="uq_kpi_user_dia"),)
