@@ -1536,6 +1536,18 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
         taxa = preco * (float(fx.get("comissao") or 0) + float(fx.get("fixo_pct") or 0)) / 100.0 + float(fx.get("fixo") or 0)
         return round(preco - taxa - preco * float(cfg.get("imposto") or 0) / 100.0 - float(cfg.get("embalagem") or 0), 2)
 
+    # id_loja por canal a partir das lojas conhecidas da conta. É o que garante que o
+    # "Aplicar" SEMPRE grava no Bling (hub/fonte da verdade), mesmo quando a v3 não
+    # devolve o vínculo com preço — senão a próxima sincronização propaga o preço antigo.
+    lojas_por_canal = {}
+    try:
+        for lj, meta in bling.lojas_da_conta(user.id).items():
+            cn_l = bling.MAPA_INTEGRACAO.get((meta.get("integracao") or "").lower())
+            if cn_l and cn_l not in lojas_por_canal:
+                lojas_por_canal[cn_l] = lj
+    except Exception:  # noqa: BLE001
+        lojas_por_canal = {}
+
     canais_painel = []
     cobertos = set()
     for c in (cfg.get("canais") or []):
@@ -1571,7 +1583,7 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
             "canal": cn, "nome": c.get("nome") or cn, "publicado": publicado,
             "preco_registrado": preco_reg, "preco_alvo": alvo_por_canal.get(cn),
             "liquido": liquido, "status": status, "ativo_cfg": bool(c.get("ativo")),
-            "id_loja": v.get("id_loja") if v else None,
+            "id_loja": (v.get("id_loja") if v else None) or lojas_por_canal.get(cn),
             "id_anuncio": (v.get("id_anuncio") if v else None) or item_id,
             "item_id": item_id,
         })
@@ -1595,7 +1607,8 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
             "publicado": True, "preco_registrado": preco_reg,
             "preco_alvo": alvo_por_canal.get(cn), "liquido": None,
             "status": "sem_preco" if preco_reg is None else "sem_taxas", "ativo_cfg": False,
-            "id_loja": v.get("id_loja"), "id_anuncio": v.get("id_anuncio"),
+            "id_loja": v.get("id_loja") or lojas_por_canal.get(cn),
+            "id_anuncio": v.get("id_anuncio"), "item_id": None,
         })
         cobertos.add(cn)
 
