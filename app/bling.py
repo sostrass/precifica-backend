@@ -424,7 +424,9 @@ def vinculos_multiloja(user_id: int, produto_id) -> list:
     for chave in ("vinculosLojas", "lojas", "produtosLojas"):
         if isinstance(raw.get(chave), list) and raw[chave]:
             return parse_vinculos_multiloja(raw[chave])
-    # fallback por idLoja
+    # fallback por idLoja: lê o produto no contexto de cada loja conhecida.
+    # Considera "listado" se a resposta trouxer um id de anúncio da loja OU um preço
+    # próprio (≠ base). Assim não perde canais publicados ao preço base (ex.: Nuvemshop).
     base_preco = _preco_br(raw.get("preco")) if isinstance(raw.get("preco"), str) else float(raw.get("preco") or 0)
     out = []
     for lj, meta in lojas_da_conta(user_id).items():
@@ -432,13 +434,22 @@ def vinculos_multiloja(user_id: int, produto_id) -> list:
             d = (obter_produto(user_id, produto_id, id_loja=lj) or {}).get("data", {}) or {}
         except Exception:
             continue
+        if not d:
+            continue
+        id_anuncio = (d.get("idProdutoLoja") or d.get("codigoProdutoLoja")
+                      or d.get("identificadorExterno") or None)
+        if id_anuncio in (0, "0", ""):
+            id_anuncio = None
         p = _preco_br(d.get("preco")) if isinstance(d.get("preco"), str) else float(d.get("preco") or 0)
-        if p > 0 and abs(p - base_preco) > 0.001:  # preço próprio do canal
-            integ = meta["integracao"]
-            out.append({"id_loja": lj, "nome": meta["nome"], "integracao": integ,
-                        "canal": MAPA_INTEGRACAO.get(integ.lower()), "id_anuncio": meta.get("id_anuncio"),
-                        "preco": p, "preco_promocional": 0.0, "link": None,
-                        "ad_status": None, "publicado": True, "ativo": True})
+        ad = str(d.get("adStatus") or "").strip()
+        listado = bool(id_anuncio) or (p > 0 and abs(p - base_preco) > 0.001)
+        if not listado:
+            continue
+        integ = meta["integracao"]
+        out.append({"id_loja": lj, "nome": meta["nome"], "integracao": integ,
+                    "canal": MAPA_INTEGRACAO.get(integ.lower()), "id_anuncio": id_anuncio,
+                    "preco": p, "preco_promocional": 0.0, "link": None,
+                    "ad_status": ad or None, "publicado": True, "ativo": bool(p > 0)})
     return out
 
 

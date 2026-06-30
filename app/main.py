@@ -1492,6 +1492,19 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
         raise HTTPException(status_code=401, detail=str(e))
     base = float(raw.get("preco") or 0)
     cfg = precificacao.obter_config(user.id)
+    # Shopee: temos API direta — o cache da Shopee é a fonte da verdade do "publicado",
+    # independente do vínculo do Bling (que a v3 não devolve com preço).
+    shopee_cache = None
+    sku_prod = raw.get("codigo")
+    if sku_prod:
+        try:
+            from .models import ShopeeItemCache
+            with SessionLocal() as _db:
+                shopee_cache = (_db.query(ShopeeItemCache)
+                                .filter_by(user_id=user.id, sku=sku_prod)
+                                .order_by(ShopeeItemCache.atualizado_em.desc()).first())
+        except Exception:  # noqa: BLE001
+            shopee_cache = None
     precos = {v["canal"]: v["preco"] for v in vinc if v.get("canal") and v["preco"] > 0}
     canais = precificacao.divergencias(cfg, base, precos)
     alvo_por_canal = {c["canal"]: c.get("preco_alvo") for c in canais}
@@ -1506,7 +1519,15 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
 
     # Painel por canal: TODOS os canais ativos do config, com líquido realizado + status,
     # mesclando os vínculos existentes. Alimenta a tabela e os badges do cockpit.
-    vinc_por_canal = {v.get("canal"): v for v in vinc if v.get("canal")}
+    vinc_por_canal = {}
+    for v in vinc:
+        cn = v.get("canal")
+        if not cn:
+            continue
+        cur = vinc_por_canal.get(cn)
+        # com duas lojas no mesmo canal (ex.: duas Shopee), fica com a que tem anúncio/preço
+        if cur is None or (not (cur.get("id_anuncio") or cur.get("preco")) and (v.get("id_anuncio") or v.get("preco"))):
+            vinc_por_canal[cn] = v
 
     def _liq_canal(faixas, preco):
         if not preco or preco <= 0:
@@ -1522,10 +1543,19 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
         v = vinc_por_canal.get(cn)
         # publicado = o produto está vinculado/anunciado nesse canal (independe de termos o preço)
         publicado = bool(v and (v.get("publicado") or v.get("id_anuncio") or v.get("ativo") or v.get("preco")))
-        # mostra o canal se está ativo na config OU se o produto já está anunciado nele (ex.: Nuvemshop)
+        preco_reg = float(v["preco"]) if (v and v.get("preco") and v["preco"] > 0) else None
+        item_id = None
+        # Shopee: cache direto manda. Marca publicado e completa preço/item_id.
+        if cn == "shopee" and shopee_cache:
+            publicado = True
+            item_id = shopee_cache.item_id
+            if preco_reg is None:
+                cp = float(shopee_cache.preco_original or 0) or float(shopee_cache.preco or 0)
+                if cp > 0:
+                    preco_reg = cp
+        # mostra o canal se está ativo na config OU se o produto já está anunciado nele
         if not c.get("ativo") and not publicado:
             continue
-        preco_reg = float(v["preco"]) if (v and v.get("preco") and v["preco"] > 0) else None
         liquido = _liq_canal(c.get("faixas") or [], preco_reg) if preco_reg else None
         if not publicado:
             status = "falta_anunciar"
@@ -1542,7 +1572,8 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
             "preco_registrado": preco_reg, "preco_alvo": alvo_por_canal.get(cn),
             "liquido": liquido, "status": status, "ativo_cfg": bool(c.get("ativo")),
             "id_loja": v.get("id_loja") if v else None,
-            "id_anuncio": v.get("id_anuncio") if v else None,
+            "id_anuncio": (v.get("id_anuncio") if v else None) or item_id,
+            "item_id": item_id,
         })
         cobertos.add(cn)
 
@@ -1601,6 +1632,27 @@ def produto_simular_liquido(produto_id, canal: str, preco: float,
             "custo": round(custo, 2), "margem": margem, "alvo": round(base, 2),
             "abaixo_alvo": bool(base > 0 and liquido < base - 0.01),
             "tem_faixas": bool(faixas)}
+
+
+@app.get("/api/mercadolivre/status")
+def mercadolivre_status(user: User = Depends(auth.get_current_user)):
+    """Status da integração direta com o Mercado Livre (mesma ideia da Shopee)."""
+    from . import mercadolivre as ml
+    return {"configurado": ml.configurado()}
+
+
+@app.get("/api/mercadolivre/item")
+def mercadolivre_item(sku: str, user: User = Depends(auth.get_current_user)):
+    """Lê o anúncio do Mercado Livre por SKU (preço/status), via API direta do ML."""
+    from . import mercadolivre as ml
+    if not ml.configurado():
+        return {"configurado": False, "item": None}
+    try:
+        return {"configurado": True, "item": ml.buscar_item_por_sku(sku)}
+    except ml.MLNaoConfigurado:
+        return {"configurado": False, "item": None}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
 
 
 @app.get("/api/produtos/{produto_id}/preco_historico")
