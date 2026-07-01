@@ -444,6 +444,21 @@ def atualizar_fotos(item_id: str, pictures: list, user_id=None):
     return {"ok": True, "item_id": item_id}
 
 
+def atualizar_descricao(item_id: str, texto: str, user_id=None):
+    """Cria/atualiza a descrição do anúncio (PUT /items/{id}/description)."""
+    _put(f"/items/{item_id}/description", json={"plain_text": texto}, user_id=user_id)
+    return {"ok": True, "item_id": item_id}
+
+
+def adicionar_foto(item_id: str, url: str, user_id=None):
+    """Acrescenta uma foto ao anúncio, preservando as existentes (PUT /items {pictures})."""
+    it = _get(f"/items/{item_id}", user_id=user_id)
+    atuais = [{"id": p["id"]} for p in (it.get("pictures") or []) if p.get("id")]
+    atuais.append({"source": url})
+    _put(f"/items/{item_id}", json={"pictures": atuais}, user_id=user_id)
+    return {"ok": True, "item_id": item_id, "n_fotos": len(atuais)}
+
+
 # =========================================================================== #
 # Domínio C — Preço & Líquido
 # =========================================================================== #

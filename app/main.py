@@ -1737,6 +1737,13 @@ def produto_mercadolivre(produto_id, user: User = Depends(auth.get_current_user)
     except Exception:  # noqa: BLE001
         visitas = None
 
+    perguntas = None
+    try:
+        perguntas = ml.listar_perguntas(user.id, status="UNANSWERED",
+                                         item_id=item_id, limit=1).get("total")
+    except Exception:  # noqa: BLE001
+        perguntas = None
+
     tarifa = None
     try:
         if item.get("category_id") and item.get("preco"):
@@ -1749,7 +1756,8 @@ def produto_mercadolivre(produto_id, user: User = Depends(auth.get_current_user)
         tarifa = None
 
     return {"conectado": True, "item": item, "radar": radar,
-            "visitas": visitas, "tarifa_real": tarifa}
+            "visitas": visitas, "tarifa_real": tarifa,
+            "perguntas_sem_resposta": perguntas}
 
 
 @app.get("/api/produtos/{produto_id}/qualidade")
@@ -2168,6 +2176,39 @@ def ml_anuncio_estoque(payload: dict = Body(...), user: User = Depends(auth.get_
     if not item_id or qtd is None:
         raise HTTPException(status_code=422, detail="Informe item_id e qtd.")
     return _ml_run(lambda ml: ml.atualizar_estoque(item_id, int(qtd), user.id))
+
+
+@app.post("/api/mercadolivre/descricao")
+def ml_set_descricao(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = (payload or {}).get("item_id")
+    texto = ((payload or {}).get("texto") or "").strip()
+    if not item_id or not texto:
+        raise HTTPException(status_code=422, detail="Informe item_id e texto.")
+    return _ml_run(lambda ml: ml.atualizar_descricao(item_id, texto, user.id))
+
+
+@app.post("/api/mercadolivre/anuncio-foto")
+def ml_add_foto(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = (payload or {}).get("item_id")
+    url = ((payload or {}).get("url") or "").strip()
+    if not item_id or not url:
+        raise HTTPException(status_code=422, detail="Informe item_id e a URL da imagem.")
+    return _ml_run(lambda ml: ml.adicionar_foto(item_id, url, user.id))
+
+
+@app.post("/api/mercadolivre/anuncio-ficha")
+def ml_set_ficha(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = (payload or {}).get("item_id")
+    ean = ((payload or {}).get("ean") or "").strip()
+    peso = ((payload or {}).get("peso") or "").strip()
+    attrs = []
+    if ean:
+        attrs.append({"id": "GTIN", "value_name": ean})
+    if peso:
+        attrs.append({"id": "WEIGHT", "value_name": peso})
+    if not item_id or not attrs:
+        raise HTTPException(status_code=422, detail="Informe item_id e ao menos EAN ou peso.")
+    return _ml_run(lambda ml: ml.atualizar_atributos(item_id, attrs, user.id))
 
 
 # --- Líquido / tarifas / frete ---
