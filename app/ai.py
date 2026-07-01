@@ -134,3 +134,24 @@ def gerar_imagem(user_id: int, prompt: str, negativo: str = "",
                         "imagem_base64": b64}
     raise HTTPException(status_code=502,
                         detail="A IA não retornou imagem — confira o modelo de imagem configurado.")
+
+
+# --- Resposta a PERGUNTA de pré-venda (Mercado Livre) ---------------------------------
+PROMPT_PERGUNTA = """Você é um vendedor parceiro da Sóstrass Acessórios e Pedrarias respondendo uma PERGUNTA de um possível comprador no Mercado Livre, ANTES da compra.
+Produto anunciado: {produto}.
+Pergunta do cliente: "{pergunta}"
+
+Regras:
+1. Responda de forma objetiva e útil à pergunta. Se faltar um dado específico (cor, medida, quantidade), seja honesto e ofereça ajuda em vez de inventar.
+2. Tom amigável e natural; comece com "Oi" ou "Olá". Nada de asteriscos, negritos, palavras difíceis ou tom robótico.
+3. Incentive a compra de forma leve, sem pressão.
+4. No máximo 350 caracteres. Assine como: Equipe Sóstrass."""
+
+
+def gerar_resposta_pergunta(user_id: int, pergunta: str, produto: str = "",
+                            modelo: str | None = None) -> str:
+    """Resposta a uma pergunta de pré-venda (Mercado Livre), no tom da loja."""
+    if not pergunta or not pergunta.strip():
+        raise HTTPException(status_code=422, detail="Informe a pergunta do cliente.")
+    prompt = PROMPT_PERGUNTA.format(produto=(produto or "—"), pergunta=pergunta.strip())
+    return _gerar_texto(user_id, prompt, modelo)

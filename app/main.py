@@ -1511,8 +1511,8 @@ def produto_sincronizacao(produto_id, user: User = Depends(auth.get_current_user
     if sku_prod:
         try:
             from . import mercadolivre as _ml
-            if _ml.configurado():
-                ml_item = _ml.buscar_item_por_sku(sku_prod)
+            if _ml.configurado(user.id):
+                ml_item = _ml.buscar_item_por_sku(sku_prod, user.id)
         except Exception:  # noqa: BLE001
             ml_item = None
     precos = {v["canal"]: v["preco"] for v in vinc if v.get("canal") and v["preco"] > 0}
@@ -1680,6 +1680,76 @@ def produto_simular_liquido(produto_id, canal: str, preco: float,
             "imposto_pct": imp_pct, "comissao_pct": comissao_pct,
             "quebra": quebra, "abaixo_alvo": bool(base > 0 and liquido < base - 0.01),
             "tem_faixas": bool(faixas)}
+
+
+@app.get("/api/produtos/{produto_id}/mercadolivre")
+def produto_mercadolivre(produto_id, user: User = Depends(auth.get_current_user)):
+    """Snapshot direto do Mercado Livre para um produto — alimenta os cartões de Funil
+    (visitas reais) e Radar (preço de referência) da Visão geral do cockpit, mais a
+    tarifa real da categoria. Tudo best-effort: se algo falhar, volta nulo e o cockpit segue."""
+    from . import mercadolivre as ml
+    if not ml.configurado(user.id):
+        return {"conectado": False}
+    try:
+        raw = (bling.obter_produto(user.id, produto_id) or {}).get("data", {}) or {}
+    except bling.BlingAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    sku = raw.get("codigo")
+    if not sku:
+        return {"conectado": True, "item": None}
+    item = None
+    try:
+        item = ml.cache_por_sku(user.id, sku)
+    except Exception:  # noqa: BLE001
+        item = None
+    if not item:
+        try:
+            it = ml.buscar_item_por_sku(sku, user.id)
+            if it:
+                item = {"item_id": it.get("item_id"), "titulo": it.get("titulo"),
+                        "preco": it.get("preco"), "status": it.get("status"),
+                        "estoque": it.get("estoque"), "permalink": it.get("permalink"),
+                        "category_id": it.get("category_id"),
+                        "listing_type_id": it.get("listing_type_id"),
+                        "logistic_type": it.get("logistic_type")}
+        except Exception:  # noqa: BLE001
+            item = None
+    if not item or not item.get("item_id"):
+        return {"conectado": True, "item": None}
+    item_id = item["item_id"]
+
+    radar = None
+    try:
+        r = ml.referencia_de_preco(item_id, user.id)
+        radar = {"atual": r.get("atual"), "sugerido": r.get("sugerido"),
+                 "menor": r.get("menor"), "diff_pct": r.get("diff_pct"),
+                 "n_concorrentes": len(r.get("concorrentes") or [])}
+    except Exception:  # noqa: BLE001
+        radar = None
+
+    visitas = None
+    try:
+        v = ml.visitas_do_item(item_id, last=30, unit="day", user_id=user.id) or {}
+        total = v.get("total_visits")
+        if total is None and isinstance(v.get("results"), list):
+            total = sum(int((p or {}).get("total") or 0) for p in v["results"])
+        visitas = {"total": total, "dias": 30}
+    except Exception:  # noqa: BLE001
+        visitas = None
+
+    tarifa = None
+    try:
+        if item.get("category_id") and item.get("preco"):
+            t = ml.tarifas_de_venda(item.get("category_id"), item.get("preco"),
+                                    item.get("listing_type_id") or "gold_special",
+                                    item.get("logistic_type"), user_id=user.id)
+            tarifa = {"comissao_pct": t.get("comissao_pct"), "sale_fee": t.get("sale_fee"),
+                      "custo_fixo": t.get("custo_fixo")}
+    except Exception:  # noqa: BLE001
+        tarifa = None
+
+    return {"conectado": True, "item": item, "radar": radar,
+            "visitas": visitas, "tarifa_real": tarifa}
 
 
 @app.get("/api/produtos/{produto_id}/qualidade")
@@ -1900,6 +1970,437 @@ def mercadolivre_item(sku: str, user: User = Depends(auth.get_current_user)):
     except ml.MLNaoConfigurado:
         return {"configurado": False, "item": None}
     except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
+
+
+_HTML_ML_OK = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mercado Livre conectado</title></head>
+<body style="font-family:system-ui,sans-serif;padding:2.5rem;max-width:640px;margin:auto;background:#0b0b0f;color:#eee">
+<div style="font-size:40px;text-align:center">✅</div>
+<h2 style="color:#FFE600;text-align:center;margin-top:.3rem">Mercado Livre autorizado{nick_sufixo}</h2>
+<p style="color:#aaa;text-align:center">Copie os dois valores abaixo e cole no Railway (variáveis de ambiente do backend), depois faça um deploy.</p>
+<div style="margin-top:1.4rem">
+<div style="color:#888;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.3rem">ML_REFRESH_TOKEN</div>
+<div style="background:#16161c;border:1px solid #333;border-radius:8px;padding:.7rem .9rem;word-break:break-all;font-family:monospace;font-size:13px;color:#9ad">{refresh}</div>
+</div>
+<div style="margin-top:1rem">
+<div style="color:#888;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.3rem">ML_SELLER_ID</div>
+<div style="background:#16161c;border:1px solid #333;border-radius:8px;padding:.7rem .9rem;font-family:monospace;font-size:13px;color:#9ad">{sid}</div>
+</div>
+<p style="color:#666;font-size:12px;margin-top:1.4rem">O ML_CLIENT_ID e o ML_CLIENT_SECRET você já colocou no Railway. Com esses quatro, o Catálogo passa a ler e atualizar o preço do Mercado Livre automaticamente. Pode fechar esta aba.</p>
+</body></html>"""
+
+
+def _ml_redirect_uri(request: Request) -> str:
+    import os
+    env = os.environ.get("ML_REDIRECT_URI")
+    if env:
+        return env.rstrip("/")
+    return f"{_shopee_redirect_base(request)}/api/mercadolivre/callback"
+
+
+@app.get("/api/mercadolivre/conectar")
+def mercadolivre_conectar(request: Request):
+    """Abra esta URL no navegador pra autorizar o app no Mercado Livre. Leva pro login
+    do ML e volta no /callback mostrando o refresh_token + seller_id."""
+    from fastapi.responses import RedirectResponse
+    from . import mercadolivre as ml
+    try:
+        url = ml.url_autorizacao(_ml_redirect_uri(request))
+    except ml.MLNaoConfigurado as e:
+        return HTMLResponse(_HTML_ERR.format(msg=f"{e}. Defina ML_CLIENT_ID no Railway e faça deploy."), status_code=400)
+    return RedirectResponse(url)
+
+
+@app.get("/api/mercadolivre/callback")
+def mercadolivre_callback(request: Request, code: str = "", error: str = ""):
+    """Callback do OAuth do ML. Troca o code por tokens e MOSTRA o refresh_token e o
+    seller_id pra colar no Railway (ML_REFRESH_TOKEN, ML_SELLER_ID)."""
+    from . import mercadolivre as ml
+    if error:
+        return HTMLResponse(_HTML_ERR.format(msg=f"Mercado Livre recusou: {error}"), status_code=400)
+    if not code:
+        return HTMLResponse(_HTML_ERR.format(msg="Autorização não recebida do Mercado Livre."), status_code=400)
+    try:
+        d = ml.trocar_code_por_token(code, _ml_redirect_uri(request))
+        refresh = d.get("refresh_token") or ""
+        access = d.get("access_token") or ""
+        sid, nick = "", ""
+        try:
+            me = ml.conta_do_token(access)
+            sid = str(me.get("id") or "")
+            nick = me.get("nickname") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        nick_sufixo = f" · {nick}" if nick else ""
+        return HTMLResponse(_HTML_ML_OK.format(refresh=refresh, sid=sid, nick_sufixo=nick_sufixo))
+    except Exception as e:  # noqa: BLE001
+        return HTMLResponse(_HTML_ERR.format(msg=str(e)), status_code=400)
+
+
+# =========================== Mercado Livre — Enterprise =========================== #
+def _ml_run(call):
+    """Roda uma chamada do módulo ML e converte exceções em HTTPException."""
+    from . import mercadolivre as ml
+    try:
+        return call(ml)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=f"Mercado Livre não conectado: {e}")
+    except ml.MLErro as e:
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
+
+
+# --- Conta / conexão ---
+@app.get("/api/mercadolivre/conta")
+def ml_conta(user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    st = ml.status_conexao(user.id)
+    if st.get("conta"):
+        try:
+            st["reputacao"] = ml.reputacao(user.id)
+        except Exception:  # noqa: BLE001
+            pass
+    return st
+
+
+@app.get("/api/mercadolivre/limites")
+def ml_limites(user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.limites_publicacao(user.id))
+
+
+@app.get("/api/mercadolivre/reputacao")
+def ml_reputacao(user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.reputacao(user.id))
+
+
+# --- Conexão multi-tenant (popup, salva a conta no banco) ---
+@app.get("/api/mercadolivre/auth/login")
+def ml_auth_login(request: Request, user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    if not ml.app_configurado():
+        raise HTTPException(status_code=400, detail="App ML não configurado (ML_CLIENT_ID/SECRET).")
+    state = ml.state_token(user.id)
+    redirect = f"{_shopee_redirect_base(request)}/api/mercadolivre/auth/callback/{state}"
+    return {"url": ml.url_autorizacao(redirect, state=state)}
+
+
+@app.get("/api/mercadolivre/auth/callback/{state}")
+def ml_auth_callback(state: str, request: Request, code: str = "", error: str = ""):
+    from . import mercadolivre as ml
+    uid = ml.ler_state(state)
+    if not uid:
+        return HTMLResponse(_HTML_ERR.format(msg="Sessão de conexão expirada. Tente de novo."), status_code=400)
+    if error or not code:
+        return HTMLResponse(_HTML_ERR.format(msg="Autorização não recebida do Mercado Livre."), status_code=400)
+    try:
+        redirect = f"{_shopee_redirect_base(request)}/api/mercadolivre/auth/callback/{state}"
+        d = ml.trocar_code_por_token(code, redirect)
+        access = d.get("access_token") or ""
+        sid, nick = "", ""
+        try:
+            me = ml.conta_do_token(access)
+            sid = str(me.get("id") or "")
+            nick = me.get("nickname") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        ml.salvar_conta(uid, d.get("refresh_token") or "", access,
+                        d.get("expires_in") or 21600, seller_id=sid, nickname=nick)
+        return HTMLResponse(_HTML_OK)
+    except Exception as e:  # noqa: BLE001
+        return HTMLResponse(_HTML_ERR.format(msg=str(e)), status_code=400)
+
+
+# --- Sincronização do catálogo (job pesado, em background) ---
+@app.post("/api/mercadolivre/sincronizar")
+def ml_sincronizar(background_tasks: BackgroundTasks, user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    if not ml.configurado(user.id):
+        raise HTTPException(status_code=400, detail="Conecte a conta do Mercado Livre primeiro.")
+    background_tasks.add_task(ml.sincronizar_catalogo, user.id)
+    return {"ok": True, "msg": "Sincronização iniciada."}
+
+
+@app.get("/api/mercadolivre/sync")
+def ml_sync_status(user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    return ml.status_sync(user.id)
+
+
+# --- Catálogo ---
+@app.get("/api/mercadolivre/itens")
+def ml_itens(sku: str = "", user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    return {"itens": ml.listar_cache(user.id, sku=sku or None)}
+
+
+@app.get("/api/mercadolivre/item-id/{item_id}")
+def ml_item_por_id(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.obter_item(item_id, user.id))
+
+
+@app.get("/api/mercadolivre/descricao/{item_id}")
+def ml_descricao(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: {"texto": ml.descricao_item(item_id, user.id)})
+
+
+# --- Preço / status / estoque do anúncio ---
+@app.post("/api/mercadolivre/preco")
+def ml_preco(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = payload.get("item_id")
+    preco = payload.get("preco")
+    if not item_id or preco is None:
+        raise HTTPException(status_code=422, detail="Informe item_id e preco.")
+    return _ml_run(lambda ml: ml.atualizar_preco(item_id, float(preco), user.id))
+
+
+@app.post("/api/mercadolivre/anuncio-status")
+def ml_anuncio_status(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = payload.get("item_id")
+    status = payload.get("status")
+    if not item_id or status not in ("active", "paused", "closed"):
+        raise HTTPException(status_code=422, detail="Informe item_id e status (active|paused|closed).")
+    return _ml_run(lambda ml: ml.atualizar_status(item_id, status, user.id))
+
+
+@app.post("/api/mercadolivre/anuncio-estoque")
+def ml_anuncio_estoque(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = payload.get("item_id")
+    qtd = payload.get("qtd")
+    if not item_id or qtd is None:
+        raise HTTPException(status_code=422, detail="Informe item_id e qtd.")
+    return _ml_run(lambda ml: ml.atualizar_estoque(item_id, int(qtd), user.id))
+
+
+# --- Líquido / tarifas / frete ---
+@app.get("/api/mercadolivre/tarifas")
+def ml_tarifas(category_id: str = "", price: float = 0.0, listing_type_id: str = "gold_special",
+               logistic_type: str = "", user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.tarifas_de_venda(category_id or None, price, listing_type_id,
+                                                   logistic_type or None, user_id=user.id))
+
+
+@app.get("/api/mercadolivre/liquido")
+def ml_liquido(price: float, category_id: str = "", listing_type_id: str = "gold_special",
+               logistic_type: str = "", frete: float = 0.0, imposto_pct: float = 0.0,
+               custo: float = 0.0, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.calcular_liquido(price, category_id or None, listing_type_id,
+                   logistic_type or None, frete, imposto_pct, custo, user.id))
+
+
+@app.get("/api/mercadolivre/frete")
+def ml_frete(item_id: str, cep: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.frete_do_item(item_id, cep, user.id))
+
+
+@app.get("/api/mercadolivre/preco-venda/{item_id}")
+def ml_preco_venda(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.preco_de_venda(item_id, user.id))
+
+
+# --- Radar de concorrência ---
+@app.get("/api/mercadolivre/radar/{item_id}")
+def ml_radar(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.referencia_de_preco(item_id, user.id))
+
+
+@app.get("/api/mercadolivre/radar-itens")
+def ml_radar_itens(user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.itens_com_referencia(user_id=user.id))
+
+
+@app.get("/api/mercadolivre/concorrentes")
+def ml_concorrentes(q: str, category_id: str = "", user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.concorrentes(q, category_id or None, user_id=user.id))
+
+
+# --- Pedidos ---
+@app.get("/api/mercadolivre/pedidos")
+def ml_pedidos(status: str = "paid", desde: str = "", ate: str = "", offset: int = 0,
+               user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.listar_pedidos(user.id, status or None, desde or None,
+                                                 ate or None, offset))
+
+
+@app.get("/api/mercadolivre/pedido/{order_id}")
+def ml_pedido(order_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.obter_pedido(order_id, user.id))
+
+
+# --- Envios / etiqueta real ---
+@app.get("/api/mercadolivre/envio/{shipment_id}")
+def ml_envio(shipment_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.envio_do_pedido(shipment_id, user.id))
+
+
+@app.get("/api/mercadolivre/etiqueta")
+def ml_etiqueta(shipment_ids: str, formato: str = "pdf", user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    try:
+        conteudo, ct = ml.etiqueta(shipment_ids.split(","), formato, user.id)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ml.MLErro as e:
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
+    return Response(content=conteudo, media_type=ct)
+
+
+# --- Perguntas ---
+@app.get("/api/mercadolivre/perguntas")
+def ml_perguntas(status: str = "", item_id: str = "", user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.listar_perguntas(user.id, status or None, item_id or None))
+
+
+@app.post("/api/mercadolivre/perguntas/responder")
+def ml_perguntas_responder(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    qid = payload.get("question_id")
+    texto = payload.get("texto")
+    if not qid or not texto:
+        raise HTTPException(status_code=422, detail="Informe question_id e texto.")
+    return _ml_run(lambda ml: ml.responder_pergunta(qid, texto, user.id))
+
+
+# --- Avaliações ---
+@app.get("/api/mercadolivre/avaliacoes/{item_id}")
+def ml_avaliacoes(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.avaliacoes_do_item(item_id, user_id=user.id))
+
+
+# --- Visitas / funil ---
+@app.get("/api/mercadolivre/visitas/{item_id}")
+def ml_visitas_item(item_id: str, last: int = 30, unit: str = "day",
+                    user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.visitas_do_item(item_id, last, unit, user.id))
+
+
+@app.get("/api/mercadolivre/visitas")
+def ml_visitas_vendedor(desde: str, ate: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.visitas_do_vendedor(desde, ate, user.id))
+
+
+# --- Promoções (v2) ---
+@app.get("/api/mercadolivre/promocoes")
+def ml_promocoes(user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.promocoes_do_vendedor(user.id))
+
+
+@app.get("/api/mercadolivre/promocoes/{item_id}")
+def ml_promocoes_item(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.promocoes_do_item(item_id, user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/aplicar")
+def ml_promo_aplicar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = payload.get("item_id")
+    deal = payload.get("deal_price")
+    if not item_id or deal is None:
+        raise HTTPException(status_code=422, detail="Informe item_id e deal_price.")
+    return _ml_run(lambda ml: ml.aplicar_desconto(item_id, deal, payload.get("top_deal_price"),
+                   payload.get("inicio"), payload.get("fim"), user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/remover")
+def ml_promo_remover(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    item_id = payload.get("item_id")
+    if not item_id:
+        raise HTTPException(status_code=422, detail="Informe item_id.")
+    return _ml_run(lambda ml: ml.remover_desconto(item_id, user.id))
+
+
+# --- Qualidade do anúncio ---
+@app.get("/api/mercadolivre/qualidade/{item_id}")
+def ml_qualidade(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.qualidade_ml(item_id, user.id))
+
+
+# --- Webhook do ML (notificações; sem auth, path fixo p/ cadastrar no app) ---
+@app.post("/api/mercadolivre/notificacoes")
+async def ml_notificacoes(request: Request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    topic = body.get("topic")
+    resource = body.get("resource")
+    try:
+        from . import mercadolivre as ml
+        from .models import MLConta
+        uid = None
+        sid = str(body.get("user_id") or "")
+        if sid:
+            db = SessionLocal()
+            try:
+                c = db.query(MLConta).filter_by(seller_id=sid).first()
+                uid = c.user_id if c else None
+            finally:
+                db.close()
+        ml.processar_notificacao(uid, topic, resource)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
+
+
+# =============================== Central de Atendimento =============================== #
+@app.get("/api/atendimento/status")
+def atendimento_status(user: User = Depends(auth.get_current_user)):
+    from . import mercadolivre as ml
+    return ml.status_conexao(user.id)
+
+
+@app.get("/api/atendimento/stats")
+def atendimento_stats(user: User = Depends(auth.get_current_user)):
+    from . import atendimento, mercadolivre as ml
+    try:
+        return atendimento.stats(user.id)
+    except ml.MLNaoConfigurado:
+        return {"canal": "mercadolivre", "sem_resposta": 0, "respondidas": 0,
+                "tempo_medio_min": None, "nao_conectado": True}
+
+
+@app.get("/api/atendimento/perguntas")
+def atendimento_perguntas(status: str = "UNANSWERED", limite: int = 50,
+                          user: User = Depends(auth.get_current_user)):
+    from . import atendimento, mercadolivre as ml
+    try:
+        return atendimento.inbox(user.id, status=status, limite=limite)
+    except ml.MLNaoConfigurado:
+        return {"total": 0, "canal": "mercadolivre", "perguntas": [], "nao_conectado": True}
+    except ml.MLErro as e:
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
+
+
+@app.post("/api/atendimento/sugerir")
+def atendimento_sugerir(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    from . import atendimento
+    pergunta = ((payload or {}).get("pergunta") or "").strip()
+    produto = (payload or {}).get("produto") or ""
+    if not pergunta:
+        raise HTTPException(status_code=422, detail="Informe a pergunta.")
+    return atendimento.sugerir(user.id, pergunta, produto)
+
+
+@app.post("/api/atendimento/responder")
+def atendimento_responder(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    from . import atendimento, mercadolivre as ml
+    qid = (payload or {}).get("question_id")
+    texto = ((payload or {}).get("texto") or "").strip()
+    if not qid or not texto:
+        raise HTTPException(status_code=422, detail="Informe question_id e texto.")
+    try:
+        return atendimento.responder(user.id, qid, texto)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ml.MLErro as e:
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
+
+
+@app.post("/api/atendimento/ocultar")
+def atendimento_ocultar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    from . import atendimento, mercadolivre as ml
+    qid = (payload or {}).get("question_id")
+    if not qid:
+        raise HTTPException(status_code=422, detail="Informe question_id.")
+    try:
+        return atendimento.ocultar(user.id, qid)
+    except ml.MLErro as e:
         raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
 
 

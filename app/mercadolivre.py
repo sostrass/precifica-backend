@@ -1,28 +1,35 @@
-"""Integração direta com a API do Mercado Livre (api.mercadolibre.com).
+"""Integração direta com a API do Mercado Livre (api.mercadolibre.com) — nível Enterprise.
 
-Espelha o papel do módulo da Shopee: ler os anúncios do vendedor (por SKU),
-preço/status e empurrar atualização de preço — sem depender do Bling, que via
-v3 não devolve os vínculos com preço.
+Espelha (e estende) o papel do módulo da Shopee. Multi-tenant:
+  • Credenciais do APP (client_id/secret) vêm do ambiente: ML_CLIENT_ID, ML_CLIENT_SECRET.
+  • Tokens da CONTA (refresh_token/seller_id) ficam por usuário em MLConta (banco).
+  • Fallback single-tenant: se não houver linha em MLConta, usa ML_REFRESH_TOKEN/ML_SELLER_ID
+    do ambiente — assim a configuração atual via Railway continua funcionando.
 
-Credenciais (por enquanto via ambiente; depois movemos pra config por usuário):
-  ML_CLIENT_ID, ML_CLIENT_SECRET, ML_REFRESH_TOKEN, ML_SELLER_ID
+Toda função pública aceita `user_id` opcional. Sem ele (None), usa as credenciais do
+ambiente (compatível com as chamadas antigas). Com user_id, usa a conta daquele tenant.
 
-Fluxo OAuth do ML (resumo, pra próxima fase ligar o botão "Conectar"):
-  1. Redireciona o vendedor pra https://auth.mercadolivre.com.br/authorization?response_type=code&client_id=...&redirect_uri=...
-  2. O ML chama de volta o redirect_uri com ?code=...
-  3. Troca o code por access_token + refresh_token (grant_type=authorization_code).
-  4. Guarda o refresh_token; renova o access_token quando expira (grant_type=refresh_token).
+Domínios cobertos: conta/auth, catálogo/itens, preço+líquido (listing_prices), radar
+(benchmarks), pedidos, envios+etiquetas, perguntas, avaliações, visitas/funil, promoções v2,
+qualidade, cache+sync e processamento de webhooks. Site padrão: MLB (Brasil).
 """
 from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timedelta
 
+import jwt
 import requests
+
+from .config import settings
+from .db import SessionLocal
+from .models import MLConta, MLItemCache, MLSync
 
 API = "https://api.mercadolibre.com"
 AUTH = "https://auth.mercadolivre.com.br"
-TIMEOUT = 20
+SITE = "MLB"
+TIMEOUT = 25
 
 
 class MLNaoConfigurado(RuntimeError):
@@ -33,129 +40,856 @@ class MLErro(RuntimeError):
     """Falha em chamada à API do Mercado Livre."""
 
 
-# cache simples do access_token em memória: {chave: (expira_em, token)}
+# cache do access_token em memória: {refresh_token[:12]: (expira_em_ts, token)}
 _TOKENS: dict[str, tuple[float, str]] = {}
 
 
-def _cfg() -> dict:
-    return {
-        "client_id": os.environ.get("ML_CLIENT_ID"),
-        "client_secret": os.environ.get("ML_CLIENT_SECRET"),
-        "refresh_token": os.environ.get("ML_REFRESH_TOKEN"),
-        "seller_id": os.environ.get("ML_SELLER_ID"),
-    }
+# =========================================================================== #
+# Credenciais, conta e tokens
+# =========================================================================== #
+def _app() -> dict:
+    return {"client_id": os.environ.get("ML_CLIENT_ID"),
+            "client_secret": os.environ.get("ML_CLIENT_SECRET")}
 
 
-def configurado() -> bool:
-    c = _cfg()
-    return bool(c["client_id"] and c["client_secret"] and c["refresh_token"])
+def app_configurado() -> bool:
+    a = _app()
+    return bool(a["client_id"] and a["client_secret"])
 
 
-def url_autorizacao(redirect_uri: str) -> str:
-    """URL pra iniciar o OAuth (botão 'Conectar Mercado Livre')."""
-    c = _cfg()
-    if not c["client_id"]:
+def _conta(db, user_id):
+    """Conta do tenant (DB) ou fallback do ambiente (single-tenant)."""
+    if user_id is not None:
+        c = db.query(MLConta).filter_by(user_id=user_id).first()
+        if c and c.refresh_token:
+            return c
+    rt = os.environ.get("ML_REFRESH_TOKEN")
+    if rt:
+        return MLConta(user_id=user_id or 0, seller_id=os.environ.get("ML_SELLER_ID"),
+                       refresh_token=rt, site_id=SITE)
+    return None
+
+
+def configurado(user_id=None) -> bool:
+    if not app_configurado():
+        return False
+    if user_id is None:
+        return bool(os.environ.get("ML_REFRESH_TOKEN"))
+    db = SessionLocal()
+    try:
+        return _conta(db, user_id) is not None
+    finally:
+        db.close()
+
+
+def status_conexao(user_id=None) -> dict:
+    if not app_configurado():
+        return {"app": False, "conta": False,
+                "msg": "Faltam ML_CLIENT_ID e ML_CLIENT_SECRET no servidor."}
+    db = SessionLocal()
+    try:
+        c = _conta(db, user_id)
+        if not c:
+            return {"app": True, "conta": False,
+                    "msg": "App pronto. Falta conectar a conta (refresh_token)."}
+        return {"app": True, "conta": True, "seller_id": c.seller_id, "nickname": c.nickname,
+                "site_id": c.site_id or SITE,
+                "expira_em": c.expira_em.isoformat() if c.expira_em else None}
+    finally:
+        db.close()
+
+
+def url_autorizacao(redirect_uri: str, state: str | None = None) -> str:
+    """URL pra iniciar o OAuth. Os escopos (read/write/offline_access) vêm da config do app."""
+    a = _app()
+    if not a["client_id"]:
         raise MLNaoConfigurado("ML_CLIENT_ID ausente")
-    return (f"{AUTH}/authorization?response_type=code"
-            f"&client_id={c['client_id']}&redirect_uri={redirect_uri}")
+    url = (f"{AUTH}/authorization?response_type=code"
+           f"&client_id={a['client_id']}&redirect_uri={redirect_uri}")
+    if state:
+        url += f"&state={state}"
+    return url
+
+
+def state_token(user_id: int) -> str:
+    """Token curto (10min) que carrega o user_id pelo redirect do OAuth (multi-tenant)."""
+    payload = {"uid": user_id, "exp": datetime.utcnow() + timedelta(minutes=10), "scp": "ml_oauth"}
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def ler_state(token: str):
+    try:
+        d = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+        return d.get("uid") if d.get("scp") == "ml_oauth" else None
+    except jwt.PyJWTError:
+        return None
 
 
 def trocar_code_por_token(code: str, redirect_uri: str) -> dict:
     """Troca o 'code' do callback por access_token + refresh_token."""
-    c = _cfg()
-    if not (c["client_id"] and c["client_secret"]):
+    a = _app()
+    if not (a["client_id"] and a["client_secret"]):
         raise MLNaoConfigurado("client_id/secret ausentes")
     r = requests.post(f"{API}/oauth/token", timeout=TIMEOUT, data={
-        "grant_type": "authorization_code", "client_id": c["client_id"],
-        "client_secret": c["client_secret"], "code": code, "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code", "client_id": a["client_id"],
+        "client_secret": a["client_secret"], "code": code, "redirect_uri": redirect_uri,
     })
     if r.status_code >= 400:
         raise MLErro(f"oauth: {r.status_code} {r.text[:200]}")
     return r.json()
 
 
-def _access_token() -> str:
-    """Renova (ou reusa) o access_token via refresh_token."""
-    if not configurado():
-        raise MLNaoConfigurado("defina ML_CLIENT_ID, ML_CLIENT_SECRET e ML_REFRESH_TOKEN")
-    c = _cfg()
-    chave = c["refresh_token"][:12]
+def salvar_conta(user_id: int, refresh_token: str, access_token: str | None = None,
+                 expires_in: int = 21600, seller_id=None, nickname=None, site_id: str = SITE):
+    """Guarda/atualiza a conta ML de um tenant (usado no callback OAuth multi-tenant)."""
+    db = SessionLocal()
+    try:
+        c = db.query(MLConta).filter_by(user_id=user_id).first()
+        if not c:
+            c = MLConta(user_id=user_id)
+            db.add(c)
+        c.refresh_token = refresh_token
+        if access_token:
+            c.access_token = access_token
+        c.expira_em = datetime.utcnow() + timedelta(seconds=int(expires_in) - 300)
+        if seller_id:
+            c.seller_id = str(seller_id)
+        if nickname:
+            c.nickname = nickname
+        c.site_id = site_id or SITE
+        if not c.conectado_em:
+            c.conectado_em = datetime.utcnow()
+        c.ativo = True
+        db.commit()
+    finally:
+        db.close()
+
+
+def _salvar_token(user_id: int, access_token: str, refresh_token: str, expires_in):
+    """Persiste o access_token renovado (e refresh rotativo) — só se já existe linha do tenant."""
+    db = SessionLocal()
+    try:
+        c = db.query(MLConta).filter_by(user_id=user_id).first()
+        if not c:
+            return
+        c.access_token = access_token
+        c.refresh_token = refresh_token
+        c.expira_em = datetime.utcnow() + timedelta(seconds=int(expires_in) - 300)
+        db.commit()
+    finally:
+        db.close()
+
+
+def conta_do_token(access_token: str) -> dict:
+    """Lê /users/me com um access_token recém-obtido (callback do OAuth, antes do refresh no DB)."""
+    r = requests.get(f"{API}/users/me", timeout=TIMEOUT,
+                     headers={"Authorization": f"Bearer {access_token}"})
+    if r.status_code >= 400:
+        raise MLErro(f"GET /users/me: {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
+def _access_token(user_id=None) -> str:
+    """Renova (ou reusa) o access_token via refresh_token. Persiste no DB p/ tenant real."""
+    if not app_configurado():
+        raise MLNaoConfigurado("defina ML_CLIENT_ID e ML_CLIENT_SECRET")
+    db = SessionLocal()
+    try:
+        c = _conta(db, user_id)
+        if not c or not c.refresh_token:
+            raise MLNaoConfigurado("conta Mercado Livre não conectada (refresh_token ausente)")
+        refresh = c.refresh_token
+    finally:
+        db.close()
+    chave = refresh[:12]
     cached = _TOKENS.get(chave)
     if cached and time.time() < cached[0] - 60:
         return cached[1]
+    a = _app()
     r = requests.post(f"{API}/oauth/token", timeout=TIMEOUT, data={
-        "grant_type": "refresh_token", "client_id": c["client_id"],
-        "client_secret": c["client_secret"], "refresh_token": c["refresh_token"],
+        "grant_type": "refresh_token", "client_id": a["client_id"],
+        "client_secret": a["client_secret"], "refresh_token": refresh,
     })
     if r.status_code >= 400:
         raise MLErro(f"refresh: {r.status_code} {r.text[:200]}")
     d = r.json()
     tok = d.get("access_token")
+    novo_refresh = d.get("refresh_token") or refresh
     expira = time.time() + float(d.get("expires_in") or 21600)
     _TOKENS[chave] = (expira, tok)
+    if novo_refresh != refresh:
+        _TOKENS[novo_refresh[:12]] = (expira, tok)
+    if user_id is not None:
+        _salvar_token(user_id, tok, novo_refresh, d.get("expires_in") or 21600)
     return tok
 
 
-def _get(path: str, params: dict | None = None) -> dict:
-    tok = _access_token()
-    r = requests.get(f"{API}{path}", params=params, timeout=TIMEOUT,
-                     headers={"Authorization": f"Bearer {tok}"})
-    if r.status_code >= 400:
-        raise MLErro(f"GET {path}: {r.status_code} {r.text[:200]}")
-    return r.json()
-
-
-def _seller_id() -> str:
-    sid = _cfg().get("seller_id")
-    if sid:
-        return sid
-    me = _get("/users/me")
-    return str(me.get("id"))
-
-
-def buscar_item_por_sku(sku: str) -> dict | None:
-    """Acha o anúncio do vendedor que tem este SKU (seller_custom_field/seller_sku).
-    Retorna {item_id, preco, status, permalink, titulo} ou None."""
-    if not sku:
-        return None
-    sid = _seller_id()
-    # 1) busca direta por seller_sku
+def _seller_id(user_id=None) -> str:
+    db = SessionLocal()
     try:
-        d = _get(f"/users/{sid}/items/search", params={"seller_sku": sku})
-        ids = d.get("results") or []
-        if ids:
-            return obter_item(ids[0])
-    except MLErro:
-        pass
-    # 2) fallback: busca textual (a próxima fase pode varrer + cachear tudo)
-    return None
+        c = _conta(db, user_id)
+        sid = c.seller_id if c else None
+    finally:
+        db.close()
+    if sid:
+        return str(sid)
+    me = _get("/users/me", user_id=user_id)
+    sid = str(me.get("id"))
+    if user_id is not None:
+        db = SessionLocal()
+        try:
+            c = db.query(MLConta).filter_by(user_id=user_id).first()
+            if c and not c.seller_id:
+                c.seller_id = sid
+                db.commit()
+        finally:
+            db.close()
+    return sid
 
 
-def obter_item(item_id: str) -> dict:
-    it = _get(f"/items/{item_id}")
+# =========================================================================== #
+# Chamada base (com proteção de rate-limit 429)
+# =========================================================================== #
+def _req(metodo, path, user_id=None, params=None, json=None, headers=None, base=API, raw=False):
+    tok = _access_token(user_id)
+    h = {"Authorization": f"Bearer {tok}"}
+    if json is not None:
+        h["Content-Type"] = "application/json"
+    if headers:
+        h.update(headers)
+    url = f"{base}{path}"
+    for tentativa in range(3):
+        r = requests.request(metodo, url, params=params, json=json, headers=h, timeout=TIMEOUT)
+        if r.status_code == 429:           # rate limit (1500/min por seller): backoff e tenta de novo
+            time.sleep(2 * (tentativa + 1))
+            continue
+        if r.status_code >= 400:
+            raise MLErro(f"{metodo} {path}: {r.status_code} {r.text[:200]}")
+        if raw:
+            return r
+        if not r.content:
+            return {}
+        try:
+            return r.json()
+        except ValueError:
+            return {}
+    raise MLErro(f"{metodo} {path}: 429 (limite de chamadas) após retries")
+
+
+def _get(path, params=None, user_id=None):
+    return _req("GET", path, user_id, params=params)
+
+
+def _put(path, json=None, user_id=None):
+    return _req("PUT", path, user_id, json=json)
+
+
+def _post(path, json=None, user_id=None, headers=None, params=None):
+    return _req("POST", path, user_id, json=json, headers=headers, params=params)
+
+
+# =========================================================================== #
+# Domínio A — Conta
+# =========================================================================== #
+def conta(user_id=None) -> dict:
+    return _get("/users/me", user_id=user_id)
+
+
+def limites_publicacao(user_id=None) -> dict:
+    """Quota de anúncios por site, baseada na reputação (GET /marketplace/users/cap)."""
+    return _get("/marketplace/users/cap", user_id=user_id)
+
+
+def reputacao(user_id=None) -> dict:
+    sid = _seller_id(user_id)
+    u = _get(f"/users/{sid}", user_id=user_id)
+    rep = u.get("seller_reputation") or {}
+    return {"nivel": rep.get("level_id"), "status": rep.get("power_seller_status"),
+            "transacoes": rep.get("transactions"), "metricas": rep.get("metrics"),
+            "experiencia": u.get("seller_experience")}
+
+
+def grants(user_id=None) -> dict:
+    a = _app()
+    return _get(f"/applications/{a['client_id']}/grants", user_id=user_id)
+
+
+# =========================================================================== #
+# Domínio B — Catálogo / Anúncios
+# =========================================================================== #
+def _norm_item(it: dict) -> dict:
     sku = None
     for a in (it.get("attributes") or []):
-        if a.get("id") in ("SELLER_SKU", "GTIN") and a.get("value_name"):
+        if a.get("id") == "SELLER_SKU" and a.get("value_name"):
             sku = a["value_name"]
             break
     if not sku:
         sku = it.get("seller_custom_field")
+    fotos = it.get("pictures") or []
+    ship = it.get("shipping") or {}
     return {
         "item_id": it.get("id"), "titulo": it.get("title"),
         "preco": float(it.get("price") or 0),
         "preco_original": float(it.get("original_price") or it.get("price") or 0),
-        "status": it.get("status"), "permalink": it.get("permalink"),
-        "sku": sku, "estoque": it.get("available_quantity"),
+        "moeda": it.get("currency_id"),
+        "status": it.get("status"), "sub_status": it.get("sub_status"),
+        "permalink": it.get("permalink"), "sku": sku,
+        "estoque": it.get("available_quantity"), "vendidos": it.get("sold_quantity"),
+        "category_id": it.get("category_id"),
+        "listing_type_id": it.get("listing_type_id"),
+        "logistic_type": ship.get("logistic_type"),
+        "frete_gratis": bool(ship.get("free_shipping")),
+        "fotos": [p.get("secure_url") or p.get("url") for p in fotos],
+        "n_fotos": len(fotos),
+        "tem_video": bool(it.get("video_id")),
+        "atributos": it.get("attributes") or [],
+        "health": it.get("health"),
+        "variacoes": it.get("variations") or [],
+        "imagem": (fotos[0].get("secure_url") if fotos else it.get("thumbnail")),
     }
 
 
-def atualizar_preco(item_id: str, preco: float) -> dict:
+def buscar_item_por_sku(sku: str, user_id=None) -> dict | None:
+    """Acha o anúncio do vendedor que tem este SKU (seller_sku ou seller_custom_field)."""
+    if not sku:
+        return None
+    sid = _seller_id(user_id)
+    try:
+        d = _get(f"/users/{sid}/items/search", params={"seller_sku": sku}, user_id=user_id)
+        ids = d.get("results") or []
+        if not ids:
+            d = _get(f"/users/{sid}/items/search", params={"sku": sku}, user_id=user_id)
+            ids = d.get("results") or []
+        if ids:
+            return obter_item(ids[0], user_id=user_id)
+    except MLErro:
+        pass
+    return None
+
+
+def obter_item(item_id: str, user_id=None) -> dict:
+    return _norm_item(_get(f"/items/{item_id}", user_id=user_id))
+
+
+def obter_itens(ids, user_id=None, attributes=None):
+    """Multiget: GET /items?ids= (lotes de 20). Respeita o rate-limit lendo em bloco."""
+    out = []
+    ids = list(ids)
+    for i in range(0, len(ids), 20):
+        lote = ids[i:i + 20]
+        params = {"ids": ",".join(lote)}
+        if attributes:
+            params["attributes"] = attributes
+        d = _get("/items", params=params, user_id=user_id)
+        for entry in (d if isinstance(d, list) else []):
+            if isinstance(entry, dict) and entry.get("code") == 200 and entry.get("body"):
+                out.append(_norm_item(entry["body"]))
+    return out
+
+
+def listar_ids(user_id=None, filtros=None, limite=None):
+    """Lista todos os item_ids do vendedor (scan/scroll, passa dos 1.000)."""
+    sid = _seller_id(user_id)
+    ids = []
+    base = {"search_type": "scan", "limit": 100}
+    if filtros:
+        base.update(filtros)
+    scroll = None
+    while True:
+        p = dict(base)
+        if scroll:
+            p["scroll_id"] = scroll
+        d = _get(f"/users/{sid}/items/search", params=p, user_id=user_id)
+        res = d.get("results") or []
+        if not res:
+            break
+        ids.extend(res)
+        scroll = d.get("scroll_id")
+        if not scroll or (limite and len(ids) >= limite):
+            break
+    return ids[:limite] if limite else ids
+
+
+def descricao_item(item_id: str, user_id=None) -> str:
+    try:
+        d = _get(f"/items/{item_id}/description", user_id=user_id)
+        return d.get("plain_text") or d.get("text") or ""
+    except MLErro:
+        return ""
+
+
+def itens_publicos(seller_id=None, user_id=None, limit=50, offset=0):
+    sid = seller_id or _seller_id(user_id)
+    return _get(f"/sites/{SITE}/search",
+                params={"seller_id": sid, "limit": limit, "offset": offset}, user_id=user_id)
+
+
+def atualizar_status(item_id: str, status: str, user_id=None):
+    _put(f"/items/{item_id}", json={"status": status}, user_id=user_id)
+    return {"ok": True, "item_id": item_id, "status": status}
+
+
+def atualizar_estoque(item_id: str, qtd: int, user_id=None):
+    _put(f"/items/{item_id}", json={"available_quantity": int(qtd)}, user_id=user_id)
+    return {"ok": True, "item_id": item_id, "estoque": int(qtd)}
+
+
+def atualizar_atributos(item_id: str, atributos: list, user_id=None):
+    _put(f"/items/{item_id}", json={"attributes": atributos}, user_id=user_id)
+    return {"ok": True, "item_id": item_id}
+
+
+def atualizar_fotos(item_id: str, pictures: list, user_id=None):
+    _put(f"/items/{item_id}", json={"pictures": pictures}, user_id=user_id)
+    return {"ok": True, "item_id": item_id}
+
+
+# =========================================================================== #
+# Domínio C — Preço & Líquido
+# =========================================================================== #
+def atualizar_preco(item_id: str, preco: float, user_id=None) -> dict:
     """Empurra o novo preço direto no anúncio do ML (PUT /items/{id})."""
-    tok = _access_token()
-    r = requests.put(f"{API}/items/{item_id}", timeout=TIMEOUT,
-                     headers={"Authorization": f"Bearer {tok}",
-                              "Content-Type": "application/json"},
-                     json={"price": round(float(preco), 2)})
-    if r.status_code >= 400:
-        raise MLErro(f"PUT /items/{item_id}: {r.status_code} {r.text[:200]}")
+    _put(f"/items/{item_id}", json={"price": round(float(preco), 2)}, user_id=user_id)
     return {"ok": True, "item_id": item_id, "preco": round(float(preco), 2)}
+
+
+def preco_de_venda(item_id: str, user_id=None) -> dict:
+    """Preço de venda vencedor + contexto de promoção (GET /items/{id}/prices)."""
+    return _get(f"/items/{item_id}/prices", user_id=user_id)
+
+
+def tarifas_de_venda(category_id=None, price=0.0, listing_type_id="gold_special",
+                     logistic_type=None, shipping_mode=None, user_id=None) -> dict:
+    """Tarifa de venda (sale_fee %) + custo fixo por faixa (GET /sites/MLB/listing_prices).
+    listing_type_id: free | gold_special (Clássico) | gold_pro (Premium)."""
+    params = {"price": round(float(price), 2), "listing_type_id": listing_type_id,
+              "currency_id": "BRL"}
+    if category_id:
+        params["category_id"] = category_id
+    if logistic_type:
+        params["logistic_type"] = logistic_type
+    if shipping_mode:
+        params["shipping_mode"] = shipping_mode
+    d = _get(f"/sites/{SITE}/listing_prices", params=params, user_id=user_id)
+    obj = None
+    if isinstance(d, list):
+        for o in d:
+            if o.get("listing_type_id") == listing_type_id:
+                obj = o
+                break
+        obj = obj or (d[0] if d else {})
+    elif isinstance(d, dict):
+        obj = d
+    obj = obj or {}
+    det = obj.get("sale_fee_details") or {}
+    sale_fee = float(obj.get("sale_fee_amount") or 0)
+    return {"listing_type_id": obj.get("listing_type_id"),
+            "comissao_pct": float(det.get("percentage_fee") or 0),
+            "sale_fee": round(sale_fee, 2),
+            "custo_fixo": round(float(det.get("fixed_fee") or 0), 2),
+            "gross_amount": float(det.get("gross_amount") or 0)}
+
+
+def frete_do_item(item_id: str, cep: str, user_id=None) -> dict:
+    return _get(f"/items/{item_id}/shipping_options", params={"zip_code": cep}, user_id=user_id)
+
+
+def calcular_liquido(preco, category_id=None, listing_type_id="gold_special",
+                     logistic_type=None, frete=0.0, imposto_pct=0.0, custo=0.0, user_id=None) -> dict:
+    """Anatomia do líquido do ML: preço − comissão − custo fixo − frete − imposto."""
+    preco = float(preco or 0)
+    taxas = tarifas_de_venda(category_id, preco, listing_type_id, logistic_type, user_id=user_id)
+    sale_fee = taxas["sale_fee"]
+    fixo = taxas["custo_fixo"]
+    imp = round(preco * (float(imposto_pct or 0) / 100), 2)
+    frete = round(float(frete or 0), 2)
+    liquido = round(preco - sale_fee - fixo - frete - imp, 2)
+    custo = float(custo or 0)
+    margem = round((liquido - custo) / liquido * 100, 1) if (custo and liquido) else None
+    quebra = []
+    if sale_fee:
+        quebra.append({"rotulo": f"Comissão {taxas['comissao_pct']:.1f}%", "valor": -sale_fee})
+    if fixo:
+        quebra.append({"rotulo": "Custo fixo ML", "valor": -fixo})
+    if frete:
+        quebra.append({"rotulo": "Frete", "valor": -frete})
+    if imp:
+        quebra.append({"rotulo": f"Imposto {imposto_pct:.0f}%", "valor": -imp})
+    return {"preco": round(preco, 2), "sale_fee": sale_fee, "custo_fixo": fixo,
+            "frete": frete, "imposto": imp, "liquido": liquido, "margem": margem,
+            "lucro": round(liquido - custo, 2) if custo else None,
+            "comissao_pct": taxas["comissao_pct"], "quebra": quebra}
+
+
+# =========================================================================== #
+# Domínio D — Radar de concorrência (nativo)
+# =========================================================================== #
+def _amt(x):
+    return float((x or {}).get("amount") or 0)
+
+
+def referencia_de_preco(item_id: str, user_id=None) -> dict:
+    """Preço de referência + concorrentes + custos (GET /marketplace/benchmarks/items/{id}/details)."""
+    d = _get(f"/marketplace/benchmarks/items/{item_id}/details", user_id=user_id)
+    meta = d.get("metadata") or {}
+    grafo = []
+    for g in (meta.get("graph") or []):
+        info = g.get("info") or {}
+        grafo.append({"item_id": g.get("item_id"), "titulo": info.get("title"),
+                      "preco": _amt(g.get("price")), "vendas": info.get("sold_quantity"),
+                      "atual": g.get("current"), "sugerido": g.get("suggested")})
+    custos = d.get("costs") or {}
+    return {"item_id": d.get("item_id"), "status": d.get("status"),
+            "atual": _amt(d.get("current_price")), "sugerido": _amt(d.get("suggested_price")),
+            "menor": _amt(d.get("lowest_price")), "interno": _amt(d.get("internal_price")),
+            "externo": _amt(d.get("external_price")), "diff_pct": d.get("percent_difference"),
+            "comissao": float(custos.get("selling_fees") or 0),
+            "frete": float(custos.get("shipping_fees") or 0),
+            "aplicavel": d.get("applicable_suggestion"), "concorrentes": grafo}
+
+
+def itens_com_referencia(seller_id=None, user_id=None) -> dict:
+    sid = seller_id or _seller_id(user_id)
+    return _get(f"/marketplace/benchmarks/user/{sid}/items", user_id=user_id)
+
+
+def concorrentes(query: str, category_id=None, limit=20, user_id=None) -> dict:
+    """Descoberta pública de concorrentes (GET /sites/MLB/search?q=)."""
+    params = {"q": query, "limit": limit}
+    if category_id:
+        params["category_id"] = category_id
+    d = _get(f"/sites/{SITE}/search", params=params, user_id=user_id)
+    out = []
+    for r in (d.get("results") or []):
+        out.append({"item_id": r.get("id"), "titulo": r.get("title"),
+                    "preco": float(r.get("price") or 0), "vendas": r.get("sold_quantity"),
+                    "vendedor": (r.get("seller") or {}).get("nickname"),
+                    "permalink": r.get("permalink"),
+                    "frete_gratis": bool((r.get("shipping") or {}).get("free_shipping"))})
+    return {"total": (d.get("paging") or {}).get("total"), "resultados": out}
+
+
+# =========================================================================== #
+# Domínio E — Pedidos
+# =========================================================================== #
+def listar_pedidos(user_id=None, status="paid", desde=None, ate=None, offset=0, limit=50) -> dict:
+    sid = _seller_id(user_id)
+    params = {"seller": sid, "sort": "date_desc", "offset": offset, "limit": limit}
+    if status:
+        params["order.status"] = status
+    if desde:
+        params["order.date_created.from"] = desde
+    if ate:
+        params["order.date_created.to"] = ate
+    return _get("/orders/search", params=params, user_id=user_id)
+
+
+def obter_pedido(order_id: str, user_id=None) -> dict:
+    return _get(f"/orders/{order_id}", user_id=user_id)
+
+
+def pedidos_do_pack(pack_id: str, user_id=None) -> dict:
+    return _get(f"/marketplace/orders/pack/{pack_id}", user_id=user_id)
+
+
+def responder_feedback(feedback_id: str, texto: str, user_id=None) -> dict:
+    return _post(f"/feedback/{feedback_id}/reply", json={"reply": texto}, user_id=user_id)
+
+
+# =========================================================================== #
+# Domínio F — Envios & Etiquetas (resolve mascaramento de endereço)
+# =========================================================================== #
+def envio_do_pedido(shipment_id: str, user_id=None) -> dict:
+    """Detalhe do envio com nome+endereço reais do comprador (header x-format-new: true)."""
+    return _req("GET", f"/shipments/{shipment_id}", user_id=user_id,
+                headers={"x-format-new": "true"})
+
+
+def custos_de_envio(order_id: str, user_id=None) -> dict:
+    """shipments_options: cost (pago pelo comprador) + list_cost (pago pelo vendedor)."""
+    return _get(f"/orders/{order_id}/shipments", user_id=user_id)
+
+
+def etiqueta(shipment_ids, formato="pdf", user_id=None):
+    """Etiqueta (waybill) real. Retorna (bytes, content_type). Máx 50 shipment_ids."""
+    rt = "zpl2" if formato == "zpl" else "pdf"
+    ids = ",".join(shipment_ids) if isinstance(shipment_ids, (list, tuple)) else str(shipment_ids)
+    r = _req("GET", "/shipment_labels", user_id=user_id,
+             params={"shipment_ids": ids, "response_type": rt}, raw=True)
+    ct = r.headers.get("Content-Type") or ("application/pdf" if rt == "pdf" else "application/octet-stream")
+    return r.content, ct
+
+
+# =========================================================================== #
+# Domínio G — Perguntas
+# =========================================================================== #
+def listar_perguntas(user_id=None, status=None, item_id=None, limit=50, offset=0) -> dict:
+    params = {"api_version": 4, "limit": limit, "offset": offset}
+    if item_id:
+        params["item"] = item_id
+    else:
+        params["seller_id"] = _seller_id(user_id)
+    if status:
+        params["status"] = status
+    return _get("/questions/search", params=params, user_id=user_id)
+
+
+def responder_pergunta(question_id, texto: str, user_id=None) -> dict:
+    return _post("/answers", json={"question_id": int(question_id), "text": texto}, user_id=user_id)
+
+
+def ocultar_pergunta(question_id, user_id=None) -> dict:
+    return _post("/my/questions/hidden", json={"questions_ids": [int(question_id)]}, user_id=user_id)
+
+
+def tempo_de_resposta(user_id=None) -> dict:
+    sid = _seller_id(user_id)
+    return _get(f"/users/{sid}/questions/response_time", user_id=user_id)
+
+
+# =========================================================================== #
+# Domínio H — Avaliações
+# =========================================================================== #
+def avaliacoes_do_item(item_id: str, limit=20, offset=0, user_id=None) -> dict:
+    d = _get(f"/reviews/item/{item_id}", params={"limit": limit, "offset": offset}, user_id=user_id)
+    paging = d.get("paging") or {}
+    revs = []
+    for r in (d.get("reviews") or []):
+        revs.append({"id": r.get("id"), "nota": r.get("rate"), "titulo": r.get("title"),
+                     "texto": r.get("content"), "data": r.get("date_created"),
+                     "likes": r.get("likes"), "dislikes": r.get("dislikes")})
+    return {"total": paging.get("total"), "com_comentario": paging.get("reviews_with_comment"),
+            "avaliacoes": revs}
+
+
+# =========================================================================== #
+# Domínio I — Visitas / Funil
+# =========================================================================== #
+def visitas_do_vendedor(desde: str, ate: str, user_id=None) -> dict:
+    sid = _seller_id(user_id)
+    return _get(f"/users/{sid}/items_visits",
+                params={"date_from": desde, "date_to": ate}, user_id=user_id)
+
+
+def visitas_do_item(item_id: str, last=30, unit="day", user_id=None) -> dict:
+    return _get(f"/items/{item_id}/visits/time_window",
+                params={"last": last, "unit": unit}, user_id=user_id)
+
+
+def visitas_multi(ids, user_id=None) -> dict:
+    return _get("/visits/items", params={"ids": ",".join(list(ids))}, user_id=user_id)
+
+
+# =========================================================================== #
+# Domínio J — Promoções (Promotions v2)
+# =========================================================================== #
+def promocoes_do_vendedor(user_id=None) -> dict:
+    sid = _seller_id(user_id)
+    return _get(f"/seller-promotions/users/{sid}", params={"app_version": "v2"}, user_id=user_id)
+
+
+def promocoes_do_item(item_id: str, user_id=None) -> dict:
+    return _get(f"/seller-promotions/items/{item_id}", params={"app_version": "v2"}, user_id=user_id)
+
+
+def detalhe_oferta(offer_id: str, user_id=None) -> dict:
+    return _get(f"/seller-promotions/offers/{offer_id}", params={"app_version": "v2"}, user_id=user_id)
+
+
+def aplicar_desconto(item_id: str, deal_price, top_deal_price=None, inicio=None, fim=None, user_id=None) -> dict:
+    """Cria um PRICE_DISCOUNT real no item (POST /marketplace/seller-promotions/items/{id})."""
+    a = _app()
+    sid = _seller_id(user_id)
+    body = {"deal_price": round(float(deal_price), 2), "promotion_type": "PRICE_DISCOUNT"}
+    if top_deal_price:
+        body["top_deal_price"] = round(float(top_deal_price), 2)
+    if inicio:
+        body["start_date"] = inicio
+    if fim:
+        body["finish_date"] = fim
+    headers = {"version": "v2", "X-Client-Id": str(a["client_id"]), "X-Caller-Id": str(sid)}
+    return _req("POST", f"/marketplace/seller-promotions/items/{item_id}", user_id=user_id,
+                params={"user_id": sid}, json=body, headers=headers)
+
+
+def remover_desconto(item_id: str, user_id=None) -> dict:
+    a = _app()
+    sid = _seller_id(user_id)
+    headers = {"version": "v2", "X-Client-Id": str(a["client_id"]), "X-Caller-Id": str(sid)}
+    return _req("DELETE", f"/marketplace/seller-promotions/items/{item_id}", user_id=user_id,
+                params={"promotion_type": "PRICE_DISCOUNT", "user_id": sid}, headers=headers)
+
+
+# =========================================================================== #
+# Domínio K — Qualidade do anúncio
+# =========================================================================== #
+def qualidade_ml(item_id: str, user_id=None) -> dict:
+    """Diagnóstico 0-100 do anúncio (fotos, ficha, descrição, vídeo) + health do ML."""
+    it = obter_item(item_id, user_id=user_id)
+    desc = descricao_item(item_id, user_id=user_id)
+    comp = []
+    t = it.get("titulo") or ""
+    comp.append({"chave": "titulo", "label": "Título", "valor": round(min(len(t) / 60, 1.0) * 20),
+                 "max": 20, "status": "ok" if len(t) >= 40 else "alerta",
+                 "detalhe": f"{len(t)} caracteres"})
+    nf = it.get("n_fotos") or 0
+    comp.append({"chave": "fotos", "label": "Fotos", "valor": round(min(nf / 8, 1.0) * 25),
+                 "max": 25, "status": "ok" if nf >= 6 else ("alerta" if nf >= 3 else "ruim"),
+                 "detalhe": f"{nf} foto(s)"})
+    attrs = {a.get("id"): a.get("value_name") for a in (it.get("atributos") or [])}
+    tem_ean = bool(attrs.get("GTIN") or attrs.get("EAN"))
+    preenchidos = sum(1 for v in attrs.values() if v)
+    attr_score = min((preenchidos / 12) + (0.3 if tem_ean else 0), 1.0)
+    comp.append({"chave": "atributos", "label": "Ficha técnica", "valor": round(attr_score * 20),
+                 "max": 20, "status": "ok" if (tem_ean and preenchidos >= 6) else "alerta",
+                 "detalhe": ("com EAN" if tem_ean else "sem EAN") + f", {preenchidos} atributos"})
+    dlen = len(desc or "")
+    comp.append({"chave": "descricao", "label": "Descrição", "valor": round(min(dlen / 600, 1.0) * 20),
+                 "max": 20, "status": "ok" if dlen >= 300 else ("alerta" if dlen > 0 else "ruim"),
+                 "detalhe": f"{dlen} caracteres"})
+    tv = it.get("tem_video")
+    comp.append({"chave": "video", "label": "Vídeo", "valor": 15 if tv else 0, "max": 15,
+                 "status": "ok" if tv else "alerta", "detalhe": "com vídeo" if tv else "sem vídeo"})
+    return {"item_id": item_id, "score": sum(c["valor"] for c in comp), "health": it.get("health"),
+            "titulo": t, "status": it.get("status"), "componentes": comp}
+
+
+# =========================================================================== #
+# Cache & sincronização
+# =========================================================================== #
+def _upsert_cache(db, user_id, it):
+    c = db.query(MLItemCache).filter_by(user_id=user_id, item_id=it["item_id"]).first()
+    if not c:
+        c = MLItemCache(user_id=user_id, item_id=it["item_id"])
+        db.add(c)
+    c.sku = it.get("sku")
+    c.titulo = it.get("titulo")
+    c.preco = it.get("preco") or 0
+    c.preco_original = it.get("preco_original") or 0
+    c.status = it.get("status")
+    c.estoque = it.get("estoque")
+    c.category_id = it.get("category_id")
+    c.listing_type_id = it.get("listing_type_id")
+    c.logistic_type = it.get("logistic_type")
+    c.permalink = it.get("permalink")
+    c.imagem = it.get("imagem")
+    c.saude = it.get("health")
+    c.em_promocao = bool(it.get("preco_original") and it.get("preco")
+                         and it["preco"] < it["preco_original"])
+    c.atualizado_em = datetime.utcnow()
+
+
+def sincronizar_catalogo(user_id) -> dict:
+    """Varre todos os anúncios (scan) e popula o MLItemCache via multiget. Job pesado."""
+    db = SessionLocal()
+    try:
+        s = db.query(MLSync).filter_by(user_id=user_id).first()
+        if not s:
+            s = MLSync(user_id=user_id)
+            db.add(s)
+        s.status = "rodando"
+        s.iniciado_em = datetime.utcnow()
+        s.processados = 0
+        s.erro = None
+        db.commit()
+    finally:
+        db.close()
+    try:
+        ids = listar_ids(user_id=user_id)
+        db = SessionLocal()
+        try:
+            s = db.query(MLSync).filter_by(user_id=user_id).first()
+            s.total = len(ids)
+            db.commit()
+        finally:
+            db.close()
+        proc = 0
+        for i in range(0, len(ids), 20):
+            itens = obter_itens(ids[i:i + 20], user_id=user_id)
+            db = SessionLocal()
+            try:
+                for it in itens:
+                    _upsert_cache(db, user_id, it)
+                proc += len(itens)
+                s = db.query(MLSync).filter_by(user_id=user_id).first()
+                s.processados = proc
+                db.commit()
+            finally:
+                db.close()
+        db = SessionLocal()
+        try:
+            s = db.query(MLSync).filter_by(user_id=user_id).first()
+            s.status = "concluido"
+            s.concluido_em = datetime.utcnow()
+            db.commit()
+        finally:
+            db.close()
+        return {"ok": True, "total": len(ids)}
+    except Exception as e:  # noqa: BLE001
+        db = SessionLocal()
+        try:
+            s = db.query(MLSync).filter_by(user_id=user_id).first()
+            if s:
+                s.status = "erro"
+                s.erro = str(e)[:300]
+                db.commit()
+        finally:
+            db.close()
+        raise
+
+
+def status_sync(user_id) -> dict:
+    db = SessionLocal()
+    try:
+        s = db.query(MLSync).filter_by(user_id=user_id).first()
+        if not s:
+            return {"status": "ocioso", "total": 0, "processados": 0}
+        return {"status": s.status, "total": s.total, "processados": s.processados, "erro": s.erro,
+                "iniciado_em": s.iniciado_em.isoformat() if s.iniciado_em else None,
+                "concluido_em": s.concluido_em.isoformat() if s.concluido_em else None}
+    finally:
+        db.close()
+
+
+def listar_cache(user_id, sku=None, limite=200):
+    db = SessionLocal()
+    try:
+        q = db.query(MLItemCache).filter_by(user_id=user_id)
+        if sku:
+            q = q.filter(MLItemCache.sku == sku)
+        rows = q.limit(limite).all()
+        return [{"item_id": r.item_id, "sku": r.sku, "titulo": r.titulo, "preco": r.preco,
+                 "preco_original": r.preco_original, "status": r.status, "estoque": r.estoque,
+                 "category_id": r.category_id, "listing_type_id": r.listing_type_id,
+                 "logistic_type": r.logistic_type, "permalink": r.permalink, "imagem": r.imagem,
+                 "em_promocao": r.em_promocao,
+                 "atualizado_em": r.atualizado_em.isoformat() if r.atualizado_em else None}
+                for r in rows]
+    finally:
+        db.close()
+
+
+def cache_por_sku(user_id, sku):
+    rows = listar_cache(user_id, sku=sku, limite=1)
+    return rows[0] if rows else None
+
+
+# =========================================================================== #
+# Webhooks (tempo real) — atualiza o cache a partir das notificações do ML
+# =========================================================================== #
+def processar_notificacao(user_id, topic, resource) -> dict:
+    try:
+        if topic in ("items", "marketplace_items", "items_prices") and resource:
+            item_id = str(resource).rstrip("/").split("/")[-1]
+            if item_id.startswith("ML") or item_id.startswith("CBT"):
+                it = obter_item(item_id, user_id=user_id)
+                db = SessionLocal()
+                try:
+                    _upsert_cache(db, user_id, it)
+                    db.commit()
+                finally:
+                    db.close()
+                return {"ok": True, "item_id": item_id}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200]}
+    return {"ok": True, "ignorado": True}

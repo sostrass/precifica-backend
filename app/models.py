@@ -514,3 +514,63 @@ class KpiSnapshot(Base):
     cobertura = Column(JSON, nullable=True)
     criado_em = Column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("user_id", "dia", name="uq_kpi_user_dia"),)
+
+
+class MLConta(Base):
+    """Credenciais/tokens do Mercado Livre por usuário (multi-tenant).
+    O access_token expira em ~6h e é renovado pelo refresh_token automaticamente.
+    Fallback single-tenant: se não houver linha, o módulo usa ML_* do ambiente."""
+
+    __tablename__ = "ml_conta"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    seller_id = Column(String, nullable=True)
+    nickname = Column(String, nullable=True)
+    site_id = Column(String, default="MLB", nullable=True)
+    access_token = Column(String, nullable=True)
+    refresh_token = Column(String, nullable=True)
+    expira_em = Column(DateTime, nullable=True)        # quando o access_token expira
+    conectado_em = Column(DateTime, nullable=True)
+    ativo = Column(Boolean, default=True)
+
+
+class MLItemCache(Base):
+    """Cache local dos anúncios do Mercado Livre (sku -> item_id, preço, status...).
+    Alimenta o cockpit e respeita o limite de 1500 req/min (lê daqui, não da API)."""
+
+    __tablename__ = "ml_item_cache"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    item_id = Column(String, nullable=False, index=True)
+    sku = Column(String, nullable=True, index=True)
+    titulo = Column(String, nullable=True)
+    preco = Column(Float, default=0.0)
+    preco_original = Column(Float, default=0.0)
+    status = Column(String, nullable=True)               # active | paused | closed
+    estoque = Column(Integer, nullable=True)
+    category_id = Column(String, nullable=True)
+    listing_type_id = Column(String, nullable=True)      # free | gold_special | gold_pro
+    logistic_type = Column(String, nullable=True)        # me1 | me2 | self_service | fulfillment | drop_off
+    saude = Column(Float, nullable=True)                 # health (0-1) quando disponível
+    permalink = Column(String, nullable=True)
+    imagem = Column(String, nullable=True)
+    em_promocao = Column(Boolean, default=False)
+    dados = Column(JSON, nullable=True)                  # payload bruto reduzido
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "item_id", name="uq_ml_user_item"),)
+
+
+class MLSync(Base):
+    """Estado da sincronização completa do catálogo do Mercado Livre (1 linha por usuário)."""
+
+    __tablename__ = "ml_sync"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    status = Column(String, default="ocioso")   # ocioso | rodando | concluido | erro
+    total = Column(Integer, default=0)
+    processados = Column(Integer, default=0)
+    erro = Column(String, nullable=True)
+    iniciado_em = Column(DateTime, nullable=True)
+    concluido_em = Column(DateTime, nullable=True)
