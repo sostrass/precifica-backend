@@ -2285,7 +2285,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     # O ML corta /orders/search em 50 por chamada. Para o modelo de "janela inteira"
     # (o front pede a janela toda de uma vez, ex.: limit=120), buscamos em blocos de 50
     # até completar `limit` (teto de segurança 150). `total` vem do paging da 1ª página.
-    limit = max(1, min(int(limit or 30), 150))
+    limit = max(1, min(int(limit or 30), 500))
     results, total, got = [], None, 0
     while got < limit:
         bloco = min(50, limit - got)
@@ -2341,6 +2341,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
         itens = []
         o_rec = o_fee = o_cost = 0.0
         o_unid = 0
+        o_logistic = None
         for it in (o.get("order_items") or []):
             item = it.get("item") or {}
             iid = str(item.get("id") or "")
@@ -2350,6 +2351,8 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             fee_u = float(it.get("sale_fee") or 0)
             prod = prod_by_sku.get(sku)
             mlc = ml_by_item.get(iid) or ml_by_sku.get(sku)
+            if not o_logistic and mlc is not None:
+                o_logistic = getattr(mlc, "logistic_type", None)
             preco_bling = float(prod.preco) if (prod and prod.preco) else None
             custo = float(prod.custo) if (prod and prod.custo) else None
             ml_preco = float(mlc.preco) if (mlc and mlc.preco) else None
@@ -2376,13 +2379,19 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             por_dia[dia] = por_dia.get(dia, 0.0) + o_rec
         buyer = o.get("buyer") or {}
         ship = o.get("shipping") or {}
+        logistic = ship.get("logistic_type") or o_logistic
+        pago_em = next((pg.get("date_approved") for pg in (o.get("payments") or [])
+                        if pg.get("date_approved")), None)
         pedidos.append({
             "id": o.get("id"),
             "date_created": o.get("date_created"),
+            "pago_em": pago_em,
             "status": st,
             "buyer": {"nickname": buyer.get("nickname")},
             "shipping_id": ship.get("id"),
             "envio_status": ship.get("status"),
+            "logistic_type": logistic,
+            "is_full": (logistic == "fulfillment"),
             "total": float(o.get("total_amount") or o_rec),
             "itens": itens,
             "resumo": {
