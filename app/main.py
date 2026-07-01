@@ -2282,9 +2282,24 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     from .models import ProdutoCache, MLItemCache
     from sqlalchemy import or_ as _or
 
-    raw = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, offset, limit) or {}
-    results = raw.get("results") or []
-    paging = raw.get("paging") or {}
+    # O ML corta /orders/search em 50 por chamada. Para o modelo de "janela inteira"
+    # (o front pede a janela toda de uma vez, ex.: limit=120), buscamos em blocos de 50
+    # até completar `limit` (teto de segurança 150). `total` vem do paging da 1ª página.
+    limit = max(1, min(int(limit or 30), 150))
+    results, total, got = [], None, 0
+    while got < limit:
+        bloco = min(50, limit - got)
+        raw = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, offset + got, bloco) or {}
+        pagina = raw.get("results") or []
+        if total is None:
+            total = (raw.get("paging") or {}).get("total")
+        results.extend(pagina)
+        got += len(pagina)
+        if len(pagina) < bloco:  # acabaram os pedidos da janela
+            break
+    if total is None:
+        total = len(results)
+    paging = {"total": total, "carregados": len(results)}
 
     skus, item_ids = set(), set()
     for o in results:
@@ -2367,6 +2382,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             "status": st,
             "buyer": {"nickname": buyer.get("nickname")},
             "shipping_id": ship.get("id"),
+            "envio_status": ship.get("status"),
             "total": float(o.get("total_amount") or o_rec),
             "itens": itens,
             "resumo": {
