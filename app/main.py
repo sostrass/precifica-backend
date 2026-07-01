@@ -492,7 +492,10 @@ def shopee_renovar(user: User = Depends(auth.get_current_user)):
 def _shopee_redirect_base(request: Request) -> str:
     """URL pública do backend para o Shopee redirecionar de volta após o login."""
     if settings.shopee_redirect_base:
-        return settings.shopee_redirect_base.rstrip("/")
+        base = settings.shopee_redirect_base.rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            base = "https://" + base
+        return base
     base = str(request.base_url).rstrip("/")
     return base.replace("http://", "https://") if "localhost" not in base and "127.0.0.1" not in base else base
 
@@ -2020,9 +2023,10 @@ def mercadolivre_conectar(request: Request):
 
 
 @app.get("/api/mercadolivre/callback")
-def mercadolivre_callback(request: Request, code: str = "", error: str = ""):
-    """Callback do OAuth do ML. Troca o code por tokens e MOSTRA o refresh_token e o
-    seller_id pra colar no Railway (ML_REFRESH_TOKEN, ML_SELLER_ID)."""
+def mercadolivre_callback(request: Request, code: str = "", error: str = "", state: str = ""):
+    """Callback único do OAuth do ML (redirect fixo, casa com o cadastro do app).
+    Com 'state' válido: salva a conta do tenant no banco e fecha o popup. Sem 'state':
+    modo setup por ambiente — mostra refresh_token/seller_id pra colar no Railway."""
     from . import mercadolivre as ml
     if error:
         return HTMLResponse(_HTML_ERR.format(msg=f"Mercado Livre recusou: {error}"), status_code=400)
@@ -2039,6 +2043,11 @@ def mercadolivre_callback(request: Request, code: str = "", error: str = ""):
             nick = me.get("nickname") or ""
         except Exception:  # noqa: BLE001
             pass
+        uid = ml.ler_state(state) if state else None
+        if uid:  # multi-tenant (popup): grava a conta e encerra
+            ml.salvar_conta(uid, refresh, access, d.get("expires_in") or 21600,
+                            seller_id=sid, nickname=nick)
+            return HTMLResponse(_HTML_OK)
         nick_sufixo = f" · {nick}" if nick else ""
         return HTMLResponse(_HTML_ML_OK.format(refresh=refresh, sid=sid, nick_sufixo=nick_sufixo))
     except Exception as e:  # noqa: BLE001
@@ -2087,7 +2096,7 @@ def ml_auth_login(request: Request, user: User = Depends(auth.get_current_user))
     if not ml.app_configurado():
         raise HTTPException(status_code=400, detail="App ML não configurado (ML_CLIENT_ID/SECRET).")
     state = ml.state_token(user.id)
-    redirect = f"{_shopee_redirect_base(request)}/api/mercadolivre/auth/callback/{state}"
+    redirect = _ml_redirect_uri(request)  # FIXO: /api/mercadolivre/callback — casa com o redirect cadastrado no app do ML
     return {"url": ml.url_autorizacao(redirect, state=state)}
 
 
