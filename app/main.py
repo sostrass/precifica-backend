@@ -2275,6 +2275,128 @@ def ml_pedido(order_id: str, user: User = Depends(auth.get_current_user)):
     return _ml_run(lambda ml: ml.obter_pedido(order_id, user.id))
 
 
+def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit):
+    """Pedidos do ML cruzados com o Bling (preço/custo por SKU) e com o cache do
+    anúncio (imagem/preço atual). A tarifa vem do próprio pedido (order_items.sale_fee),
+    então não há chamada extra à API. Devolve pedidos + estatísticas agregadas."""
+    from .models import ProdutoCache, MLItemCache
+    from sqlalchemy import or_ as _or
+
+    raw = ml.listar_pedidos(user_id, status or None, None, None, offset, limit) or {}
+    results = raw.get("results") or []
+    paging = raw.get("paging") or {}
+
+    skus, item_ids = set(), set()
+    for o in results:
+        for it in (o.get("order_items") or []):
+            item = it.get("item") or {}
+            if item.get("seller_sku"):
+                skus.add(str(item["seller_sku"]))
+            if item.get("id"):
+                item_ids.add(str(item["id"]))
+
+    prod_by_sku, ml_by_item, ml_by_sku = {}, {}, {}
+    db = SessionLocal()
+    try:
+        if skus:
+            for r in db.query(ProdutoCache).filter(
+                    ProdutoCache.user_id == user_id, ProdutoCache.sku.in_(list(skus))).all():
+                if r.sku:
+                    prod_by_sku[str(r.sku)] = r
+        conds = []
+        if item_ids:
+            conds.append(MLItemCache.item_id.in_(list(item_ids)))
+        if skus:
+            conds.append(MLItemCache.sku.in_(list(skus)))
+        if conds:
+            for r in db.query(MLItemCache).filter(
+                    MLItemCache.user_id == user_id, _or(*conds)).all():
+                if r.item_id:
+                    ml_by_item[str(r.item_id)] = r
+                if r.sku:
+                    ml_by_sku[str(r.sku)] = r
+    finally:
+        db.close()
+
+    pedidos = []
+    t_rec = t_fee = t_cost = t_liq = 0.0
+    t_unid = 0
+    por_status, por_dia = {}, {}
+    for o in results:
+        itens = []
+        o_rec = o_fee = o_cost = 0.0
+        o_unid = 0
+        for it in (o.get("order_items") or []):
+            item = it.get("item") or {}
+            iid = str(item.get("id") or "")
+            sku = str(item.get("seller_sku") or "")
+            qty = int(it.get("quantity") or 0)
+            unit = float(it.get("unit_price") or 0)
+            fee_u = float(it.get("sale_fee") or 0)
+            prod = prod_by_sku.get(sku)
+            mlc = ml_by_item.get(iid) or ml_by_sku.get(sku)
+            preco_bling = float(prod.preco) if (prod and prod.preco) else None
+            custo = float(prod.custo) if (prod and prod.custo) else None
+            ml_preco = float(mlc.preco) if (mlc and mlc.preco) else None
+            imagem = (mlc.imagem if (mlc and mlc.imagem) else (prod.imagem if (prod and prod.imagem) else None))
+            titulo = item.get("title") or (prod.nome if prod else None) or (mlc.titulo if mlc else None) or "Item"
+            rev = unit * qty
+            fee = fee_u * qty
+            cost = (custo or 0) * qty
+            liq = rev - fee - cost
+            itens.append({
+                "item_id": iid or None, "sku": sku or None, "titulo": titulo,
+                "imagem": imagem, "quantidade": qty, "unit_price": round(unit, 2),
+                "sale_fee": round(fee, 2), "preco_bling": preco_bling,
+                "ml_preco": ml_preco, "custo": custo, "receita": round(rev, 2),
+                "custo_total": round(cost, 2), "liquido": round(liq, 2),
+                "margem": round(liq / rev * 100, 1) if rev > 0 else None,
+            })
+            o_rec += rev; o_fee += fee; o_cost += cost; o_unid += qty
+        o_liq = o_rec - o_fee - o_cost
+        st = o.get("status")
+        por_status[st] = por_status.get(st, 0) + 1
+        dia = (o.get("date_created") or "")[:10]
+        if dia:
+            por_dia[dia] = por_dia.get(dia, 0.0) + o_rec
+        buyer = o.get("buyer") or {}
+        ship = o.get("shipping") or {}
+        pedidos.append({
+            "id": o.get("id"),
+            "date_created": o.get("date_created"),
+            "status": st,
+            "buyer": {"nickname": buyer.get("nickname")},
+            "shipping_id": ship.get("id"),
+            "total": float(o.get("total_amount") or o_rec),
+            "itens": itens,
+            "resumo": {
+                "receita": round(o_rec, 2), "tarifa": round(o_fee, 2),
+                "custo": round(o_cost, 2), "liquido": round(o_liq, 2),
+                "unidades": o_unid,
+                "margem": round(o_liq / o_rec * 100, 1) if o_rec > 0 else None,
+            },
+        })
+        t_rec += o_rec; t_fee += o_fee; t_cost += o_cost; t_liq += o_liq; t_unid += o_unid
+
+    n = len(results)
+    stats = {
+        "pedidos": n, "receita": round(t_rec, 2),
+        "ticket_medio": round(t_rec / n, 2) if n else 0,
+        "unidades": t_unid, "tarifas": round(t_fee, 2),
+        "custo": round(t_cost, 2), "liquido": round(t_liq, 2),
+        "margem": round(t_liq / t_rec * 100, 1) if t_rec > 0 else None,
+        "por_status": por_status,
+        "receita_por_dia": [{"dia": k, "receita": round(v, 2)} for k, v in sorted(por_dia.items())],
+    }
+    return {"pedidos": pedidos, "paging": paging, "stats": stats}
+
+
+@app.get("/api/mercadolivre/pedidos-enriquecido")
+def ml_pedidos_enriquecido(status: str = "paid", offset: int = 0, limit: int = 30,
+                           user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: _pedidos_ml_enriquecidos(ml, user.id, status, offset, limit))
+
+
 # --- Envios / etiqueta real ---
 @app.get("/api/mercadolivre/envio/{shipment_id}")
 def ml_envio(shipment_id: str, user: User = Depends(auth.get_current_user)):
