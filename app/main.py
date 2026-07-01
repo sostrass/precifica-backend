@@ -2275,14 +2275,14 @@ def ml_pedido(order_id: str, user: User = Depends(auth.get_current_user)):
     return _ml_run(lambda ml: ml.obter_pedido(order_id, user.id))
 
 
-def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit):
+def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate=None):
     """Pedidos do ML cruzados com o Bling (preço/custo por SKU) e com o cache do
     anúncio (imagem/preço atual). A tarifa vem do próprio pedido (order_items.sale_fee),
     então não há chamada extra à API. Devolve pedidos + estatísticas agregadas."""
     from .models import ProdutoCache, MLItemCache
     from sqlalchemy import or_ as _or
 
-    raw = ml.listar_pedidos(user_id, status or None, None, None, offset, limit) or {}
+    raw = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, offset, limit) or {}
     results = raw.get("results") or []
     paging = raw.get("paging") or {}
 
@@ -2393,8 +2393,10 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit):
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
 def ml_pedidos_enriquecido(status: str = "paid", offset: int = 0, limit: int = 30,
+                           desde: str = "", ate: str = "",
                            user: User = Depends(auth.get_current_user)):
-    return _ml_run(lambda ml: _pedidos_ml_enriquecidos(ml, user.id, status, offset, limit))
+    return _ml_run(lambda ml: _pedidos_ml_enriquecidos(ml, user.id, status, offset, limit,
+                                                        desde or None, ate or None))
 
 
 # --- Envios / etiqueta real ---
