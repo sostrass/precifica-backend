@@ -2275,6 +2275,37 @@ def ml_pedido(order_id: str, user: User = Depends(auth.get_current_user)):
     return _ml_run(lambda ml: ml.obter_pedido(order_id, user.id))
 
 
+def _parse_dt_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _balde_pedido(order_status, env, hoje_fim):
+    """Classifica o pedido nos baldes do painel a partir do estado REAL do envio
+    (o mesmo eixo da tela Vendas do ML): a despachar hoje / próximos dias /
+    em trânsito / finalizado / cancelado. Sem envio no cache => 'sincronizando'."""
+    if order_status == "cancelled":
+        return "cancelado"
+    if not env:
+        return "sincronizando"
+    st = env.get("status")
+    sub = env.get("substatus") or ""
+    if st == "cancelled":
+        return "cancelado"
+    if st == "delivered" or env.get("devolucao"):
+        return "finalizado"
+    if st == "shipped" or sub in ("in_hub", "in_transit", "out_for_delivery", "dropped_off", "picked_up", "receiver_absent"):
+        return "transito"
+    hl = _parse_dt_iso(env.get("handling_limit"))
+    if hl and hl > hoje_fim:
+        return "proximos"
+    return "hoje"
+
+
 def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate=None):
     """Pedidos do ML cruzados com o Bling (preço/custo por SKU) e com o cache do
     anúncio (imagem/preço atual). A tarifa vem do próprio pedido (order_items.sale_fee),
@@ -2403,14 +2434,63 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
         })
         t_rec += o_rec; t_fee += o_fee; t_cost += o_cost; t_liq += o_liq; t_unid += o_unid
 
+    # --- Estado real do envio: lê do cache (hot-path leve). Webhooks do tópico
+    #     `shipments` + backfill sob demanda mantêm o cache vivo. ---
+    sids = [str(p["shipping_id"]) for p in pedidos if p.get("shipping_id")]
+    envios_cache = {}
+    if sids:
+        _db2 = SessionLocal()
+        try:
+            envios_cache = ml.ler_envios_cache(_db2, user_id, sids)
+        finally:
+            _db2.close()
+    baldes = {"hoje": 0, "proximos": 0, "transito": 0, "finalizado": 0, "cancelado": 0, "sincronizando": 0}
+    n_fiscal = n_devol = n_sync = 0
+    t_frete = 0.0
+    hoje_fim = datetime.utcnow().replace(hour=23, minute=59, second=59, microsecond=0)
+    for p in pedidos:
+        env = envios_cache.get(str(p.get("shipping_id"))) if p.get("shipping_id") else None
+        p["envio"] = env
+        balde = _balde_pedido(p.get("status"), env, hoje_fim)
+        p["balde"] = balde
+        baldes[balde] = baldes.get(balde, 0) + 1
+        r = p.get("resumo") or {}
+        frete = float((env or {}).get("custo_vendedor") or 0) if env else 0.0
+        # A tarifa (comissão via sale_fee) já vem do pedido; somamos o frete pago pelo
+        # vendedor (frete grátis sai do bolso do vendedor) p/ a margem ficar exata.
+        r["frete_vendedor"] = round(frete, 2) if frete else 0.0
+        r["tarifa_total"] = round((r.get("tarifa") or 0) + frete, 2)
+        r["comissao_pct"] = round((r.get("tarifa") or 0) / r["receita"] * 100, 1) if r.get("receita") else None
+        if frete:
+            r["liquido"] = round((r.get("liquido") or 0) - frete, 2)
+            r["margem"] = round(r["liquido"] / r["receita"] * 100, 1) if r.get("receita") else None
+        p["resumo"] = r
+        t_frete += frete
+        if env:
+            if env.get("status"):
+                p["envio_status"] = env.get("status")
+            if env.get("fiscal_pendente"):
+                n_fiscal += 1
+            if env.get("devolucao"):
+                n_devol += 1
+        else:
+            n_sync += 1
+
     n = len(results)
+    liq_final = t_liq - t_frete
     stats = {
         "pedidos": n, "receita": round(t_rec, 2),
         "ticket_medio": round(t_rec / n, 2) if n else 0,
         "unidades": t_unid, "tarifas": round(t_fee, 2),
-        "custo": round(t_cost, 2), "liquido": round(t_liq, 2),
-        "margem": round(t_liq / t_rec * 100, 1) if t_rec > 0 else None,
+        "frete_vendedor": round(t_frete, 2),
+        "custos_ml": round(t_fee + t_frete, 2),
+        "custo": round(t_cost, 2), "liquido": round(liq_final, 2),
+        "margem": round(liq_final / t_rec * 100, 1) if t_rec > 0 else None,
         "por_status": por_status,
+        "baldes": baldes,
+        "fiscal_pendentes": n_fiscal,
+        "devolucoes": n_devol,
+        "sincronizando": n_sync,
         "receita_por_dia": [{"dia": k, "receita": round(v, 2)} for k, v in sorted(por_dia.items())],
     }
     return {"pedidos": pedidos, "paging": paging, "stats": stats}
@@ -2428,6 +2508,32 @@ def ml_pedidos_enriquecido(status: str = "paid", offset: int = 0, limit: int = 3
 @app.get("/api/mercadolivre/envio/{shipment_id}")
 def ml_envio(shipment_id: str, user: User = Depends(auth.get_current_user)):
     return _ml_run(lambda ml: ml.envio_do_pedido(shipment_id, user.id))
+
+
+@app.post("/api/mercadolivre/envios/sincronizar")
+def ml_envios_sincronizar(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Backfill sob demanda: busca no ML os envios que faltam no cache (até `cap`)
+    e grava. O painel chama isso em lotes p/ aquecer os baldes sem travar a lista."""
+    ids = payload.get("shipment_ids") or []
+    cap = min(int(payload.get("cap") or 60), 120)
+    return _ml_run(lambda ml: ml.sincronizar_envios(user.id, ids, cap=cap))
+
+
+@app.get("/api/mercadolivre/posvenda")
+def ml_posvenda(status: str = "opened", user: User = Depends(auth.get_current_user)):
+    """Reclamações/devoluções em que o vendedor é parte (balde Devoluções / painel Pós-venda)."""
+    return _ml_run(lambda ml: ml.listar_posvenda(user.id, status=status))
+
+
+@app.get("/api/mercadolivre/posvenda/{claim_id}")
+def ml_posvenda_detalhe(claim_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.detalhe_posvenda(claim_id, user.id))
+
+
+@app.get("/api/mercadolivre/tarifa/{order_id}")
+def ml_tarifa_detalhe(order_id: str, user: User = Depends(auth.get_current_user)):
+    """Composição real da tarifa do pedido (faturamento) — detalhamento sob demanda no drawer."""
+    return _ml_run(lambda ml: ml.detalhe_tarifa(order_id, user.id))
 
 
 @app.get("/api/mercadolivre/etiqueta")

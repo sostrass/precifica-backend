@@ -574,3 +574,51 @@ class MLSync(Base):
     erro = Column(String, nullable=True)
     iniciado_em = Column(DateTime, nullable=True)
     concluido_em = Column(DateTime, nullable=True)
+
+
+class MLEnvioCache(Base):
+    """Cache do estado de cada envio (shipment) do Mercado Livre.
+
+    Alimentado por webhooks do tópico `shipments` (tempo real) e por backfill
+    sob demanda. É a fonte de verdade dos baldes do painel (a despachar hoje,
+    próximos dias, em trânsito, finalizadas), do prazo de coleta, rastreio e
+    custos — dados que o /orders/search NÃO devolve.
+    """
+
+    __tablename__ = "ml_envio_cache"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    shipment_id = Column(String, nullable=False, index=True)
+    order_id = Column(String, nullable=True, index=True)
+
+    status = Column(String, nullable=True, index=True)
+    substatus = Column(String, nullable=True)
+    logistic_type = Column(String, nullable=True)
+    mode = Column(String, nullable=True)
+
+    handling_limit = Column(DateTime, nullable=True)      # prazo p/ despachar (coleta/manuseio)
+    delivery_limit = Column(DateTime, nullable=True)      # previsão-limite de entrega
+    date_ready = Column(DateTime, nullable=True)
+    date_shipped = Column(DateTime, nullable=True)
+    date_delivered = Column(DateTime, nullable=True)
+
+    tracking_number = Column(String, nullable=True)
+    tracking_method = Column(String, nullable=True)
+
+    custo_vendedor = Column(Float, nullable=True)         # frete pago pelo vendedor
+    custo_comprador = Column(Float, nullable=True)        # frete pago pelo comprador
+
+    receiver_nome = Column(String, nullable=True)
+    receiver_endereco = Column(String, nullable=True)     # linha compacta p/ lista
+    receiver_cidade = Column(String, nullable=True)
+    receiver_estado = Column(String, nullable=True)
+    receiver_cep = Column(String, nullable=True)
+
+    fiscal_pendente = Column(Boolean, default=False)
+    devolucao = Column(Boolean, default=False)
+
+    dados = Column(JSON, nullable=True)                   # shipment cru (x-format-new)
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "shipment_id", name="uq_ml_user_shipment"),)

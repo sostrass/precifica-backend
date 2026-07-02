@@ -625,6 +625,22 @@ def custos_de_envio(order_id: str, user_id=None) -> dict:
     return _get(f"/orders/{order_id}/shipments", user_id=user_id)
 
 
+def custos_do_shipment(shipment_id, user_id=None) -> dict:
+    """Custos do envio: receiver.cost (comprador) + senders[].cost (vendedor). Seção 3."""
+    return _get(f"/shipments/{shipment_id}/costs", user_id=user_id)
+
+
+def _custos_envio(raw: dict) -> dict:
+    """Extrai frete do vendedor e do comprador da resposta de /shipments/{id}/costs."""
+    raw = raw or {}
+    receiver = raw.get("receiver") or {}
+    senders = raw.get("senders") or []
+    vendedor = None
+    if senders and isinstance(senders, list):
+        vendedor = senders[0].get("cost")
+    return {"vendedor": vendedor, "comprador": receiver.get("cost")}
+
+
 def etiqueta(shipment_ids, formato="pdf", user_id=None):
     """Etiqueta (waybill) real. Retorna (bytes, content_type). Máx 50 shipment_ids."""
     rt = "zpl2" if formato == "zpl" else "pdf"
@@ -892,6 +908,154 @@ def cache_por_sku(user_id, sku):
 # =========================================================================== #
 # Webhooks (tempo real) — atualiza o cache a partir das notificações do ML
 # =========================================================================== #
+def _dt_iso(s):
+    """Parse ISO do ML → datetime naive. Tolerante a fuso e a None."""
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return d.replace(tzinfo=None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _limite_valor(x):
+    return x.get("date") if isinstance(x, dict) else x
+
+
+def _resumo_envio(raw: dict) -> dict:
+    """Extrai do shipment (x-format-new) os campos que o painel usa. 100% defensivo."""
+    raw = raw or {}
+    lead = raw.get("lead_time") or {}
+    sh = raw.get("status_history") or {}
+    ra = raw.get("receiver_address") or {}
+    status = raw.get("status")
+    substatus = raw.get("substatus")
+    handling = _limite_valor(lead.get("estimated_handling_limit")) or _limite_valor(raw.get("estimated_handling_limit"))
+    delivery = _limite_valor(lead.get("estimated_delivery_limit")) or _limite_valor(lead.get("estimated_delivery_time"))
+    try:
+        custo_comprador = (raw.get("shipping_option") or {}).get("cost")
+    except Exception:  # noqa: BLE001
+        custo_comprador = None
+    sub = str(substatus or "")
+    fiscal_pend = sub in ("invoice_pending", "waiting_for_invoice") or ("invoice" in sub and "pend" in sub)
+    devol = status in ("returned", "to_be_returned") or ("return" in sub)
+    cidade = (ra.get("city") or {}).get("name") if isinstance(ra.get("city"), dict) else ra.get("city")
+    estado = (ra.get("state") or {}).get("name") if isinstance(ra.get("state"), dict) else ra.get("state")
+    linha = ra.get("address_line") or " ".join(
+        x for x in [ra.get("street_name"), str(ra.get("street_number") or "")] if x
+    ).strip()
+    return {
+        "status": status, "substatus": substatus,
+        "logistic_type": raw.get("logistic_type"), "mode": raw.get("mode"),
+        "handling_limit": handling, "delivery_limit": delivery,
+        "date_ready": sh.get("date_ready_to_ship"), "date_shipped": sh.get("date_shipped"),
+        "date_delivered": sh.get("date_delivered"),
+        "tracking_number": raw.get("tracking_number"), "tracking_method": raw.get("tracking_method"),
+        "custo_comprador": custo_comprador,
+        "receiver_nome": ra.get("receiver_name"), "receiver_endereco": linha or None,
+        "receiver_cidade": cidade, "receiver_estado": estado, "receiver_cep": ra.get("zip_code"),
+        "fiscal_pendente": bool(fiscal_pend), "devolucao": bool(devol),
+    }
+
+
+def _upsert_envio_cache(db, user_id, shipment_id, raw, order_id=None, custos=None):
+    from .models import MLEnvioCache
+    r = _resumo_envio(raw)
+    c = db.query(MLEnvioCache).filter_by(user_id=user_id, shipment_id=str(shipment_id)).first()
+    if not c:
+        c = MLEnvioCache(user_id=user_id, shipment_id=str(shipment_id))
+        db.add(c)
+    if order_id:
+        c.order_id = str(order_id)
+    c.status = r["status"]; c.substatus = r["substatus"]
+    c.logistic_type = r["logistic_type"]; c.mode = r["mode"]
+    c.handling_limit = _dt_iso(r["handling_limit"]); c.delivery_limit = _dt_iso(r["delivery_limit"])
+    c.date_ready = _dt_iso(r["date_ready"]); c.date_shipped = _dt_iso(r["date_shipped"])
+    c.date_delivered = _dt_iso(r["date_delivered"])
+    c.tracking_number = r["tracking_number"]; c.tracking_method = r["tracking_method"]
+    c.custo_comprador = r["custo_comprador"]
+    if custos:
+        if custos.get("vendedor") is not None:
+            c.custo_vendedor = custos["vendedor"]
+        if custos.get("comprador") is not None:
+            c.custo_comprador = custos["comprador"]
+    c.receiver_nome = r["receiver_nome"]; c.receiver_endereco = r["receiver_endereco"]
+    c.receiver_cidade = r["receiver_cidade"]; c.receiver_estado = r["receiver_estado"]; c.receiver_cep = r["receiver_cep"]
+    c.fiscal_pendente = r["fiscal_pendente"]; c.devolucao = r["devolucao"]
+    c.dados = raw
+    c.atualizado_em = datetime.utcnow()
+    return c
+
+
+def _envio_cache_dict(c) -> dict:
+    iso = lambda d: d.isoformat() if d else None  # noqa: E731
+    return {
+        "status": c.status, "substatus": c.substatus,
+        "logistic_type": c.logistic_type, "mode": c.mode,
+        "handling_limit": iso(c.handling_limit), "delivery_limit": iso(c.delivery_limit),
+        "date_ready": iso(c.date_ready), "date_shipped": iso(c.date_shipped), "date_delivered": iso(c.date_delivered),
+        "tracking_number": c.tracking_number, "tracking_method": c.tracking_method,
+        "custo_comprador": c.custo_comprador, "custo_vendedor": c.custo_vendedor,
+        "receiver_nome": c.receiver_nome, "receiver_endereco": c.receiver_endereco,
+        "receiver_cidade": c.receiver_cidade, "receiver_estado": c.receiver_estado, "receiver_cep": c.receiver_cep,
+        "fiscal_pendente": bool(c.fiscal_pendente), "devolucao": bool(c.devolucao),
+        "atualizado_em": iso(c.atualizado_em),
+    }
+
+
+def ler_envios_cache(db, user_id, shipment_ids) -> dict:
+    """Lê do cache os envios pedidos (hot-path, sem chamar o ML). {shipment_id: dict}."""
+    from .models import MLEnvioCache
+    ids = [str(x) for x in shipment_ids if x]
+    if not ids:
+        return {}
+    out = {}
+    for i in range(0, len(ids), 400):
+        bloco = ids[i:i + 400]
+        for c in db.query(MLEnvioCache).filter(
+            MLEnvioCache.user_id == user_id, MLEnvioCache.shipment_id.in_(bloco)
+        ).all():
+            out[c.shipment_id] = _envio_cache_dict(c)
+    return out
+
+
+def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
+    """Backfill: busca no ML os envios ainda ausentes do cache (até `cap`) e grava.
+    Mantém o hot-path leve — os webhooks do tópico `shipments` mantêm o resto vivo."""
+    from .models import MLEnvioCache
+    ids = [str(x) for x in shipment_ids if x]
+    db = SessionLocal()
+    try:
+        existentes = set()
+        if ids:
+            for i in range(0, len(ids), 400):
+                bloco = ids[i:i + 400]
+                for (sid,) in db.query(MLEnvioCache.shipment_id).filter(
+                    MLEnvioCache.user_id == user_id, MLEnvioCache.shipment_id.in_(bloco)
+                ).all():
+                    existentes.add(sid)
+        faltam = [x for x in ids if x not in existentes]
+        alvo = faltam[:cap]
+        buscados = 0
+        for sid in alvo:
+            try:
+                raw = envio_do_pedido(sid, user_id=user_id)
+                custos = None
+                try:
+                    custos = _custos_envio(custos_do_shipment(sid, user_id=user_id))
+                except Exception:  # noqa: BLE001
+                    custos = None
+                _upsert_envio_cache(db, user_id, sid, raw, custos=custos)
+                buscados += 1
+            except Exception:  # noqa: BLE001
+                continue
+        db.commit()
+        return {"buscados": buscados, "faltam": max(0, len(faltam) - buscados), "total": len(ids)}
+    finally:
+        db.close()
+
+
 def processar_notificacao(user_id, topic, resource) -> dict:
     try:
         if topic in ("items", "marketplace_items", "items_prices") and resource:
@@ -905,6 +1069,137 @@ def processar_notificacao(user_id, topic, resource) -> dict:
                 finally:
                     db.close()
                 return {"ok": True, "item_id": item_id}
+        if topic == "shipments" and resource:
+            sid = str(resource).rstrip("/").split("/")[-1]
+            if sid.isdigit():
+                raw = envio_do_pedido(sid, user_id=user_id)
+                custos = None
+                try:
+                    custos = _custos_envio(custos_do_shipment(sid, user_id=user_id))
+                except Exception:  # noqa: BLE001
+                    custos = None
+                db = SessionLocal()
+                try:
+                    _upsert_envio_cache(db, user_id, sid, raw, custos=custos)
+                    db.commit()
+                finally:
+                    db.close()
+                return {"ok": True, "shipment_id": sid}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "erro": str(e)[:200]}
     return {"ok": True, "ignorado": True}
+
+
+# =========================================================================== #
+# Domínio — Pós-venda (reclamações / devoluções)  [post-purchase v1 + returns v2]
+# =========================================================================== #
+_REASON_PREFIXO = {
+    "PNR": "Produto não recebido",
+    "PDD": "Produto com defeito",
+    "PDW": "Produto diferente do anúncio",
+    "MED": "Mediação",
+    "CANC": "Cancelamento",
+}
+
+
+def _claim_item(c: dict) -> dict:
+    c = c or {}
+    res = c.get("resource")
+    rid = c.get("resource_id")
+    order_id = str(rid) if res in ("order", "purchase") and rid else None
+    players = c.get("players") or []
+    comprador = next((p.get("user_id") for p in players if p.get("role") == "complainant"), None)
+    reason = str(c.get("reason_id") or "")
+    pref = next((v for k, v in _REASON_PREFIXO.items() if reason.startswith(k)), None)
+    return {
+        "claim_id": c.get("id"),
+        "order_id": order_id, "pack_id": c.get("pack_id"),
+        "resource": res, "resource_id": rid,
+        "stage": c.get("stage"), "status": c.get("status"), "type": c.get("type"),
+        "reason_id": c.get("reason_id"), "reason_grupo": pref,
+        "comprador_id": comprador,
+        "last_updated": c.get("last_updated") or c.get("date_created"),
+    }
+
+
+def listar_posvenda(user_id=None, status="opened", limit=50) -> dict:
+    """Reclamações/devoluções em que o vendedor é parte. Fonte do balde Devoluções
+    e do painel de Pós-venda. Ver relatório, seção 9 (POST-PURCHASE claims)."""
+    sid = _seller_id(user_id)
+    params = {"players.user_id": sid, "limit": limit, "sort": "last_updated:desc"}
+    if status:
+        params["status"] = status
+    data = _get("/post-purchase/v1/claims/search", params=params, user_id=user_id)
+    linhas = data.get("data") or data.get("results") or []
+    paging = data.get("paging") or {}
+    return {"itens": [_claim_item(c) for c in linhas], "total": paging.get("total", len(linhas))}
+
+
+def detalhe_posvenda(claim_id, user_id=None) -> dict:
+    """Claim + detalhe (o que precisa ser feito) + se afeta reputação (janela de 48h)."""
+    base = f"/post-purchase/v1/claims/{claim_id}"
+    claim = _get(base, user_id=user_id)
+    try:
+        detalhe = _get(base + "/detail", user_id=user_id)
+    except Exception:  # noqa: BLE001
+        detalhe = {}
+    try:
+        reput = _get(base + "/affects-reputation", user_id=user_id)
+    except Exception:  # noqa: BLE001
+        reput = {}
+    reason_nome = None
+    rid = (claim or {}).get("reason_id")
+    if rid:
+        try:
+            reason_nome = (_get(f"/post-purchase/v1/claims/reasons/{rid}", user_id=user_id) or {}).get("name")
+        except Exception:  # noqa: BLE001
+            reason_nome = None
+    players = (claim or {}).get("players") or []
+    acoes = []
+    for p in players:
+        if p.get("role") in ("respondent", "seller"):
+            for a in (p.get("available_actions") or []):
+                acoes.append({"action": a.get("action"), "mandatory": a.get("mandatory"), "due_date": a.get("due_date")})
+    return {
+        "resumo": _claim_item(claim),
+        "reason_nome": reason_nome,
+        "titulo": (detalhe or {}).get("title"),
+        "descricao": (detalhe or {}).get("description"),
+        "problema": (detalhe or {}).get("problem"),
+        "due_date": (detalhe or {}).get("due_date"),
+        "responsavel": (detalhe or {}).get("action_responsible"),
+        "afeta_reputacao": bool((reput or {}).get("affects_reputation")),
+        "tem_incentivo": bool((reput or {}).get("has_incentive")),
+        "resolucao": (claim or {}).get("resolution"),
+        "acoes_vendedor": acoes,
+    }
+
+
+# =========================================================================== #
+# Domínio — Detalhe de tarifa por pedido (faturamento real)  [seção 8]
+# =========================================================================== #
+def detalhe_tarifa(order_id, user_id=None) -> dict:
+    """Composição real da tarifa cobrada no pedido (comissão, custo fixo, descontos/rebates),
+    via relatório de faturamento filtrado por pedido. Best-effort e defensivo — nomes de
+    campo confirmados no relatório, seção 8 (/billing/integration/group/ML/order/details)."""
+    try:
+        data = _get("/billing/integration/group/ML/order/details",
+                    params={"order_ids": str(order_id)}, user_id=user_id)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200]}
+    linhas = data.get("data") or data.get("results") or (data if isinstance(data, list) else [])
+    saidas = []
+    for row in linhas if isinstance(linhas, list) else []:
+        sales = row.get("sales_info") or []
+        for s in sales:
+            sf = s.get("sale_fee") or {}
+            di = s.get("discount_info") or {}
+            saidas.append({
+                "order_id": s.get("order_id"),
+                "valor_venda": s.get("transaction_amount"),
+                "financing_fee": s.get("financing_fee"),
+                "tarifa_bruta": sf.get("gross"), "tarifa_liquida": sf.get("net"), "rebate": sf.get("rebate"),
+                "sem_desconto": di.get("charge_amount_without_discount"),
+                "desconto": di.get("discount_amount"),
+            })
+    return {"ok": True, "itens": saidas, "cru": data if not saidas else None}
