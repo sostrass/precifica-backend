@@ -2373,10 +2373,14 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     pedidos = []
     t_rec = t_fee = t_cost = t_liq = 0.0
     t_unid = 0
+    _pcfg = precificacao.obter_config(user_id)
+    _imp_pct = float(_pcfg.get("imposto") or 0)
+    _cartao_pct = float(_pcfg.get("cartao") or 0)
+    _embalagem = float(_pcfg.get("embalagem") or 0)
     por_status, por_dia = {}, {}
     for o in results:
         itens = []
-        o_rec = o_fee = o_cost = 0.0
+        o_rec = o_fee = o_bling = 0.0
         o_unid = 0
         o_logistic = None
         for it in (o.get("order_items") or []):
@@ -2390,25 +2394,27 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             mlc = ml_by_item.get(iid) or ml_by_sku.get(sku)
             if not o_logistic and mlc is not None:
                 o_logistic = getattr(mlc, "logistic_type", None)
-            preco_bling = float(prod.preco) if (prod and prod.preco) else None
-            custo = preco_bling  # custo base = Preço Bling (convenção usada em toda a plataforma)
+            preco_bling = float(prod.preco) if (prod and prod.preco) else None  # referência (líquido-alvo), NÃO custo
             ml_preco = float(mlc.preco) if (mlc and mlc.preco) else None
             imagem = (mlc.imagem if (mlc and mlc.imagem) else (prod.imagem if (prod and prod.imagem) else None))
             titulo = item.get("title") or (prod.nome if prod else None) or (mlc.titulo if mlc else None) or "Item"
             rev = unit * qty
             fee = fee_u * qty
-            cost = (custo or 0) * qty
-            liq = rev - fee - cost
+            liq_item = rev - fee  # imposto/cartão/embalagem entram no nível do pedido (base-venda)
             itens.append({
                 "item_id": iid or None, "sku": sku or None, "titulo": titulo,
                 "imagem": imagem, "quantidade": qty, "unit_price": round(unit, 2),
                 "sale_fee": round(fee, 2), "preco_bling": preco_bling,
-                "ml_preco": ml_preco, "custo": custo, "receita": round(rev, 2),
-                "custo_total": round(cost, 2), "liquido": round(liq, 2),
-                "margem": round(liq / rev * 100, 1) if rev > 0 else None,
+                "ml_preco": ml_preco, "receita": round(rev, 2),
+                "liquido": round(liq_item, 2),
+                "margem": round(liq_item / rev * 100, 1) if rev > 0 else None,
             })
-            o_rec += rev; o_fee += fee; o_cost += cost; o_unid += qty
-        o_liq = o_rec - o_fee - o_cost
+            o_rec += rev; o_fee += fee; o_bling += (preco_bling or 0) * qty; o_unid += qty
+        o_imposto = round(_imp_pct / 100 * o_rec, 2)
+        o_cartao = round(_cartao_pct / 100 * o_rec, 2)
+        o_embalagem = round(_embalagem, 2) if o_rec > 0 else 0.0
+        o_taxas = o_imposto + o_cartao + o_embalagem
+        o_liq = o_rec - o_fee - o_taxas
         st = o.get("status")
         por_status[st] = por_status.get(st, 0) + 1
         dia = (o.get("date_created") or "")[:10]
@@ -2434,12 +2440,13 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             "itens": itens,
             "resumo": {
                 "receita": round(o_rec, 2), "tarifa": round(o_fee, 2),
-                "custo": round(o_cost, 2), "liquido": round(o_liq, 2),
-                "unidades": o_unid, "estornado": (st == "cancelled"),
+                "imposto": o_imposto, "cartao": o_cartao, "embalagem": o_embalagem,
+                "taxas": round(o_taxas, 2), "preco_bling": round(o_bling, 2) if o_bling else None,
+                "liquido": round(o_liq, 2), "unidades": o_unid, "estornado": (st == "cancelled"),
                 "margem": round(o_liq / o_rec * 100, 1) if o_rec > 0 else None,
             },
         })
-        t_rec += o_rec; t_fee += o_fee; t_cost += o_cost; t_liq += o_liq; t_unid += o_unid
+        t_rec += o_rec; t_fee += o_fee; t_cost += o_taxas; t_liq += o_liq; t_unid += o_unid
 
     # --- Estado real do envio: lê do cache (hot-path leve). Webhooks do tópico
     #     `shipments` + backfill sob demanda mantêm o cache vivo. ---
@@ -2491,7 +2498,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
         "unidades": t_unid, "tarifas": round(t_fee, 2),
         "frete_vendedor": round(t_frete, 2),
         "custos_ml": round(t_fee + t_frete, 2),
-        "custo": round(t_cost, 2), "liquido": round(liq_final, 2),
+        "custo": round(t_cost, 2), "impostos": round(t_cost, 2), "liquido": round(liq_final, 2),
         "margem": round(liq_final / t_rec * 100, 1) if t_rec > 0 else None,
         "por_status": por_status,
         "baldes": baldes,
