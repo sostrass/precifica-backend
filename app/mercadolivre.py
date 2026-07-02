@@ -1203,3 +1203,100 @@ def detalhe_tarifa(order_id, user_id=None) -> dict:
                 "desconto": di.get("discount_amount"),
             })
     return {"ok": True, "itens": saidas, "cru": data if not saidas else None}
+
+
+# =========================================================================== #
+# Domínio — Mensagens pós-venda (comprador)  [seção 10]
+# =========================================================================== #
+def _msg_item(m: dict, seller_id) -> dict:
+    m = m or {}
+    frm = (m.get("from") or {}).get("user_id")
+    md = m.get("message_date") or {}
+    mod = m.get("message_moderation") or {}
+    anexos = [{"nome": a.get("original_filename") or a.get("filename"), "tipo": a.get("type")}
+              for a in (m.get("message_attachments") or [])]
+    return {
+        "id": m.get("id"),
+        "de_vendedor": str(frm) == str(seller_id),
+        "texto": m.get("text") or m.get("text_translated"),
+        "data": md.get("created") or md.get("received") or md.get("available"),
+        "lida": bool(md.get("read")),
+        "status": m.get("status"),
+        "moderacao": mod.get("status"),
+        "anexos": anexos,
+    }
+
+
+def mensagens_pedido(pack_id, user_id=None) -> dict:
+    """Thread pós-venda de um pedido/pacote. Não marca como lida (mark_as_read=false)."""
+    sid = _seller_id(user_id)
+    data = _get(f"/messages/packs/{pack_id}/sellers/{sid}",
+                params={"tag": "post_sale", "mark_as_read": "false"}, user_id=user_id)
+    cs = data.get("conversation_status") or {}
+    msgs = data.get("messages") or []
+    return {
+        "conversa": {
+            "status": cs.get("status"), "substatus": cs.get("substatus"),
+            "pode_responder": cs.get("status_update_allowed", True),
+            "claim_id": cs.get("claim_id"), "shipping_id": cs.get("shipping_id"),
+        },
+        "mensagens": [_msg_item(m, sid) for m in msgs],
+        "seller_id": sid,
+    }
+
+
+def enviar_mensagem(pack_id, buyer_id, texto, user_id=None) -> dict:
+    """Responde o comprador (limite de 350 caracteres)."""
+    sid = _seller_id(user_id)
+    t = (texto or "").strip()[:350]
+    if not t:
+        return {"ok": False, "erro": "Mensagem vazia."}
+    if not buyer_id:
+        return {"ok": False, "erro": "Comprador não identificado."}
+    body = {"from": {"user_id": int(sid)}, "to": {"user_id": int(buyer_id)}, "text": t}
+    try:
+        r = _post(f"/messages/packs/{pack_id}/sellers/{sid}", json=body,
+                  params={"tag": "post_sale"}, user_id=user_id)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200]}
+    return {"ok": True, "resposta": r}
+
+
+def mensagens_nao_lidas(user_id=None) -> dict:
+    """Contagem de conversas não lidas (badge)."""
+    try:
+        data = _get("/messages/unread", params={"tag": "post_sale", "role": "seller"}, user_id=user_id)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200], "total": 0, "recursos": []}
+    res = data.get("results") or []
+    total = sum(int(x.get("count") or 0) for x in res)
+    return {"ok": True, "total": total,
+            "recursos": [{"resource": x.get("resource"), "count": x.get("count")} for x in res]}
+
+
+# =========================================================================== #
+# Domínio — Dados fiscais do comprador (p/ NF-e)  [seção 12]
+# =========================================================================== #
+def dados_fiscais_comprador(order_id, user_id=None) -> dict:
+    """Nome + CPF/CNPJ + endereço do comprador para a NF-e (/orders/{id}/billing_info,
+    header x-version:2). É o que o Bling precisa para emitir. Defensivo."""
+    try:
+        data = _req("GET", f"/orders/{order_id}/billing_info", user_id=user_id, headers={"x-version": "2"})
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200]}
+    b = ((data or {}).get("buyer") or {}).get("billing_info") or {}
+    ident = b.get("identification") or {}
+    addr = b.get("address") or {}
+    def _nome(x):
+        return x.get("name") if isinstance(x, dict) else x
+    nome = " ".join(v for v in [b.get("name"), b.get("last_name")] if v).strip() or None
+    return {
+        "ok": True,
+        "nome": nome,
+        "doc_tipo": ident.get("type"), "doc_numero": ident.get("number"),
+        "endereco": " ".join(v for v in [addr.get("street_name"), str(addr.get("street_number") or "")] if v).strip() or None,
+        "bairro": _nome(addr.get("neighborhood")),
+        "cidade": addr.get("city_name") or _nome(addr.get("city")),
+        "estado": _nome(addr.get("state")),
+        "cep": addr.get("zip_code"),
+    }

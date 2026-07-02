@@ -2415,10 +2415,11 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
                         if pg.get("date_approved")), None)
         pedidos.append({
             "id": o.get("id"),
+            "pack_id": o.get("pack_id"),
             "date_created": o.get("date_created"),
             "pago_em": pago_em,
             "status": st,
-            "buyer": {"nickname": buyer.get("nickname")},
+            "buyer": {"nickname": buyer.get("nickname"), "id": buyer.get("id")},
             "shipping_id": ship.get("id"),
             "envio_status": ship.get("status"),
             "logistic_type": logistic,
@@ -2534,6 +2535,51 @@ def ml_posvenda_detalhe(claim_id: str, user: User = Depends(auth.get_current_use
 def ml_tarifa_detalhe(order_id: str, user: User = Depends(auth.get_current_user)):
     """Composição real da tarifa do pedido (faturamento) — detalhamento sob demanda no drawer."""
     return _ml_run(lambda ml: ml.detalhe_tarifa(order_id, user.id))
+
+
+@app.get("/api/mercadolivre/mensagens/{pack_id}")
+def ml_mensagens(pack_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.mensagens_pedido(pack_id, user.id))
+
+
+@app.post("/api/mercadolivre/mensagens/{pack_id}")
+def ml_mensagens_enviar(pack_id: str, payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    buyer_id = payload.get("buyer_id")
+    texto = payload.get("texto") or ""
+    return _ml_run(lambda ml: ml.enviar_mensagem(pack_id, buyer_id, texto, user.id))
+
+
+@app.get("/api/mercadolivre/mensagens-nao-lidas")
+def ml_mensagens_nao_lidas(user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.mensagens_nao_lidas(user.id))
+
+
+@app.post("/api/mercadolivre/nfe-status")
+def ml_nfe_status(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Casa a NF-e do Bling (módulo fiscal existente) com os pedidos do ML pelo número
+    do pedido. Chamado após a lista carregar — não pesa no hot-path (é cacheado)."""
+    from . import nfe
+    ids = [str(x) for x in (payload.get("order_ids") or []) if x]
+    if not ids:
+        return {"mapa": {}}
+    try:
+        mapa = nfe.nfe_por_pedidos(user.id, ids)
+    except Exception as e:  # noqa: BLE001
+        return {"mapa": {}, "erro": str(e)[:200]}
+    out = {}
+    for k, v in (mapa or {}).items():
+        out[str(k)] = {
+            "numero": v.get("nfe_numero"), "serie": v.get("nfe_serie"),
+            "emissao": v.get("nfe_emissao"), "valor": v.get("valor_total"),
+            "chave": v.get("nfe_chave"), "situacao": v.get("nfe_situacao"),
+            "situacao_label": v.get("nfe_situacao_label"),
+        }
+    return {"mapa": out, "total": len(out)}
+
+
+@app.get("/api/mercadolivre/dados-fiscais/{order_id}")
+def ml_dados_fiscais(order_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.dados_fiscais_comprador(order_id, user.id))
 
 
 @app.get("/api/mercadolivre/etiqueta")
