@@ -364,3 +364,33 @@ def divergencias(cfg, base_venda, precos_atuais=None) -> list:
             "diferenca": dif, "diferenca_pct": dif_pct, "status": status,
         })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# MARGEM REAL POR CANAL — a MESMA linha de cálculo usada na aba Shopee
+# (_margem_real_shopee), generalizada por canal. Respeita as faixas da tela de
+# Configurações: comissão % + fixo % da faixa do preço, + imposto + cartão +
+# embalagem dos custos globais. `custo` = precoCusto do Bling (quando houver).
+# --------------------------------------------------------------------------- #
+def margem_real_canal(cfg: dict, canal: str, preco: float, custo=None) -> dict | None:
+    preco = float(preco or 0)
+    if preco <= 0:
+        return None
+    canais = cfg.get("canais") or []
+    c = next((x for x in canais if (x.get("canal") or "").lower() == (canal or "").lower()), None)
+    if not c:
+        return None
+    faixas = sorted(c.get("faixas") or [], key=lambda f: (f.get("ate") is None, f.get("ate") or 0))
+    faixa = next((f for f in faixas if f.get("ate") is None or preco <= f.get("ate")), faixas[-1] if faixas else None)
+    if faixa is None:
+        return None
+    pct = (float(faixa.get("comissao", 0)) + float(faixa.get("fixo_pct", 0))
+           + float(cfg.get("imposto", 0)) + float(cfg.get("cartao", 0))) / 100.0
+    fixos = float(faixa.get("fixo", 0)) + float(cfg.get("embalagem", 0))
+    liquido = preco * (1 - pct) - fixos
+    tem_custo = custo is not None
+    lucro = liquido - float(custo or 0)
+    return {"liquido": round(liquido, 2), "taxas": round(preco - liquido, 2),
+            "comissao_pct": float(faixa.get("comissao", 0)), "fixo": float(faixa.get("fixo", 0)),
+            "lucro": round(lucro, 2) if tem_custo else None,
+            "margem_pct": round(lucro / preco * 100, 1) if tem_custo else None}

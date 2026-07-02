@@ -2373,14 +2373,12 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     pedidos = []
     t_rec = t_fee = t_cost = t_liq = 0.0
     t_unid = 0
-    _pcfg = precificacao.obter_config(user_id)
-    _imp_pct = float(_pcfg.get("imposto") or 0)
-    _cartao_pct = float(_pcfg.get("cartao") or 0)
-    _embalagem = float(_pcfg.get("embalagem") or 0)
+    _pcfg = precificacao.obter_config(user_id)  # taxas/faixas da tela de Configurações
     por_status, por_dia = {}, {}
     for o in results:
         itens = []
         o_rec = o_fee = o_bling = 0.0
+        o_taxas_cfg = o_liq_cfg = 0.0
         o_unid = 0
         o_logistic = None
         for it in (o.get("order_items") or []):
@@ -2394,27 +2392,29 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             mlc = ml_by_item.get(iid) or ml_by_sku.get(sku)
             if not o_logistic and mlc is not None:
                 o_logistic = getattr(mlc, "logistic_type", None)
-            preco_bling = float(prod.preco) if (prod and prod.preco) else None  # referência (líquido-alvo), NÃO custo
+            preco_bling = float(prod.preco) if (prod and prod.preco) else None  # alvo (deve "sobrar" isso)
+            custo_prod = float(prod.custo) if (prod and prod.custo) else None  # precoCusto do Bling
             ml_preco = float(mlc.preco) if (mlc and mlc.preco) else None
             imagem = (mlc.imagem if (mlc and mlc.imagem) else (prod.imagem if (prod and prod.imagem) else None))
             titulo = item.get("title") or (prod.nome if prod else None) or (mlc.titulo if mlc else None) or "Item"
             rev = unit * qty
             fee = fee_u * qty
-            liq_item = rev - fee  # imposto/cartão/embalagem entram no nível do pedido (base-venda)
+            mr = precificacao.margem_real_canal(_pcfg, "mercadolivre", unit, custo_prod) or {}
+            liq_u = mr.get("liquido")
+            liq_item = (liq_u * qty) if liq_u is not None else (rev - fee)
             itens.append({
                 "item_id": iid or None, "sku": sku or None, "titulo": titulo,
                 "imagem": imagem, "quantidade": qty, "unit_price": round(unit, 2),
-                "sale_fee": round(fee, 2), "preco_bling": preco_bling,
+                "sale_fee": round(fee, 2), "preco_bling": preco_bling, "custo": custo_prod,
                 "ml_preco": ml_preco, "receita": round(rev, 2),
-                "liquido": round(liq_item, 2),
-                "margem": round(liq_item / rev * 100, 1) if rev > 0 else None,
+                "liquido": round(liq_item, 2), "taxas_mkt": round((mr.get("taxas") or 0) * qty, 2) or None,
+                "lucro": round(mr["lucro"] * qty, 2) if mr.get("lucro") is not None else None,
+                "margem": mr.get("margem_pct"),
             })
             o_rec += rev; o_fee += fee; o_bling += (preco_bling or 0) * qty; o_unid += qty
-        o_imposto = round(_imp_pct / 100 * o_rec, 2)
-        o_cartao = round(_cartao_pct / 100 * o_rec, 2)
-        o_embalagem = round(_embalagem, 2) if o_rec > 0 else 0.0
-        o_taxas = o_imposto + o_cartao + o_embalagem
-        o_liq = o_rec - o_fee - o_taxas
+            o_taxas_cfg += (mr.get("taxas") or 0) * qty
+            o_liq_cfg += liq_item
+        o_liq = o_liq_cfg
         st = o.get("status")
         por_status[st] = por_status.get(st, 0) + 1
         dia = (o.get("date_created") or "")[:10]
@@ -2439,14 +2439,15 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             "total": float(o.get("total_amount") or o_rec),
             "itens": itens,
             "resumo": {
-                "receita": round(o_rec, 2), "tarifa": round(o_fee, 2),
-                "imposto": o_imposto, "cartao": o_cartao, "embalagem": o_embalagem,
-                "taxas": round(o_taxas, 2), "preco_bling": round(o_bling, 2) if o_bling else None,
+                "receita": round(o_rec, 2),
+                "tarifa": round(o_fee, 2),  # comissão REAL cobrada pelo ML (sale_fee) — informativo
+                "taxas": round(o_taxas_cfg, 2),  # taxas pela Configuração (faixa + imposto + cartão + embalagem)
+                "preco_bling": round(o_bling, 2) if o_bling else None,  # alvo: quanto deve sobrar
                 "liquido": round(o_liq, 2), "unidades": o_unid, "estornado": (st == "cancelled"),
                 "margem": round(o_liq / o_rec * 100, 1) if o_rec > 0 else None,
             },
         })
-        t_rec += o_rec; t_fee += o_fee; t_cost += o_taxas; t_liq += o_liq; t_unid += o_unid
+        t_rec += o_rec; t_fee += o_fee; t_cost += o_taxas_cfg; t_liq += o_liq; t_unid += o_unid
 
     # --- Estado real do envio: lê do cache (hot-path leve). Webhooks do tópico
     #     `shipments` + backfill sob demanda mantêm o cache vivo. ---
