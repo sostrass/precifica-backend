@@ -2286,8 +2286,8 @@ def _parse_dt_iso(s):
 
 def _balde_pedido(order_status, env, hoje_fim):
     """Classifica o pedido nos baldes do painel a partir do estado REAL do envio
-    (o mesmo eixo da tela Vendas do ML): a despachar hoje / próximos dias /
-    em trânsito / finalizado / cancelado. Sem envio no cache => 'sincronizando'."""
+    (mesmo eixo da tela Vendas do ML): a despachar hoje / próximos dias / aguardando
+    NF-e / em trânsito / finalizado / cancelado. Sem envio no cache => 'sincronizando'."""
     if order_status == "cancelled":
         return "cancelado"
     if not env:
@@ -2300,6 +2300,12 @@ def _balde_pedido(order_status, env, hoje_fim):
         return "finalizado"
     if st == "shipped" or sub in ("in_hub", "in_transit", "out_for_delivery", "dropped_off", "picked_up", "receiver_absent"):
         return "transito"
+    if env.get("fiscal_pendente"):
+        return "fiscal"  # bloqueado até emitir NF-e — aba própria
+    # ready/handling/buffered → hoje vs próximos pela data efetiva de coleta
+    buffering = _parse_dt_iso(env.get("buffering_date"))
+    if sub == "buffered" or buffering:
+        return "hoje" if (buffering and buffering <= hoje_fim) else "proximos"
     hl = _parse_dt_iso(env.get("handling_limit"))
     if hl and hl > hoje_fim:
         return "proximos"
@@ -2445,7 +2451,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             envios_cache = ml.ler_envios_cache(_db2, user_id, sids)
         finally:
             _db2.close()
-    baldes = {"hoje": 0, "proximos": 0, "transito": 0, "finalizado": 0, "cancelado": 0, "sincronizando": 0}
+    baldes = {"hoje": 0, "proximos": 0, "fiscal": 0, "transito": 0, "finalizado": 0, "cancelado": 0, "sincronizando": 0}
     n_fiscal = n_devol = n_sync = 0
     t_frete = 0.0
     hoje_fim = datetime.utcnow().replace(hour=23, minute=59, second=59, microsecond=0)

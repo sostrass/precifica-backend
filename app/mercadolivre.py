@@ -630,6 +630,15 @@ def custos_do_shipment(shipment_id, user_id=None) -> dict:
     return _get(f"/shipments/{shipment_id}/costs", user_id=user_id)
 
 
+def lead_time_do_shipment(shipment_id, user_id=None) -> dict:
+    """Prazos do envio: estimated_handling_limit (limite de despacho / coleta),
+    estimated_delivery_*, etc. Sub-recurso /shipments/{id}/lead_time (seção 3)."""
+    return _get(f"/shipments/{shipment_id}/lead_time", user_id=user_id)
+
+
+_STATUS_ACIONAVEL = ("ready_to_ship", "handling", "pending")
+
+
 def _custos_envio(raw: dict) -> dict:
     """Extrai frete do vendedor e do comprador da resposta de /shipments/{id}/costs."""
     raw = raw or {}
@@ -1045,6 +1054,11 @@ def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
         for sid in alvo:
             try:
                 raw = envio_do_pedido(sid, user_id=user_id)
+                if (raw.get("status") in _STATUS_ACIONAVEL) and not ((raw.get("lead_time") or {}).get("estimated_handling_limit")):
+                    try:
+                        raw["lead_time"] = lead_time_do_shipment(sid, user_id=user_id)
+                    except Exception:  # noqa: BLE001
+                        pass
                 _upsert_envio_cache(db, user_id, sid, raw)
                 db.commit()
                 buscados += 1
@@ -1075,6 +1089,11 @@ def processar_notificacao(user_id, topic, resource) -> dict:
             sid = str(resource).rstrip("/").split("/")[-1]
             if sid.isdigit():
                 raw = envio_do_pedido(sid, user_id=user_id)
+                if (raw.get("status") in _STATUS_ACIONAVEL) and not ((raw.get("lead_time") or {}).get("estimated_handling_limit")):
+                    try:
+                        raw["lead_time"] = lead_time_do_shipment(sid, user_id=user_id)
+                    except Exception:  # noqa: BLE001
+                        pass
                 custos = None
                 try:
                     custos = _custos_envio(custos_do_shipment(sid, user_id=user_id))
