@@ -1321,3 +1321,76 @@ def dados_fiscais_comprador(order_id, user_id=None) -> dict:
         "estado": _nome(addr.get("state")),
         "cep": addr.get("zip_code"),
     }
+
+
+# =========================================================================== #
+# Domínio — Agenda de coletas (janela + corte) e código de autorização [seção 15]
+# =========================================================================== #
+_DIAS_SEMANA_EN = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def _hhmm(v):
+    """Normaliza um horário vindo do ML ('15:00', '15:00:00', ISO) para 'HH:MM'."""
+    if not v:
+        return None
+    s = str(v)
+    if "T" in s:  # ISO -> pega a parte da hora
+        s = s.split("T")[-1]
+    s = s.replace("Z", "")
+    partes = s.split(":")
+    if len(partes) >= 2 and partes[0].isdigit():
+        return f"{int(partes[0]):02d}:{partes[1][:2]}"
+    return None
+
+
+def agenda_coleta(user_id=None) -> dict:
+    """Janela de coleta de HOJE (de/até + horário de corte) por tipo logístico.
+    Cobre cross_docking (Coleta) e xd_drop_off (Places). Tudo defensivo: se o ML
+    não devolver agenda, retorna {ok: False} e o painel simplesmente não mostra."""
+    sid = _seller_id(user_id)
+    hoje_key = _DIAS_SEMANA_EN[datetime.utcnow().weekday()]
+    achados = []
+    for lt in ("cross_docking", "xd_drop_off"):
+        try:
+            data = _get(f"/users/{sid}/shipping/schedule/{lt}", user_id=user_id)
+        except Exception:  # noqa: BLE001
+            continue
+        sched = (data or {}).get("schedule") or {}
+        dia = sched.get(hoje_key) or {}
+        detalhes = dia.get("detail") or []
+        if not detalhes:
+            continue
+        d0 = detalhes[0] or {}
+        janela = {
+            "logistic_type": lt,
+            "de": _hhmm(d0.get("from")),
+            "ate": _hhmm(d0.get("to")),
+            "corte": _hhmm(d0.get("cutoff")),
+            "carrier": (d0.get("carrier") or {}).get("name"),
+            "trabalha": bool(dia.get("work", True)),
+            "same_day": bool(d0.get("milkrun_same_day")),
+        }
+        if janela["de"] or janela["ate"] or janela["corte"]:
+            achados.append(janela)
+    if not achados:
+        return {"ok": False}
+    return {"ok": True, "janelas": achados, "principal": achados[0]}
+
+
+def codigo_autorizacao_coleta(user_id=None) -> dict:
+    """Código de autorização de coleta do dia (quando o ML expõe). Defensivo:
+    varre os campos mais prováveis e devolve o primeiro código encontrado."""
+    sid = _seller_id(user_id)
+    for path in (
+        f"/users/{sid}/service/carrier_pickup/authorization_code",
+        f"/users/{sid}/shipping/carrier_pickup/authorization_code",
+    ):
+        try:
+            data = _get(path, user_id=user_id)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(data, dict):
+            cod = data.get("authorization_code") or data.get("code") or data.get("value")
+            if cod:
+                return {"ok": True, "codigo": str(cod)}
+    return {"ok": False}

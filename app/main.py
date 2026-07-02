@@ -2596,6 +2596,21 @@ def ml_dados_fiscais(order_id: str, user: User = Depends(auth.get_current_user))
     return _ml_run(lambda ml: ml.dados_fiscais_comprador(order_id, user.id))
 
 
+@app.get("/api/mercadolivre/coleta")
+def ml_coleta(user: User = Depends(auth.get_current_user)):
+    """Janela de coleta de hoje (de/até + corte) + código de autorização, quando o ML expõe."""
+    def _run(ml):
+        ag = ml.agenda_coleta(user.id)
+        try:
+            cod = ml.codigo_autorizacao_coleta(user.id)
+        except Exception:  # noqa: BLE001
+            cod = {"ok": False}
+        if isinstance(ag, dict):
+            ag["codigo_autorizacao"] = cod.get("codigo") if cod.get("ok") else None
+        return ag
+    return _ml_run(_run)
+
+
 @app.get("/api/mercadolivre/etiqueta")
 def ml_etiqueta(shipment_ids: str, formato: str = "pdf", user: User = Depends(auth.get_current_user)):
     from . import mercadolivre as ml
