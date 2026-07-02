@@ -990,10 +990,13 @@ def _upsert_envio_cache(db, user_id, shipment_id, raw, order_id=None, custos=Non
 
 def _envio_cache_dict(c) -> dict:
     iso = lambda d: d.isoformat() if d else None  # noqa: E731
+    dados = c.dados if isinstance(c.dados, dict) else {}
+    buffering = (dados.get("buffering") or {}).get("date")
     return {
         "status": c.status, "substatus": c.substatus,
         "logistic_type": c.logistic_type, "mode": c.mode,
         "handling_limit": iso(c.handling_limit), "delivery_limit": iso(c.delivery_limit),
+        "buffering_date": buffering,
         "date_ready": iso(c.date_ready), "date_shipped": iso(c.date_shipped), "date_delivered": iso(c.date_delivered),
         "tracking_number": c.tracking_number, "tracking_method": c.tracking_method,
         "custo_comprador": c.custo_comprador, "custo_vendedor": c.custo_vendedor,
