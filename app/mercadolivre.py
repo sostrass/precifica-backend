@@ -1038,15 +1038,19 @@ def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
         faltam = [x for x in ids if x not in existentes]
         alvo = faltam[:cap]
         buscados = 0
+        erros = []
         for sid in alvo:
             try:
                 raw = envio_do_pedido(sid, user_id=user_id)
                 _upsert_envio_cache(db, user_id, sid, raw)
+                db.commit()
                 buscados += 1
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                if len(erros) < 3:
+                    erros.append(str(e)[:200])
                 continue
-        db.commit()
-        return {"buscados": buscados, "faltam": max(0, len(faltam) - buscados), "total": len(ids)}
+        return {"buscados": buscados, "faltam": max(0, len(faltam) - buscados), "total": len(ids), "erros": erros}
     finally:
         db.close()
 

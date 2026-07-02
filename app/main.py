@@ -2385,7 +2385,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             if not o_logistic and mlc is not None:
                 o_logistic = getattr(mlc, "logistic_type", None)
             preco_bling = float(prod.preco) if (prod and prod.preco) else None
-            custo = float(prod.custo) if (prod and prod.custo) else None
+            custo = preco_bling  # custo base = Preço Bling (convenção usada em toda a plataforma)
             ml_preco = float(mlc.preco) if (mlc and mlc.preco) else None
             imagem = (mlc.imagem if (mlc and mlc.imagem) else (prod.imagem if (prod and prod.imagem) else None))
             titulo = item.get("title") or (prod.nome if prod else None) or (mlc.titulo if mlc else None) or "Item"
@@ -2429,7 +2429,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             "resumo": {
                 "receita": round(o_rec, 2), "tarifa": round(o_fee, 2),
                 "custo": round(o_cost, 2), "liquido": round(o_liq, 2),
-                "unidades": o_unid,
+                "unidades": o_unid, "estornado": (st == "cancelled"),
                 "margem": round(o_liq / o_rec * 100, 1) if o_rec > 0 else None,
             },
         })
