@@ -1041,12 +1041,7 @@ def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
         for sid in alvo:
             try:
                 raw = envio_do_pedido(sid, user_id=user_id)
-                custos = None
-                try:
-                    custos = _custos_envio(custos_do_shipment(sid, user_id=user_id))
-                except Exception:  # noqa: BLE001
-                    custos = None
-                _upsert_envio_cache(db, user_id, sid, raw, custos=custos)
+                _upsert_envio_cache(db, user_id, sid, raw)
                 buscados += 1
             except Exception:  # noqa: BLE001
                 continue
