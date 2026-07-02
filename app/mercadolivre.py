@@ -636,6 +636,71 @@ def lead_time_do_shipment(shipment_id, user_id=None) -> dict:
     return _get(f"/shipments/{shipment_id}/lead_time", user_id=user_id)
 
 
+def _fmt_data_ml(v):
+    """Aceita string ISO ou {date: ...} e devolve a string ISO (ou None)."""
+    if isinstance(v, dict):
+        return v.get("date")
+    return v or None
+
+
+def sla_do_shipment(shipment_id, user_id=None) -> dict:
+    """GET /shipments/{id}/sla → no prazo / atrasado / adiantado + data prometida.
+    Não chamar para cancelado/Full (o chamador decide). Defensivo."""
+    try:
+        d = _req("GET", f"/shipments/{shipment_id}/sla", user_id=user_id, headers={"x-format-new": "true"})
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    return {"status": d.get("status"), "service": d.get("service"),
+            "expected_date": _fmt_data_ml(d.get("expected_date")),
+            "last_updated": d.get("last_updated")}
+
+
+def carrier_do_shipment(shipment_id, user_id=None) -> dict:
+    """GET /shipments/{id}/carrier → {url (rastreio), name (transportadora)}. Defensivo."""
+    try:
+        d = _req("GET", f"/shipments/{shipment_id}/carrier", user_id=user_id, headers={"x-format-new": "true"})
+    except Exception:  # noqa: BLE001
+        return {}
+    if isinstance(d, dict):
+        return {"url": d.get("url"), "name": d.get("name")}
+    return {}
+
+
+def historico_do_shipment(shipment_id, user_id=None) -> list:
+    """GET /shipments/{id}/history → cada mudança de status com data. Defensivo."""
+    try:
+        d = _req("GET", f"/shipments/{shipment_id}/history", user_id=user_id, headers={"x-format-new": "true"})
+    except Exception:  # noqa: BLE001
+        return []
+    linhas = d if isinstance(d, list) else ((d.get("history") if isinstance(d, dict) else None) or [])
+    out = []
+    for h in linhas:
+        if isinstance(h, dict):
+            out.append({"status": h.get("status"), "substatus": h.get("substatus"),
+                        "date": _fmt_data_ml(h.get("date") or h.get("date_created") or h.get("status_date"))})
+    return out
+
+
+def feedback_do_pedido(order_id, user_id=None) -> dict:
+    """GET /orders/{id}/feedback → avaliação do comprador (purchase) e do vendedor (sale).
+    O rating do comprador sobre a venda fica em `purchase`. Defensivo."""
+    try:
+        d = _get(f"/orders/{order_id}/feedback", user_id=user_id)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    pur = d.get("purchase") or {}
+    sale = d.get("sale") or {}
+    return {
+        "comprador": {"rating": pur.get("rating"), "message": pur.get("message"),
+                      "status": pur.get("status"), "fulfilled": pur.get("fulfilled")},
+        "vendedor": {"rating": sale.get("rating"), "message": sale.get("message")},
+    }
+
+
 _STATUS_ACIONAVEL = ("ready_to_ship", "handling", "pending")
 
 
@@ -648,6 +713,15 @@ def _custos_envio(raw: dict) -> dict:
     if senders and isinstance(senders, list):
         vendedor = senders[0].get("cost")
     return {"vendedor": vendedor, "comprador": receiver.get("cost")}
+
+
+def baixar_anexo_mensagem(filename, user_id=None):
+    """Baixa os bytes de um anexo de mensagem pós-venda (proxy autenticado — o <img>
+    do navegador não carrega o token, então o app busca via API e monta um blob)."""
+    r = _req("GET", f"/messages/attachments/{filename}",
+             params={"tag": "post_sale", "site_id": "MLB"}, user_id=user_id, raw=True)
+    ct = (r.headers.get("content-type") if hasattr(r, "headers") else None) or "application/octet-stream"
+    return r.content, ct
 
 
 def etiqueta(shipment_ids, formato="pdf", user_id=None):
@@ -1033,25 +1107,42 @@ def ler_envios_cache(db, user_id, shipment_ids) -> dict:
 
 
 def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
-    """Backfill: busca no ML os envios ainda ausentes do cache (até `cap`) e grava.
-    Mantém o hot-path leve — os webhooks do tópico `shipments` mantêm o resto vivo."""
+    """Backfill + refresh: busca envios ausentes E reatualiza os cacheados em estados
+    NÃO-terminais e desatualizados (o status muda: despacho, faturamento, entrega). Sem
+    isso o cache congela quando o webhook falha (pedido despachado/faturado fica preso no
+    balde antigo). Terminais (entregue/cancelado) não são rebuscados. Bounded por `cap`."""
     from .models import MLEnvioCache
+    from datetime import timedelta
     ids = [str(x) for x in shipment_ids if x]
     db = SessionLocal()
     try:
-        existentes = set()
+        cache_info = {}  # sid -> (status, atualizado_em)
         if ids:
             for i in range(0, len(ids), 400):
                 bloco = ids[i:i + 400]
-                for (sid,) in db.query(MLEnvioCache.shipment_id).filter(
-                    MLEnvioCache.user_id == user_id, MLEnvioCache.shipment_id.in_(bloco)
-                ).all():
-                    existentes.add(sid)
-        faltam = [x for x in ids if x not in existentes]
+                for sid, st, atz in db.query(
+                    MLEnvioCache.shipment_id, MLEnvioCache.status, MLEnvioCache.atualizado_em
+                ).filter(MLEnvioCache.user_id == user_id, MLEnvioCache.shipment_id.in_(bloco)).all():
+                    cache_info[sid] = (st, atz)
+        _REFRESH_STATES = ("ready_to_ship", "handling", "pending")
+        _LIMITE = datetime.utcnow() - timedelta(minutes=15)
+        faltam = [x for x in ids if x not in cache_info]
+        # cacheados pré-despacho e velhos (>15min) → reatualizar, mais antigos primeiro.
+        # É o que conserta "despachado ontem preso em A despachar" e "faturado preso em
+        # Aguardando NF-e": o status real (shipped / nota liberada) só entra rebuscando.
+        stale = sorted(
+            [(sid, atz or datetime.min) for sid, (st, atz) in cache_info.items()
+             if st in _REFRESH_STATES and (atz is None or atz < _LIMITE)],
+            key=lambda t: t[1],
+        )
         alvo = faltam[:cap]
+        n_faltam_alvo = len(alvo)
+        if len(alvo) < cap:
+            alvo += [sid for sid, _ in stale[:cap - len(alvo)]]
         buscados = 0
+        atualizados = 0
         erros = []
-        for sid in alvo:
+        for idx, sid in enumerate(alvo):
             try:
                 raw = envio_do_pedido(sid, user_id=user_id)
                 if (raw.get("status") in _STATUS_ACIONAVEL) and not ((raw.get("lead_time") or {}).get("estimated_handling_limit")):
@@ -1062,12 +1153,15 @@ def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
                 _upsert_envio_cache(db, user_id, sid, raw)
                 db.commit()
                 buscados += 1
+                if idx >= n_faltam_alvo:
+                    atualizados += 1
             except Exception as e:  # noqa: BLE001
                 db.rollback()
                 if len(erros) < 3:
                     erros.append(str(e)[:200])
                 continue
-        return {"buscados": buscados, "faltam": max(0, len(faltam) - buscados), "total": len(ids), "erros": erros}
+        return {"buscados": buscados, "faltam": max(0, len(faltam) - n_faltam_alvo),
+                "atualizados": atualizados, "stale": len(stale), "total": len(ids), "erros": erros}
     finally:
         db.close()
 
@@ -1234,7 +1328,8 @@ def _msg_item(m: dict, seller_id) -> dict:
     frm = (m.get("from") or {}).get("user_id")
     md = m.get("message_date") or {}
     mod = m.get("message_moderation") or {}
-    anexos = [{"nome": a.get("original_filename") or a.get("filename"), "tipo": a.get("type")}
+    anexos = [{"nome": a.get("original_filename") or a.get("filename"), "tipo": a.get("type"),
+               "filename": a.get("filename")}
               for a in (m.get("message_attachments") or [])]
     return {
         "id": m.get("id"),

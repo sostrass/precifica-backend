@@ -2643,6 +2643,23 @@ def ml_dados_fiscais(order_id: str, user: User = Depends(auth.get_current_user))
     return _ml_run(lambda ml: ml.dados_fiscais_comprador(order_id, user.id))
 
 
+@app.get("/api/mercadolivre/envio-extra/{shipment_id}")
+def ml_envio_extra(shipment_id: str, order_id: str = None,
+                   logistic_type: str = None, ship_status: str = None,
+                   user: User = Depends(auth.get_current_user)):
+    """Detalhes extra sob demanda (só quando o drawer abre): SLA, transportadora +
+    link de rastreio, histórico completo do envio e avaliação do comprador."""
+    def _run(ml):
+        pular_sla = (ship_status == "cancelled") or (logistic_type == "fulfillment")
+        return {
+            "sla": ({} if pular_sla else ml.sla_do_shipment(shipment_id, user.id)),
+            "carrier": ml.carrier_do_shipment(shipment_id, user.id),
+            "historico": ml.historico_do_shipment(shipment_id, user.id),
+            "feedback": (ml.feedback_do_pedido(order_id, user.id) if order_id else {}),
+        }
+    return _ml_run(_run)
+
+
 @app.get("/api/mercadolivre/coleta")
 def ml_coleta(user: User = Depends(auth.get_current_user)):
     """Janela de coleta de hoje (de/até + corte) + código de autorização, quando o ML expõe."""
@@ -2668,6 +2685,19 @@ def ml_etiqueta(shipment_ids: str, formato: str = "pdf", user: User = Depends(au
     except ml.MLErro as e:
         raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
     return Response(content=conteudo, media_type=ct)
+
+
+@app.get("/api/mercadolivre/mensagem-anexo")
+def ml_mensagem_anexo(filename: str, user: User = Depends(auth.get_current_user)):
+    """Proxy autenticado de anexo de mensagem (imagem/vídeo) para render inline no chat."""
+    from . import mercadolivre as ml
+    try:
+        conteudo, ct = ml.baixar_anexo_mensagem(filename, user.id)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Mercado Livre: {e}")
+    return Response(content=conteudo, media_type=ct, headers={"Cache-Control": "private, max-age=3600"})
 
 
 # --- Perguntas ---
