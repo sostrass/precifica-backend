@@ -545,6 +545,14 @@ def nota_editavel(cod) -> bool:
         return False
 
 
+def nota_autorizada(cod) -> bool:
+    """Nota fiscalmente emitida (autorizada/DANFE/registrada) — libera o despacho."""
+    try:
+        return int(cod or 0) in (5, 6, 7)
+    except (TypeError, ValueError):
+        return False
+
+
 def detalhar_nfe(raw: dict, lojas_map: dict | None = None) -> dict:
     """Visão COMPLETA da nota (destinatário, totais, impostos, transporte, links).
 

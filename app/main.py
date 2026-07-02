@@ -2284,6 +2284,18 @@ def _parse_dt_iso(s):
         return None
 
 
+_PAG_METODO = {
+    "credit_card": "Cartão de crédito", "debit_card": "Cartão de débito",
+    "account_money": "Saldo Mercado Pago", "ticket": "Boleto", "pix": "Pix",
+    "bank_transfer": "Pix / Transferência", "digital_currency": "Cripto",
+}
+_SINAL_TAG = {
+    "fraud_risk_detected": {"tipo": "fraude", "label": "Risco de fraude detectado", "tom": "danger"},
+    "catalog": {"tipo": "catalogo", "label": "Venda de catálogo", "tom": "dim"},
+    "test_order": {"tipo": "teste", "label": "Pedido de teste", "tom": "warn"},
+}
+
+
 def _balde_pedido(order_status, env, hoje_fim):
     """Classifica o pedido nos baldes do painel a partir do estado REAL do envio
     (mesmo eixo da tela Vendas do ML): a despachar hoje / próximos dias / aguardando
@@ -2425,11 +2437,27 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
         logistic = ship.get("logistic_type") or o_logistic
         pago_em = next((pg.get("date_approved") for pg in (o.get("payments") or [])
                         if pg.get("date_approved")), None)
+        _pgs = o.get("payments") or []
+        _pg0 = _pgs[0] if _pgs else {}
+        pagamento = None
+        if _pg0:
+            _parc = _pg0.get("installments")
+            pagamento = {
+                "metodo": _PAG_METODO.get(_pg0.get("payment_method_id")) or _PAG_METODO.get(_pg0.get("payment_type")) or _pg0.get("payment_type"),
+                "parcelas": _parc if _parc and _parc > 1 else None,
+                "valor_parcela": round(float(_pg0.get("installment_amount")), 2) if _pg0.get("installment_amount") else None,
+                "aprovado_em": _pg0.get("date_approved"),
+            }
+        sinais = [dict(_SINAL_TAG[t]) for t in (o.get("tags") or []) if t in _SINAL_TAG]
+        if o.get("mediations"):
+            sinais.append({"tipo": "mediacao", "label": "Mediação aberta", "tom": "warn"})
         pedidos.append({
             "id": o.get("id"),
             "pack_id": o.get("pack_id"),
             "date_created": o.get("date_created"),
             "pago_em": pago_em,
+            "pagamento": pagamento,
+            "sinais": sinais,
             "status": st,
             "buyer": {"nickname": buyer.get("nickname"), "id": buyer.get("id")},
             "shipping_id": ship.get("id"),
@@ -2463,8 +2491,27 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     n_fiscal = n_devol = n_sync = 0
     t_frete = 0.0
     hoje_fim = datetime.utcnow().replace(hour=23, minute=59, second=59, microsecond=0)
+    # NF-e do Bling: pedidos que o ML marca como "aguardando NF-e" mas que JÁ TÊM nota
+    # autorizada no Bling saem de "Aguardando NF-e" (o status do pedido muda). Limitado
+    # aos candidatos fiscais e cacheado — não pesa no hot-path.
+    nfe_ok_ids = set()
+    fiscal_cand = [str(p.get("id")) for p in pedidos
+                   if (envios_cache.get(str(p.get("shipping_id"))) or {}).get("fiscal_pendente")]
+    if fiscal_cand:
+        try:
+            from . import nfe as _nfe_mod
+            _mapa_nfe = _nfe_mod.nfe_por_pedidos(user_id, fiscal_cand)
+            for _oid, _info in (_mapa_nfe or {}).items():
+                if _nfe_mod.nota_autorizada((_info or {}).get("nfe_situacao")):
+                    nfe_ok_ids.add(str(_oid))
+        except Exception:  # noqa: BLE001
+            pass
     for p in pedidos:
         env = envios_cache.get(str(p.get("shipping_id"))) if p.get("shipping_id") else None
+        if env and str(p.get("id")) in nfe_ok_ids and env.get("fiscal_pendente"):
+            env = dict(env)
+            env["fiscal_pendente"] = False
+            env["nfe_emitida"] = True  # nota autorizada no Bling → liberado p/ despacho
         p["envio"] = env
         balde = _balde_pedido(p.get("status"), env, hoje_fim)
         p["balde"] = balde
