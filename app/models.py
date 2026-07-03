@@ -622,3 +622,46 @@ class MLEnvioCache(Base):
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("user_id", "shipment_id", name="uq_ml_user_shipment"),)
+
+
+class MLPedidoCache(Base):
+    """Cache de pedidos do Mercado Livre (nível pedido) — alimenta análise de vendas."""
+
+    __tablename__ = "ml_pedido_cache"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    order_id = Column(String, nullable=False, index=True)
+    pack_id = Column(String, nullable=True)
+    status = Column(String, nullable=True, index=True)       # paid | cancelled | ...
+    date_created = Column(DateTime, nullable=True, index=True)
+    date_closed = Column(DateTime, nullable=True)
+    total_amount = Column(Float, default=0.0)
+    paid_amount = Column(Float, default=0.0)
+    currency_id = Column(String, nullable=True)
+    unidades = Column(Integer, default=0)
+    itens = Column(JSON, nullable=True)                      # [{item_id,sku,titulo,quantidade,unit_price,sale_fee}]
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "order_id", name="uq_mlpedido_user_order"),)
+
+
+class MLPedidoItemCache(Base):
+    """Cache por item de pedido — agregação rápida de vendas por item_id/SKU e janela."""
+
+    __tablename__ = "ml_pedido_item_cache"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    order_id = Column(String, nullable=False, index=True)
+    item_id = Column(String, nullable=True, index=True)
+    sku = Column(String, nullable=True, index=True)
+    titulo = Column(String, nullable=True)
+    quantidade = Column(Integer, default=0)
+    unit_price = Column(Float, default=0.0)
+    receita = Column(Float, default=0.0)                     # unit_price * quantidade
+    sale_fee = Column(Float, default=0.0)
+    status = Column(String, nullable=True, index=True)
+    date_created = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (UniqueConstraint("user_id", "order_id", "item_id", name="uq_mlpeditem_user_order_item"),)

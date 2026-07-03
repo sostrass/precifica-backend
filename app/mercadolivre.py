@@ -842,6 +842,41 @@ PROMO_ADERE = {"DEAL", "MARKETPLACE_CAMPAIGN", "DOD", "LIGHTNING", "SMART",
                "UNHEALTHY_STOCK", "BANK"}
 
 
+def _num(v):
+    try: return float(v)
+    except (TypeError, ValueError): return None
+
+
+def sugestao_desconto_item(item_id: str, preco_atual=None, user_id=None):
+    """Best-effort: tenta descobrir o 'suggested_discounted_price' que o ML sugere para o item
+    (varre a resposta de /seller-promotions/items/{id}). Retorna {preco, pct} ou None — nunca quebra."""
+    try:
+        data = promocoes_do_item(item_id, user_id)
+    except Exception:  # noqa: BLE001
+        return None
+    achados = []
+
+    def _scan(o):
+        if isinstance(o, dict):
+            for k in ("suggested_discounted_price", "suggested_price", "suggested_deal_price"):
+                p = _num(o.get(k))
+                if p and p > 0:
+                    achados.append(p)
+            for v in o.values():
+                _scan(v)
+        elif isinstance(o, list):
+            for x in o:
+                _scan(x)
+
+    _scan(data)
+    if not achados:
+        return None
+    preco = min(achados)  # menor sugerido = maior desconto sugerido
+    pa = _num(preco_atual)
+    pct = round((1 - preco / pa) * 100, 1) if (pa and pa > 0) else None
+    return {"preco": round(preco, 2), "pct": pct}
+
+
 def detalhe_promocao(promotion_id: str, promotion_type: str, user_id=None) -> dict:
     """GET /seller-promotions/promotions/{id} — detalhe de uma campanha/oferta."""
     return _get(f"/seller-promotions/promotions/{promotion_id}",
@@ -912,6 +947,120 @@ def painel_promocoes(user_id=None) -> dict:
     except Exception:  # noqa: BLE001
         out["exclusao_ativa"] = None
     return out
+
+
+# --- ESCRITA (direta MLB, sem /marketplace, com ?app_version=v2) --------------
+_APPV = {"app_version": "v2"}
+
+
+def criar_campanha_percentual(nome, inicio, fim, user_id=None) -> dict:
+    """POST cria SELLER_CAMPAIGN (sub_type FLEXIBLE_PERCENTAGE). Datas no formato local ISO."""
+    body = {"promotion_type": "SELLER_CAMPAIGN", "name": nome, "sub_type": "FLEXIBLE_PERCENTAGE",
+            "start_date": inicio, "finish_date": fim}
+    return _req("POST", "/seller-promotions/promotions", params=_APPV, json=body, user_id=user_id)
+
+
+def criar_cupom(nome, inicio, fim, subtipo, valor, min_compra, codigo=None,
+                orcamento=None, max_desconto=None, user_id=None) -> dict:
+    """POST cria SELLER_COUPON_CAMPAIGN. subtipo=FIXED_AMOUNT|FIXED_PERCENTAGE (exclusivo MLB)."""
+    body = {"promotion_type": "SELLER_COUPON_CAMPAIGN", "name": nome, "sub_type": subtipo,
+            "start_date": inicio, "finish_date": fim, "min_purchase_amount": float(min_compra or 0)}
+    if subtipo == "FIXED_AMOUNT":
+        body["fixed_amount"] = float(valor)
+    else:
+        body["fixed_percentage"] = float(valor)
+        if max_desconto is not None:
+            body["max_purchase_amount"] = float(max_desconto)
+    if codigo:
+        body["partial_coupon_code"] = codigo
+    if orcamento is not None:
+        body["budget"] = float(orcamento)
+    return _req("POST", "/seller-promotions/promotions", params=_APPV, json=body, user_id=user_id)
+
+
+def criar_volume(nome, inicio, fim, subtipo, buy_quantity, pay_quantity=None,
+                 discount_percentage=None, allow_combination=True, user_id=None) -> dict:
+    """POST cria VOLUME. subtipo BNGM (buy/pay) | BNSP/SPONTH (buy/discount_percentage)."""
+    body = {"promotion_type": "VOLUME", "sub_type": subtipo, "name": nome,
+            "start_date": inicio, "finish_date": fim, "buy_quantity": int(buy_quantity),
+            "allow_combination": bool(allow_combination)}
+    if subtipo == "BNGM":
+        body["pay_quantity"] = int(pay_quantity)
+    else:
+        body["discount_percentage"] = float(discount_percentage)
+    return _req("POST", "/seller-promotions/promotions", params=_APPV, json=body, user_id=user_id)
+
+
+def editar_campanha(promotion_id, promotion_type, campos: dict, user_id=None) -> dict:
+    """PUT edita uma campanha (envia promotion_type sempre + só os campos a alterar)."""
+    body = {"promotion_type": promotion_type, **(campos or {})}
+    return _req("PUT", f"/seller-promotions/promotions/{promotion_id}", params=_APPV, json=body, user_id=user_id)
+
+
+def excluir_campanha(promotion_id, promotion_type, user_id=None) -> dict:
+    """DELETE encerra/exclui uma campanha."""
+    return _req("DELETE", f"/seller-promotions/promotions/{promotion_id}",
+                params={"promotion_type": promotion_type, **_APPV}, user_id=user_id)
+
+
+def criar_desconto_item(item_id, deal_price, inicio=None, fim=None, top_deal_price=None, user_id=None) -> dict:
+    """POST cria PRICE_DISCOUNT no item (desconto individual)."""
+    body = {"promotion_type": "PRICE_DISCOUNT", "deal_price": round(float(deal_price), 2)}
+    if top_deal_price is not None:
+        body["top_deal_price"] = round(float(top_deal_price), 2)
+    if inicio:
+        body["start_date"] = inicio
+    if fim:
+        body["finish_date"] = fim
+    return _req("POST", f"/seller-promotions/items/{item_id}", params=_APPV, json=body, user_id=user_id)
+
+
+def add_item_promocao(item_id, promotion_id, promotion_type, deal_price=None,
+                      top_deal_price=None, stock=None, user_id=None) -> dict:
+    """POST adiciona/adere um item a uma campanha/convite (SELLER_CAMPAIGN, DEAL, LIGHTNING…)."""
+    body = {"promotion_id": promotion_id, "promotion_type": promotion_type}
+    if deal_price is not None:
+        body["deal_price"] = round(float(deal_price), 2)
+    if top_deal_price is not None:
+        body["top_deal_price"] = round(float(top_deal_price), 2)
+    if stock is not None:
+        body["stock"] = int(stock)
+    return _req("POST", f"/seller-promotions/items/{item_id}", params=_APPV, json=body, user_id=user_id)
+
+
+def editar_item_promocao(item_id, promotion_id, promotion_type, deal_price=None,
+                         top_deal_price=None, remove_loyalty=None, user_id=None) -> dict:
+    """PUT edita um item numa campanha % (só sub_type FLEXIBLE_PERCENTAGE)."""
+    body = {"promotion_id": promotion_id, "promotion_type": promotion_type}
+    if deal_price is not None:
+        body["deal_price"] = round(float(deal_price), 2)
+    if top_deal_price is not None:
+        body["top_deal_price"] = round(float(top_deal_price), 2)
+    if remove_loyalty is not None:
+        body["remove_loyalty"] = bool(remove_loyalty)
+    return _req("PUT", f"/seller-promotions/items/{item_id}", params=_APPV, json=body, user_id=user_id)
+
+
+def remover_item_promocao(item_id, promotion_type, promotion_id=None, offer_id=None, user_id=None) -> dict:
+    """DELETE remove um item de uma campanha/convite."""
+    params = {"promotion_type": promotion_type, **_APPV}
+    if promotion_id:
+        params["promotion_id"] = promotion_id
+    if offer_id:
+        params["offer_id"] = offer_id
+    return _req("DELETE", f"/seller-promotions/items/{item_id}", params=params, user_id=user_id)
+
+
+def exclusao_seller_set(ativo: bool, user_id=None) -> dict:
+    """POST liga/desliga a exclusão de participação automática do ML para o seller inteiro."""
+    return _req("POST", "/seller-promotions/exclusion-list/seller", params=_APPV,
+                json={"exclusion_status": "true" if ativo else "false"}, user_id=user_id)
+
+
+def exclusao_item_set(item_id, ativo: bool, user_id=None) -> dict:
+    """POST liga/desliga a exclusão para um item específico."""
+    return _req("POST", "/seller-promotions/exclusion-list/item", params=_APPV,
+                json={"item_id": item_id, "exclusion_status": "true" if ativo else "false"}, user_id=user_id)
 
 
 # =========================================================================== #

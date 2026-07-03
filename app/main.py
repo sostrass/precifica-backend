@@ -2786,13 +2786,561 @@ def ml_promocoes_simular(payload: dict = Body(...), user: User = Depends(auth.ge
     piso_preco = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
                   if preco_bling is not None else None)
     acima_do_piso = (liquido >= preco_bling) if (liquido is not None and preco_bling is not None) else None
+    sug = None
+    try:
+        from . import mercadolivre as _ml
+        sug = _ml.sugestao_desconto_item(item_id, preco_atual, user.id)
+    except Exception:  # noqa: BLE001
+        sug = None
     return {
         "item_id": item_id, "titulo": titulo, "sku": sku,
         "preco_atual": round(preco_atual, 2), "desconto_pct": desconto, "deal_price": deal_price,
         "liquido": liquido, "taxas": mr.get("taxas"), "custo": custo,
         "lucro": mr.get("lucro"), "margem_pct": mr.get("margem_pct"),
         "preco_bling": preco_bling, "piso_preco": piso_preco, "acima_do_piso": acima_do_piso,
+        "sugestao_preco": (sug or {}).get("preco"), "sugestao_pct": (sug or {}).get("pct"),
     }
+
+
+# --- Escrita de promoções (com TRAVA DE MARGEM no Preço Bling) ---
+def _piso_item(user_id, item_id):
+    """(preco_bling, piso_preco) do item — piso = menor preço cujo líquido cobre o Preço Bling."""
+    from .models import ProdutoCache, MLItemCache
+    db = SessionLocal()
+    try:
+        mlc = db.query(MLItemCache).filter(MLItemCache.user_id == user_id, MLItemCache.item_id == item_id).first()
+        sku = mlc.sku if mlc else None
+        prod = (db.query(ProdutoCache).filter(ProdutoCache.user_id == user_id, ProdutoCache.sku == sku).first()
+                if sku else None)
+        preco_bling = float(prod.preco) if (prod and prod.preco) else None
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user_id)
+    piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+            if preco_bling is not None else None)
+    return preco_bling, piso
+
+
+def _checa_piso(user_id, item_id, deal_price):
+    """Bloqueia (HTTP 400) se deal_price fura o piso (Preço Bling). A regra de ouro do módulo."""
+    _pb, piso = _piso_item(user_id, item_id)
+    if piso is not None and deal_price is not None and float(deal_price) < piso:
+        raise HTTPException(status_code=400, detail=(
+            f"Bloqueado pela trava de margem: R$ {float(deal_price):.2f} fica abaixo do piso "
+            f"R$ {piso:.2f} (Preço Bling). Reduza o desconto."))
+
+
+@app.post("/api/mercadolivre/promocoes/campanha")
+def ml_promo_criar_campanha(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    nome, ini, fim = payload.get("nome"), payload.get("inicio"), payload.get("fim")
+    if not (nome and ini and fim):
+        raise HTTPException(status_code=422, detail="Informe nome, inicio e fim.")
+    return _ml_run(lambda ml: ml.criar_campanha_percentual(nome, ini, fim, user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/cupom")
+def ml_promo_criar_cupom(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    obr = ("nome", "inicio", "fim", "subtipo", "valor", "min_compra")
+    if any(payload.get(k) in (None, "") for k in obr):
+        raise HTTPException(status_code=422, detail="Informe nome, inicio, fim, subtipo, valor e min_compra.")
+    return _ml_run(lambda ml: ml.criar_cupom(
+        payload["nome"], payload["inicio"], payload["fim"], payload["subtipo"], payload["valor"],
+        payload["min_compra"], payload.get("codigo"), payload.get("orcamento"), payload.get("max_desconto"), user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/volume")
+def ml_promo_criar_volume(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    obr = ("nome", "inicio", "fim", "subtipo", "buy_quantity")
+    if any(payload.get(k) in (None, "") for k in obr):
+        raise HTTPException(status_code=422, detail="Informe nome, inicio, fim, subtipo e buy_quantity.")
+    return _ml_run(lambda ml: ml.criar_volume(
+        payload["nome"], payload["inicio"], payload["fim"], payload["subtipo"], payload["buy_quantity"],
+        payload.get("pay_quantity"), payload.get("discount_percentage"),
+        payload.get("allow_combination", True), user.id))
+
+
+@app.put("/api/mercadolivre/promocoes/campanha/{promotion_id}")
+def ml_promo_editar_campanha(promotion_id: str, payload: dict = Body(...),
+                             user: User = Depends(auth.get_current_user)):
+    ptype = payload.get("promotion_type")
+    if not ptype:
+        raise HTTPException(status_code=422, detail="Informe promotion_type.")
+    campos = payload.get("campos") or {k: v for k, v in payload.items() if k not in ("promotion_type", "campos")}
+    return _ml_run(lambda ml: ml.editar_campanha(promotion_id, ptype, campos, user.id))
+
+
+@app.delete("/api/mercadolivre/promocoes/campanha/{promotion_id}")
+def ml_promo_excluir_campanha(promotion_id: str, promotion_type: str = Query(...),
+                              user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.excluir_campanha(promotion_id, promotion_type, user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/item/{item_id}/desconto")
+def ml_promo_desconto(item_id: str, payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    deal = payload.get("deal_price")
+    if deal is None:
+        raise HTTPException(status_code=422, detail="Informe deal_price.")
+    _checa_piso(user.id, item_id, deal)
+    return _ml_run(lambda ml: ml.criar_desconto_item(
+        item_id, deal, payload.get("inicio"), payload.get("fim"), payload.get("top_deal_price"), user.id))
+
+
+@app.delete("/api/mercadolivre/promocoes/item/{item_id}/desconto")
+def ml_promo_desconto_remover(item_id: str, user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.remover_item_promocao(item_id, "PRICE_DISCOUNT", user_id=user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/item/{item_id}/aderir")
+def ml_promo_aderir(item_id: str, payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    pid, ptype = payload.get("promotion_id"), payload.get("promotion_type")
+    if not (pid and ptype):
+        raise HTTPException(status_code=422, detail="Informe promotion_id e promotion_type.")
+    deal = payload.get("deal_price")
+    if deal is not None:
+        _checa_piso(user.id, item_id, deal)
+    return _ml_run(lambda ml: ml.add_item_promocao(
+        item_id, pid, ptype, deal, payload.get("top_deal_price"), payload.get("stock"), user.id))
+
+
+@app.delete("/api/mercadolivre/promocoes/item/{item_id}")
+def ml_promo_remover_item(item_id: str, promotion_type: str = Query(...),
+                          promotion_id: str = Query(None), user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.remover_item_promocao(item_id, promotion_type, promotion_id, user_id=user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/exclusao/seller")
+def ml_promo_exclusao_seller(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.exclusao_seller_set(bool(payload.get("ativo")), user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/exclusao/item")
+def ml_promo_exclusao_item(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    iid = payload.get("item_id")
+    if not iid:
+        raise HTTPException(status_code=422, detail="Informe item_id.")
+    return _ml_run(lambda ml: ml.exclusao_item_set(iid, bool(payload.get("ativo")), user.id))
+
+
+def _npx(v):
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/api/mercadolivre/promocoes/itens")
+def ml_promo_itens(q: str = Query(None), limit: int = Query(30, le=60), offset: int = Query(0),
+                   apenas_ativos: bool = Query(True), user: User = Depends(auth.get_current_user)):
+    """Anúncios do vendedor (cache) com Preço Bling + piso — alimenta o seletor de itens (modo campanha)."""
+    from sqlalchemy import or_ as _or
+    from .models import MLItemCache, ProdutoCache
+    db = SessionLocal()
+    try:
+        query = db.query(MLItemCache).filter(MLItemCache.user_id == user.id)
+        if apenas_ativos:
+            query = query.filter(MLItemCache.status == "active")
+        if q and q.strip():
+            like = f"%{q.strip()}%"
+            query = query.filter(_or(MLItemCache.titulo.ilike(like), MLItemCache.sku.ilike(like),
+                                     MLItemCache.item_id.ilike(like)))
+        total = query.count()
+        rows = query.order_by(MLItemCache.titulo.asc()).offset(offset).limit(limit).all()
+        skus = [r.sku for r in rows if r.sku]
+        prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
+                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user.id)
+    itens = []
+    for r in rows:
+        prod = prods.get(r.sku) if r.sku else None
+        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        custo = float(prod.custo) if (prod and prod.custo and prod.custo > 0) else None
+        piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                if preco_bling is not None else None)
+        itens.append({
+            "item_id": r.item_id, "sku": r.sku, "titulo": r.titulo, "preco": float(r.preco or 0),
+            "imagem": r.imagem, "status": r.status, "estoque": r.estoque,
+            "logistic_type": r.logistic_type, "em_promocao": bool(r.em_promocao),
+            "preco_bling": preco_bling, "custo": custo, "piso_preco": piso,
+        })
+    return {"total": total, "offset": offset, "limit": limit, "itens": itens}
+
+
+@app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/itens")
+def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
+                            user: User = Depends(auth.get_current_user)):
+    """Itens candidatos/participantes de um convite, com banda de preço (min/max/sugerido) + piso do Bling."""
+    raw = _ml_run(lambda ml: ml.itens_promocao(promotion_id, promotion_type, user_id=user.id))
+    lista = raw.get("results") if isinstance(raw, dict) else raw
+    lista = lista or []
+    base = []
+    for it in lista:
+        iid = it.get("id") or it.get("item_id")
+        if not iid:
+            continue
+        stock = it.get("stock") if isinstance(it.get("stock"), dict) else {}
+        np_ = it.get("net_proceeds") if isinstance(it.get("net_proceeds"), dict) else {}
+        base.append({
+            "item_id": iid,
+            "original_price": _npx(it.get("original_price")) or _npx(it.get("price")),
+            "min_discounted_price": _npx(it.get("min_discounted_price")),
+            "max_discounted_price": _npx(it.get("max_discounted_price")),
+            "suggested_discounted_price": _npx(it.get("suggested_discounted_price")),
+            "top_deal_price": _npx(it.get("top_deal_price")),
+            "net_proceeds": _npx(np_.get("amount")),
+            "stock_min": stock.get("min"), "stock_max": stock.get("max"),
+            "status": it.get("status"),
+        })
+    # enriquece com cache (título/imagem/sku) + piso do Bling
+    ids = [b["item_id"] for b in base]
+    from .models import MLItemCache, ProdutoCache
+    db = SessionLocal()
+    try:
+        mlc = ({m.item_id: m for m in db.query(MLItemCache).filter(
+                MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
+        skus = [m.sku for m in mlc.values() if m.sku]
+        prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
+                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user.id)
+    for b in base:
+        m = mlc.get(b["item_id"])
+        b["titulo"] = m.titulo if m else None
+        b["imagem"] = m.imagem if m else None
+        b["sku"] = m.sku if m else None
+        b["estoque"] = m.estoque if m else None
+        prod = prods.get(m.sku) if (m and m.sku) else None
+        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        b["preco_bling"] = preco_bling
+        b["piso_preco"] = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                           if preco_bling is not None else None)
+    return {"promotion_id": promotion_id, "promotion_type": promotion_type, "itens": base}
+
+
+@app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/metricas")
+def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(...),
+                               inicio: str = Query(None), fim: str = Query(None),
+                               user: User = Depends(auth.get_current_user)):
+    """Métricas reais de uma campanha: agrega net_proceeds dos itens (líquido real do ML),
+    cruza com custo/Preço Bling e gera insights sugestivos (o que cresce, o que preocupa, o que fazer)."""
+    raw = _ml_run(lambda ml: ml.itens_promocao(promotion_id, promotion_type, user_id=user.id))
+    lista = raw.get("results") if isinstance(raw, dict) else raw
+    lista = lista or []
+    base = []
+    for it in lista:
+        iid = it.get("id") or it.get("item_id")
+        if not iid:
+            continue
+        np_ = it.get("net_proceeds") if isinstance(it.get("net_proceeds"), dict) else {}
+        base.append({
+            "item_id": iid, "price": _npx(it.get("price")),
+            "original_price": _npx(it.get("original_price")) or _npx(it.get("price")),
+            "net": _npx(np_.get("amount")), "suggested": _npx(it.get("suggested_discounted_price")),
+            "status": it.get("status"),
+        })
+    ids = [b["item_id"] for b in base]
+    from .models import MLItemCache, ProdutoCache
+    db = SessionLocal()
+    try:
+        mlc = ({m.item_id: m for m in db.query(MLItemCache).filter(
+                MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
+        skus = [m.sku for m in mlc.values() if m.sku]
+        prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
+                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user.id)
+    det = []
+    for b in base:
+        m = mlc.get(b["item_id"])
+        prod = prods.get(m.sku) if (m and m.sku) else None
+        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        custo = float(prod.custo) if (prod and prod.custo and prod.custo > 0) else None
+        piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                if preco_bling is not None else None)
+        price = b["price"] or b["original_price"]
+        orig = b["original_price"]
+        desc = round((1 - price / orig) * 100, 1) if (orig and price and orig > 0) else None
+        liquido = b["net"]
+        lucro = round(liquido - custo, 2) if (liquido is not None and custo is not None) else None
+        margem = round(lucro / price * 100, 1) if (lucro is not None and price and price > 0) else None
+        abaixo = (liquido is not None and preco_bling is not None and liquido < preco_bling)
+        estoque = m.estoque if m else None
+        oport = (b["suggested"] is not None and price is not None and b["suggested"] < price - 0.005
+                 and (piso is None or b["suggested"] >= piso))
+        det.append({
+            "item_id": b["item_id"], "titulo": (m.titulo if m else None), "sku": (m.sku if m else None),
+            "imagem": (m.imagem if m else None), "price": price, "original_price": orig, "desconto_pct": desc,
+            "liquido": liquido, "custo": custo, "lucro": lucro, "margem_pct": margem,
+            "preco_bling": preco_bling, "abaixo_piso": bool(abaixo), "suggested": b["suggested"],
+            "oportunidade": bool(oport), "estoque": estoque, "status": b["status"],
+        })
+
+    def _avg(xs):
+        xs = [x for x in xs if x is not None]
+        return round(sum(xs) / len(xs), 1) if xs else None
+
+    n = len(det)
+    liquidos = [d["liquido"] for d in det if d["liquido"] is not None]
+    lucros = [d["lucro"] for d in det if d["lucro"] is not None]
+    abaixo_piso = sum(1 for d in det if d["abaixo_piso"])
+    oportunidades = sum(1 for d in det if d["oportunidade"])
+    estoque_baixo = sum(1 for d in det if (d["estoque"] is not None and 0 < d["estoque"] <= 5))
+    sem_custo = sum(1 for d in det if d["custo"] is None)
+    com_custo = n - sem_custo
+    ativos = sum(1 for d in det if (d["status"] in (None, "active", "started", "enabled")))
+    liquido_total = round(sum(liquidos), 2) if liquidos else None
+    lucro_total = round(sum(lucros), 2) if lucros else None
+    desconto_medio = _avg([d["desconto_pct"] for d in det])
+    margem_media = _avg([d["margem_pct"] for d in det])
+    preco_promo_total = round(sum(d["price"] for d in det if d["price"]), 2) if det else None
+    preco_orig_total = round(sum(d["original_price"] for d in det if d["original_price"]), 2) if det else None
+
+    dias_total = dias_dec = dias_rest = pct_tempo = None
+    try:
+        from datetime import datetime as _dt
+
+        def _pd(s):
+            if not s:
+                return None
+            return _dt.fromisoformat(str(s).replace("Z", "")[:19])
+        di, dfim, hoje = _pd(inicio), _pd(fim), _dt.utcnow()
+        if di and dfim and dfim > di:
+            dias_total = (dfim - di).days or 1
+            dias_dec = max(0, (hoje - di).days)
+            dias_rest = max(0, (dfim - hoje).days)
+            pct_tempo = min(100, max(0, round((hoje - di).total_seconds() / (dfim - di).total_seconds() * 100)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    if abaixo_piso > 0 or estoque_baixo > 0:
+        saude = "risco"
+    elif (desconto_medio is not None and desconto_medio > 40) or oportunidades > 0 or n == 0:
+        saude = "atencao"
+    else:
+        saude = "saudavel"
+
+    ins = []
+
+    def add(t, ic, ti, de):
+        ins.append({"tipo": t, "icone": ic, "titulo": ti, "detalhe": de})
+
+    if n == 0:
+        add("info", "PackageOpen", "Campanha ainda sem itens", "Use 'Adicionar itens' para incluir anúncios nesta campanha.")
+    if abaixo_piso > 0:
+        add("risco", "ShieldAlert", f"{abaixo_piso} {'item' if abaixo_piso == 1 else 'itens'} furando a margem",
+            "O líquido estimado (net do ML) está abaixo do Preço Bling. Suba o preço desses itens ou remova-os da campanha.")
+    if abaixo_piso == 0 and margem_media is not None and margem_media >= 15 and n > 0:
+        add("positivo", "ShieldCheck", f"Margem saudável — média de {margem_media}%",
+            "Nenhum item fura o piso e a margem está equilibrada. Bom candidato a manter ou renovar.")
+    if oportunidades > 0:
+        add("oportunidade", "TrendingUp", f"{oportunidades} {'item' if oportunidades == 1 else 'itens'} com folga para descontar mais",
+            "O ML sugere um desconto maior que ainda fica acima do piso. Aprofundar pode aumentar conversão e competitividade.")
+    if desconto_medio is not None and desconto_medio < 8 and n > 0:
+        add("acao", "Percent", f"Desconto médio baixo ({desconto_medio}%)",
+            "Pode ter pouco apelo para o comprador. Considere aprofundar onde há folga de margem.")
+    if desconto_medio is not None and desconto_medio > 40:
+        add("risco", "Flame", f"Desconto médio alto ({desconto_medio}%)",
+            "Ótimo para girar, mas confirme se a margem se mantém — priorize corrigir itens abaixo do piso.")
+    if estoque_baixo > 0:
+        add("risco", "PackageX", f"{estoque_baixo} {'item' if estoque_baixo == 1 else 'itens'} com estoque baixo",
+            "Risco de ruptura no meio da campanha. Reabasteça ou reduza a exposição desses itens.")
+    if dias_rest is not None and dias_rest <= 2:
+        add("acao", "CalendarClock", f"Termina em {dias_rest} {'dia' if dias_rest == 1 else 'dias'}",
+            "Programe a próxima janela para a loja não ficar sem desconto ativo (auto-continuar).")
+    if sem_custo > 0:
+        add("info", "HelpCircle", f"{sem_custo} {'item' if sem_custo == 1 else 'itens'} sem custo no Bling",
+            "Cadastre o custo para calcular o lucro real desses itens e liberar a leitura de margem.")
+
+    # --- vendas dos itens na janela (do cache de pedidos) ---
+    vendas = None
+    if inicio and fim:
+        _ini = _parse_ml_dt(inicio); _fim = _parse_ml_dt(fim); _agora = datetime.utcnow()
+        if _ini and _fim:
+            _fime = min(_fim, _agora)
+            if _fime > _ini:
+                _dur = _fime - _ini
+                _ids = [d["item_id"] for d in det if d["item_id"]]
+                _at = _vendas_itens(user.id, _ids, _ini, _fime)
+                _bl = _vendas_itens(user.id, _ids, _ini - _dur, _ini)
+                from .models import MLPedidoItemCache as _MPC
+                _db = SessionLocal()
+                try:
+                    _tem = _db.query(_MPC).filter(_MPC.user_id == user.id).first() is not None
+                finally:
+                    _db.close()
+
+                def _delta(a, b):
+                    return round((a - b) / b * 100, 1) if (b and b > 0) else None
+                vendas = {
+                    "unidades": _at["unidades"], "receita": _at["receita"], "serie": _at["serie"],
+                    "unidades_baseline": _bl["unidades"], "receita_baseline": _bl["receita"],
+                    "delta_unidades_pct": _delta(_at["unidades"], _bl["unidades"]),
+                    "delta_receita_pct": _delta(_at["receita"], _bl["receita"]),
+                    "baseline_disponivel": _bl["unidades"] > 0, "cache_vazio": not _tem,
+                    "janela_ini": _ini.isoformat(), "janela_fim": _fime.isoformat(),
+                }
+    if vendas:
+        if vendas["cache_vazio"]:
+            add("info", "RefreshCw", "Sincronize os pedidos para ver vendas",
+                "O cache de pedidos está vazio. Rode a sincronização para liberar a análise de vendas desta campanha.")
+        elif vendas["delta_unidades_pct"] is not None and vendas["delta_unidades_pct"] >= 10:
+            add("positivo", "TrendingUp", f"Vendas +{vendas['delta_unidades_pct']}% na janela",
+                "Os itens desta campanha venderam mais que no período anterior equivalente — a promoção está impulsionando as vendas.")
+        elif vendas["delta_unidades_pct"] is not None and vendas["delta_unidades_pct"] <= -10:
+            add("risco", "TrendingDown", f"Vendas {vendas['delta_unidades_pct']}% na janela",
+                "Queda de vendas dos itens vs o período anterior. Avalie aprofundar o desconto (respeitando o piso) ou revisar preço e concorrência.")
+        elif vendas["unidades"] > 0 and not vendas["baseline_disponivel"]:
+            add("info", "Info", "Sem base para comparar vendas",
+                "Há vendas na janela, mas não há histórico anterior suficiente. Amplie a sincronização para comparar.")
+
+    return {
+        "promotion_id": promotion_id, "promotion_type": promotion_type,
+        "itens": n, "itens_ativos": ativos, "com_custo": com_custo, "sem_custo": sem_custo,
+        "desconto_medio_pct": desconto_medio, "liquido_total": liquido_total, "lucro_total": lucro_total,
+        "margem_media_pct": margem_media, "abaixo_piso": abaixo_piso, "oportunidades": oportunidades,
+        "estoque_baixo": estoque_baixo, "preco_promo_total": preco_promo_total, "preco_original_total": preco_orig_total,
+        "dias_total": dias_total, "dias_decorridos": dias_dec, "dias_restantes": dias_rest, "pct_tempo": pct_tempo,
+        "saude": saude, "insights": ins, "itens_detalhe": det, "vendas": vendas,
+    }
+
+
+# =========================== Cache de pedidos (vendas) ===========================
+def _parse_ml_dt(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S")
+    except Exception:  # noqa: BLE001
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "")[:19])
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _upsert_pedido_cache(db, user_id, o) -> bool:
+    """Upsert de um pedido do ML nas duas tabelas de cache. Não faz commit."""
+    from .models import MLPedidoCache, MLPedidoItemCache
+    oid = str(o.get("id") or "")
+    if not oid:
+        return False
+    dc = _parse_ml_dt(o.get("date_created"))
+    itens_min, unidades = [], 0
+    for it in (o.get("order_items") or []):
+        item = it.get("item") or {}
+        iid = str(item.get("id") or "") or None
+        sku = str(item.get("seller_sku") or "") or None
+        qty = int(it.get("quantity") or 0)
+        unit = float(it.get("unit_price") or 0)
+        fee = float(it.get("sale_fee") or 0)
+        unidades += qty
+        itens_min.append({"item_id": iid, "sku": sku, "titulo": item.get("title"),
+                          "quantidade": qty, "unit_price": round(unit, 2), "sale_fee": round(fee, 2)})
+    campos = dict(pack_id=(str(o.get("pack_id")) if o.get("pack_id") else None),
+                  status=o.get("status"), date_created=dc, date_closed=_parse_ml_dt(o.get("date_closed")),
+                  total_amount=float(o.get("total_amount") or 0), paid_amount=float(o.get("paid_amount") or 0),
+                  currency_id=o.get("currency_id"), unidades=unidades, itens=itens_min,
+                  atualizado_em=datetime.utcnow())
+    ped = db.query(MLPedidoCache).filter(MLPedidoCache.user_id == user_id, MLPedidoCache.order_id == oid).first()
+    if ped:
+        for k, v in campos.items():
+            setattr(ped, k, v)
+    else:
+        db.add(MLPedidoCache(user_id=user_id, order_id=oid, **campos))
+    db.query(MLPedidoItemCache).filter(MLPedidoItemCache.user_id == user_id,
+                                       MLPedidoItemCache.order_id == oid).delete()
+    for m in itens_min:
+        db.add(MLPedidoItemCache(user_id=user_id, order_id=oid, item_id=m["item_id"], sku=m["sku"],
+                                 titulo=m["titulo"], quantidade=m["quantidade"], unit_price=m["unit_price"],
+                                 receita=round(m["unit_price"] * m["quantidade"], 2), sale_fee=m["sale_fee"],
+                                 status=o.get("status"), date_created=dc))
+    return True
+
+
+def _vendas_itens(user_id, item_ids, ini, fim):
+    """Soma unidades/receita dos itens (do cache) no período [ini, fim) + série diária. Exclui cancelados."""
+    from .models import MLPedidoItemCache
+    if not item_ids or not ini or not fim:
+        return {"unidades": 0, "receita": 0.0, "serie": []}
+    db = SessionLocal()
+    try:
+        rows = db.query(MLPedidoItemCache).filter(
+            MLPedidoItemCache.user_id == user_id,
+            MLPedidoItemCache.item_id.in_(list(item_ids)),
+            MLPedidoItemCache.date_created >= ini,
+            MLPedidoItemCache.date_created < fim,
+        ).all()
+    finally:
+        db.close()
+    unid, rec, serie = 0, 0.0, {}
+    for r in rows:
+        if (r.status or "") == "cancelled":
+            continue
+        unid += (r.quantidade or 0)
+        rec += (r.receita or 0)
+        d = r.date_created.date().isoformat() if r.date_created else "?"
+        s = serie.setdefault(d, {"unidades": 0, "receita": 0.0})
+        s["unidades"] += (r.quantidade or 0)
+        s["receita"] += (r.receita or 0)
+    serie_list = [{"dia": k, "unidades": v["unidades"], "receita": round(v["receita"], 2)}
+                  for k, v in sorted(serie.items())]
+    return {"unidades": unid, "receita": round(rec, 2), "serie": serie_list}
+
+
+@app.post("/api/mercadolivre/pedidos/cache/backfill")
+def ml_pedidos_backfill(dias: int = Query(90, ge=1, le=365), user: User = Depends(auth.get_current_user)):
+    """Busca os pedidos dos últimos `dias` no ML e popula o cache de vendas (upsert idempotente)."""
+    from datetime import timedelta
+    ate = datetime.utcnow()
+    desde = ate - timedelta(days=dias)
+    desde_s = desde.strftime("%Y-%m-%dT00:00:00.000-00:00")
+    ate_s = ate.strftime("%Y-%m-%dT23:59:59.000-00:00")
+    MAX_PAG = 60
+    gravados = paginas = 0
+    truncado = False
+    db = SessionLocal()
+    try:
+        for pag in range(MAX_PAG):
+            raw = _ml_run(lambda ml, _p=pag: ml.listar_pedidos(user.id, None, desde_s, ate_s, _p * 50, 50)) or {}
+            pagina = raw.get("results") or []
+            paginas += 1
+            for o in pagina:
+                try:
+                    if _upsert_pedido_cache(db, user.id, o):
+                        gravados += 1
+                except Exception:  # noqa: BLE001
+                    db.rollback()
+            try:
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+            if len(pagina) < 50:
+                break
+            if pag == MAX_PAG - 1:
+                truncado = True
+    finally:
+        db.close()
+    return {"ok": True, "dias": dias, "paginas": paginas, "pedidos_gravados": gravados, "truncado": truncado}
+
+
+@app.get("/api/mercadolivre/pedidos/cache/status")
+def ml_pedidos_cache_status(user: User = Depends(auth.get_current_user)):
+    from .models import MLPedidoCache
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        total = db.query(MLPedidoCache).filter(MLPedidoCache.user_id == user.id).count()
+        primeiro = ultimo = None
+        if total:
+            primeiro = db.query(func.min(MLPedidoCache.date_created)).filter(MLPedidoCache.user_id == user.id).scalar()
+            ultimo = db.query(func.max(MLPedidoCache.date_created)).filter(MLPedidoCache.user_id == user.id).scalar()
+    finally:
+        db.close()
+    return {"pedidos": total, "vazio": total == 0,
+            "primeiro": primeiro.isoformat() if primeiro else None,
+            "ultimo": ultimo.isoformat() if ultimo else None}
 
 
 @app.get("/api/mercadolivre/promocoes")
