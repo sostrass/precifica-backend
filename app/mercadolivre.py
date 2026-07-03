@@ -1021,9 +1021,12 @@ def criar_desconto_item(item_id, deal_price, inicio=None, fim=None, top_deal_pri
 
 
 def add_item_promocao(item_id, promotion_id, promotion_type, deal_price=None,
-                      top_deal_price=None, stock=None, user_id=None) -> dict:
-    """POST adiciona/adere um item a uma campanha/convite (SELLER_CAMPAIGN, DEAL, LIGHTNING…)."""
+                      top_deal_price=None, stock=None, offer_id=None, user_id=None) -> dict:
+    """POST adiciona/adere um item a uma campanha/convite (SELLER_CAMPAIGN, DEAL, LIGHTNING…).
+    Convites (LIGHTNING/DOD/SMART/MARKETPLACE_CAMPAIGN) exigem o offer_id do candidato."""
     body = {"promotion_id": promotion_id, "promotion_type": promotion_type}
+    if offer_id:
+        body["offer_id"] = offer_id
     if deal_price is not None:
         body["deal_price"] = round(float(deal_price), 2)
     if top_deal_price is not None:

@@ -2901,7 +2901,8 @@ def ml_promo_aderir(item_id: str, payload: dict = Body(...), user: User = Depend
     if deal is not None and not payload.get("permitir_abaixo_piso"):
         _checa_piso(user.id, item_id, deal)
     return _ml_run(lambda ml: ml.add_item_promocao(
-        item_id, pid, ptype, deal, payload.get("top_deal_price"), payload.get("stock"), user.id))
+        item_id, pid, ptype, deal, payload.get("top_deal_price"), payload.get("stock"),
+        payload.get("offer_id"), user.id))
 
 
 @app.delete("/api/mercadolivre/promocoes/item/{item_id}")
@@ -3005,6 +3006,7 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
             "top_deal_price": _npx(it.get("top_deal_price")),
             "net_proceeds": _npx(np_.get("amount")),
             "stock_min": stock.get("min"), "stock_max": stock.get("max"),
+            "offer_id": it.get("offer_id") or (((it.get("offers") or [{}])[0] or {}).get("id")),
             "status": it.get("status"),
         })
     ids = [b["item_id"] for b in base]
@@ -3445,6 +3447,176 @@ def ml_pedidos_parados(dias: int = Query(30, ge=1, le=365), limit: int = Query(2
                                 x["dias_sem_venda"] if x["dias_sem_venda"] is not None else 99999,
                                 x["folga_desconto_pct"]), reverse=True)
     return {"dias": dias, "cache_vazio": not tem_cache, "total": len(parados), "itens": parados[:limit]}
+
+
+@app.get("/api/mercadolivre/buybox")
+def ml_buybox(limit: int = Query(20, ge=1, le=40), offset: int = Query(0),
+              somente_perdendo: bool = Query(True), user: User = Depends(auth.get_current_user)):
+    """Rastreio de buybox: para uma página de anúncios ativos, consulta price_to_win, normaliza
+    ganhando/perdendo/compartilhando e cruza com o piso — sugere o preço que recupera o topo sem furar a margem."""
+    from .models import MLItemCache, ProdutoCache
+    db = SessionLocal()
+    try:
+        base_q = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.status == "active")
+        total = base_q.count()
+        itens = base_q.order_by(MLItemCache.preco.desc()).offset(offset).limit(limit).all()
+        skus = [i.sku for i in itens if i.sku]
+        prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
+                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user.id)
+
+    def _run(ml):
+        out = []
+        resumo = {"ganhando": 0, "perdendo": 0, "compartilhando": 0, "fora": 0, "recuperavel": 0}
+        for it in itens:
+            try:
+                ptw = ml.preco_para_ganhar(it.item_id, user.id) or {}
+            except Exception:  # noqa: BLE001
+                resumo["fora"] += 1
+                continue
+            status_ml = (ptw.get("status") or "").lower()
+            p2w = _npx(ptw.get("price_to_win"))
+            winner = ptw.get("winner") if isinstance(ptw.get("winner"), dict) else {}
+            pv = _npx(winner.get("price"))
+            if status_ml == "winning":
+                st = "ganhando"
+            elif "sharing" in status_ml:
+                st = "compartilhando"
+            elif status_ml in ("competing", "not_winning", "listed") or p2w is not None:
+                st = "perdendo"
+            else:
+                st = "fora"
+            if st == "fora":
+                resumo["fora"] += 1
+                continue
+            resumo[st] += 1
+            preco = float(it.preco or 0)
+            prod = prods.get(it.sku) if it.sku else None
+            preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+            piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                    if preco_bling is not None else None)
+            recuperavel = (st in ("perdendo", "compartilhando") and p2w is not None
+                           and (piso is None or p2w >= piso))
+            if recuperavel:
+                resumo["recuperavel"] += 1
+            if somente_perdendo and st == "ganhando":
+                continue
+            out.append({
+                "item_id": it.item_id, "titulo": it.titulo, "sku": it.sku, "imagem": it.imagem, "estoque": it.estoque,
+                "status": st, "meu_preco": preco, "preco_para_ganhar": p2w, "preco_vencedor": pv,
+                "preco_bling": preco_bling, "piso": piso, "recuperavel": bool(recuperavel),
+                "diferenca": round(preco - p2w, 2) if (p2w is not None) else None,
+            })
+        return {"itens": out, "resumo": resumo}
+
+    res = _ml_run(lambda ml: _run(ml))
+    return {"total_catalogo": total, "offset": offset, "limit": limit, "verificados": len(itens),
+            "itens": res["itens"], "resumo": res["resumo"], "tem_mais": offset + limit < total}
+
+
+@app.post("/api/mercadolivre/buybox/ajustar-preco")
+def ml_buybox_ajustar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Ajusta o preço padrão do anúncio (ex.: para recuperar o buybox) — com trava de margem (nunca abaixo do piso)."""
+    iid, preco = payload.get("item_id"), payload.get("preco")
+    if not iid or preco is None:
+        raise HTTPException(status_code=422, detail="Informe item_id e preco.")
+    _checa_piso(user.id, iid, preco)
+    return _ml_run(lambda ml: ml.atualizar_preco(iid, float(preco), user.id))
+
+
+@app.get("/api/mercadolivre/agentes/sugestoes")
+def ml_agentes_sugestoes(limit: int = Query(40, ge=1, le=120), user: User = Depends(auth.get_current_user)):
+    """Motor de sugestões dos agentes (modo sugestivo): analisa catálogo + cache de pedidos + margem e
+    devolve ações recomendadas por item (uma por item, a de maior prioridade), sempre acima do piso."""
+    from .models import MLItemCache, MLPedidoItemCache, ProdutoCache
+    from sqlalchemy import func
+    agora = datetime.utcnow()
+    j30, j60 = agora - timedelta(days=30), agora - timedelta(days=60)
+    db = SessionLocal()
+    try:
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.status == "active").all()
+        skus = [i.sku for i in itens if i.sku]
+        prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
+                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+        rows = db.query(MLPedidoItemCache.item_id, MLPedidoItemCache.quantidade,
+                        MLPedidoItemCache.date_created, MLPedidoItemCache.status).filter(
+            MLPedidoItemCache.user_id == user.id, MLPedidoItemCache.date_created >= j60,
+            MLPedidoItemCache.item_id.isnot(None)).all()
+        ultima = dict(db.query(MLPedidoItemCache.item_id, func.max(MLPedidoItemCache.date_created)).filter(
+            MLPedidoItemCache.user_id == user.id, MLPedidoItemCache.item_id.isnot(None))
+            .group_by(MLPedidoItemCache.item_id).all())
+        tem_cache = db.query(MLPedidoItemCache).filter(MLPedidoItemCache.user_id == user.id).first() is not None
+    finally:
+        db.close()
+    recente, anterior = {}, {}
+    for iid, qty, dt, st in rows:
+        if (st or "") == "cancelled":
+            continue
+        alvo = recente if dt >= j30 else anterior
+        alvo[iid] = alvo.get(iid, 0) + (qty or 0)
+    cfg = precificacao.obter_config(user.id)
+    sugs = []
+    for it in itens:
+        prod = prods.get(it.sku) if it.sku else None
+        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                if preco_bling is not None else None)
+        preco = float(it.preco or 0)
+        folga = round((1 - piso / preco) * 100, 1) if (piso and preco > 0 and piso < preco) else 0.0
+        estoque = it.estoque or 0
+        ult = ultima.get(it.item_id)
+        dias_sem = (agora - ult).days if ult else None
+        rec, ant = recente.get(it.item_id, 0), anterior.get(it.item_id, 0)
+        cands = []
+        # Agente ESTOQUE PARADO: sem venda há 30d+ e com folga
+        if (dias_sem is None or dias_sem >= 30) and folga > 0 and estoque > 0:
+            d = max(5, min(round(folga) - 3, 20))
+            cands.append({"agente": "parado", "prioridade": 70 + min(estoque, 25) + (min(dias_sem, 120) // 4 if dias_sem else 15),
+                          "motivo": (f"{dias_sem}d sem vender" if dias_sem else "sem venda registrada") + f" · {estoque} un paradas",
+                          "acao": f"desconto {d}%", "desconto_pct": d})
+        # Agente GIRO: vendeu antes e caiu >40%
+        if ant >= 2 and rec < ant * 0.6 and folga > 0:
+            queda = round((1 - (rec / ant)) * 100)
+            d = max(5, min(round(folga) - 3, 15))
+            cands.append({"agente": "giro", "prioridade": 78 + min(ant, 25) + queda // 3,
+                          "motivo": f"vendas caíram {queda}% (de {ant} p/ {rec} un em 30d)",
+                          "acao": f"desconto {d}%", "desconto_pct": d})
+        # Agente MARGEM: margem folgada e vendendo
+        if folga >= 25 and rec >= 2:
+            d = max(8, min(round(folga) - 10, 20))
+            cands.append({"agente": "margem", "prioridade": 60 + round(folga) // 2 + min(rec, 20),
+                          "motivo": f"margem folgada ({folga}%) e vende ({rec} un/30d) — desconto seguro p/ acelerar",
+                          "acao": f"desconto {d}%", "desconto_pct": d})
+        # Agente ESTOQUE BAIXO: pouco estoque e vendendo → urgência (Relâmpago)
+        if 0 < estoque <= 5 and rec >= 2:
+            cands.append({"agente": "estoque_baixo", "prioridade": 66 + min(rec, 20),
+                          "motivo": f"estoque baixo ({estoque} un) e vendendo — Relâmpago com estoque reservado cria urgência",
+                          "acao": "Relâmpago (estoque reservado)", "desconto_pct": None})
+        if not cands:
+            continue
+        sug = max(cands, key=lambda c: c["prioridade"])
+        dp = None
+        if sug.get("desconto_pct"):
+            dp = round(preco * (1 - sug["desconto_pct"] / 100), 2)
+            if piso and dp < piso:
+                dp = round(piso, 2)
+        sug.update({"item_id": it.item_id, "titulo": it.titulo, "sku": it.sku, "imagem": it.imagem,
+                    "preco": preco, "estoque": estoque, "preco_bling": preco_bling, "piso": piso,
+                    "folga_pct": folga, "deal_price_sugerido": dp,
+                    "capital": round(preco * estoque, 2), "vendas_30d": rec, "vendas_30_60d": ant})
+        sugs.append(sug)
+    sugs.sort(key=lambda x: x["prioridade"], reverse=True)
+    por_agente = {}
+    for s in sugs:
+        por_agente[s["agente"]] = por_agente.get(s["agente"], 0) + 1
+    capital_parado = round(sum(s["capital"] for s in sugs if s.get("agente") == "parado"), 2)
+    resumo_impacto = {"capital_parado": capital_parado, "oportunidades": len(sugs),
+                      "n_parado": por_agente.get("parado", 0), "n_giro": por_agente.get("giro", 0),
+                      "n_margem": por_agente.get("margem", 0), "n_estoque_baixo": por_agente.get("estoque_baixo", 0)}
+    return {"cache_vazio": not tem_cache, "total": len(sugs), "por_agente": por_agente,
+            "resumo_impacto": resumo_impacto, "sugestoes": sugs[:limit]}
 
 
 @app.get("/api/mercadolivre/promocoes")
