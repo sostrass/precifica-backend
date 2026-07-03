@@ -834,6 +834,86 @@ def remover_desconto(item_id: str, user_id=None) -> dict:
                 params={"promotion_type": "PRICE_DISCOUNT", "user_id": sid}, headers=headers)
 
 
+# --- Leitura direta MLB (forma sem /marketplace, com ?app_version=v2) ---------
+# Tipos de campanha que o VENDEDOR cria × os que ele apenas ADERE (ML convida).
+PROMO_CRIA = {"SELLER_CAMPAIGN", "PRICE_DISCOUNT", "SELLER_COUPON_CAMPAIGN", "VOLUME"}
+PROMO_ADERE = {"DEAL", "MARKETPLACE_CAMPAIGN", "DOD", "LIGHTNING", "SMART",
+               "PRICE_MATCHING", "PRICE_MATCHING_MELI_ALL", "PRE_NEGOTIATED",
+               "UNHEALTHY_STOCK", "BANK"}
+
+
+def detalhe_promocao(promotion_id: str, promotion_type: str, user_id=None) -> dict:
+    """GET /seller-promotions/promotions/{id} — detalhe de uma campanha/oferta."""
+    return _get(f"/seller-promotions/promotions/{promotion_id}",
+                params={"promotion_type": promotion_type, "app_version": "v2"}, user_id=user_id)
+
+
+def itens_promocao(promotion_id: str, promotion_type: str, status_item=None, user_id=None) -> dict:
+    """GET /seller-promotions/promotions/{id}/items — itens da campanha, com
+    net_proceeds (líquido estimado do ML), min/max_discounted_price e sugestão."""
+    params = {"promotion_type": promotion_type, "app_version": "v2"}
+    if status_item:
+        params["status_item"] = status_item
+    return _get(f"/seller-promotions/promotions/{promotion_id}/items", params=params, user_id=user_id)
+
+
+def detalhe_candidato(candidate_id: str, user_id=None) -> dict:
+    return _get(f"/seller-promotions/candidates/{candidate_id}", params={"app_version": "v2"}, user_id=user_id)
+
+
+def precos_item(item_id: str, user_id=None) -> dict:
+    """GET /items/{id}/prices — preços standard/promotion (fonte de verdade de preço)."""
+    return _get(f"/items/{item_id}/prices", user_id=user_id)
+
+
+def preco_de_venda(item_id: str, context: str = "channel_marketplace", user_id=None) -> dict:
+    """GET /items/{id}/sale_price — preço vencedor exibido ao comprador (+ metadata da promoção)."""
+    return _get(f"/items/{item_id}/sale_price", params={"context": context}, user_id=user_id)
+
+
+def preco_para_ganhar(item_id: str, user_id=None) -> dict:
+    """GET /items/{id}/price_to_win — preço para recuperar o destaque no catálogo (buybox)."""
+    return _get(f"/items/{item_id}/price_to_win", user_id=user_id)
+
+
+def lista_exclusao(user_id=None) -> dict:
+    """GET /seller-promotions/exclusion-list/seller — governança: participação automática do ML."""
+    return _get("/seller-promotions/exclusion-list/seller", params={"app_version": "v2"}, user_id=user_id)
+
+
+def _classifica_promocoes(results: list) -> dict:
+    """Separa a lista de /seller-promotions/users/{id} em convites (ML convida) × minhas
+    (o vendedor cria) e devolve contagens. Pura — sem I/O — para ser testável."""
+    convites, minhas = [], []
+    for p in (results or []):
+        item = {
+            "id": p.get("id"), "type": p.get("type"), "sub_type": p.get("sub_type"),
+            "status": p.get("status"), "name": p.get("name"),
+            "start_date": p.get("start_date"), "finish_date": p.get("finish_date"),
+            "deadline_date": p.get("deadline_date"), "benefits": p.get("benefits"),
+        }
+        (minhas if p.get("type") in PROMO_CRIA else convites).append(item)
+    ativas = sum(1 for m in minhas if (m.get("status") or "") in ("started", "active"))
+    copart = sum(1 for c in convites if ((c.get("benefits") or {}) or {}).get("type") == "REBATE")
+    return {"convites": convites, "minhas": minhas,
+            "contagens": {"convites": len(convites), "minhas": len(minhas),
+                          "ativas": ativas, "coparticipadas": copart}}
+
+
+def painel_promocoes(user_id=None) -> dict:
+    """Painel consolidado: convites × minhas campanhas + contagens + estado da exclusão."""
+    data = promocoes_do_vendedor(user_id) or {}
+    results = data.get("results") or data.get("promotions") or []
+    out = _classifica_promocoes(results)
+    try:
+        exc = lista_exclusao(user_id) or {}
+        excl = exc.get("exclusion_status")
+        out["exclusao_ativa"] = (excl in (True, "true")) if excl is not None else None
+    except Exception:  # noqa: BLE001
+        out["exclusao_ativa"] = None
+    return out
+
+
 # =========================================================================== #
 # Domínio K — Qualidade do anúncio
 # =========================================================================== #
@@ -1456,12 +1536,16 @@ def agenda_coleta(user_id=None) -> dict:
         if not detalhes:
             continue
         d0 = detalhes[0] or {}
+        veic = d0.get("vehicle") or {}
+        mot = d0.get("driver") or {}
         janela = {
             "logistic_type": lt,
             "de": _hhmm(d0.get("from")),
             "ate": _hhmm(d0.get("to")),
             "corte": _hhmm(d0.get("cutoff")),
             "carrier": (d0.get("carrier") or {}).get("name"),
+            "motorista": mot.get("name"),
+            "veiculo": veic.get("license_plate") or veic.get("vehicle_type"),
             "trabalha": bool(dia.get("work", True)),
             "same_day": bool(d0.get("milkrun_same_day")),
         }

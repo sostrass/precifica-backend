@@ -2662,17 +2662,10 @@ def ml_envio_extra(shipment_id: str, order_id: str = None,
 
 @app.get("/api/mercadolivre/coleta")
 def ml_coleta(user: User = Depends(auth.get_current_user)):
-    """Janela de coleta de hoje (de/até + corte) + código de autorização, quando o ML expõe."""
-    def _run(ml):
-        ag = ml.agenda_coleta(user.id)
-        try:
-            cod = ml.codigo_autorizacao_coleta(user.id)
-        except Exception:  # noqa: BLE001
-            cod = {"ok": False}
-        if isinstance(ag, dict):
-            ag["codigo_autorizacao"] = cod.get("codigo") if cod.get("ok") else None
-        return ag
-    return _ml_run(_run)
+    """Janela de coleta de hoje (de/até + corte) + transportadora/motorista/veículo, quando o ML expõe.
+    Obs.: o Mercado Livre NÃO expõe 'código de autorização de coleta' na API pública (cross_docking usa
+    romaneio, e os detalhes ricos ficam num endpoint privado do seller center)."""
+    return _ml_run(lambda ml: ml.agenda_coleta(user.id))
 
 
 @app.get("/api/mercadolivre/etiqueta")
@@ -2734,6 +2727,74 @@ def ml_visitas_vendedor(desde: str, ate: str, user: User = Depends(auth.get_curr
 
 
 # --- Promoções (v2) ---
+@app.get("/api/mercadolivre/promocoes/painel")
+def ml_promocoes_painel(user: User = Depends(auth.get_current_user)):
+    """Painel consolidado da Central de Promoções: convites do ML × minhas campanhas,
+    com contagens e estado da lista de exclusão (governança)."""
+    return _ml_run(lambda ml: ml.painel_promocoes(user.id))
+
+
+@app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}")
+def ml_promocao_detalhe(promotion_id: str, promotion_type: str = Query(...),
+                        user: User = Depends(auth.get_current_user)):
+    """Detalhe de uma campanha + seus itens (net_proceeds, banda min/max, sugestão do ML)."""
+    def _run(ml):
+        det = ml.detalhe_promocao(promotion_id, promotion_type, user.id)
+        try:
+            its = ml.itens_promocao(promotion_id, promotion_type, user_id=user.id)
+        except ml.MLErro:
+            its = {}
+        return {"detalhe": det, "itens": its}
+    return _ml_run(_run)
+
+
+@app.post("/api/mercadolivre/promocoes/simular")
+def ml_promocoes_simular(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Simulador de desconto: item + desconto% (ou deal_price) → preço, líquido real,
+    custo, lucro real, margem, PISO (Preço Bling) e banda. Não escreve nada no ML."""
+    from .models import ProdutoCache, MLItemCache
+    item_id = str(payload.get("item_id") or "").strip()
+    if not item_id:
+        raise HTTPException(status_code=422, detail="Informe item_id.")
+    desconto = payload.get("desconto_pct")
+    deal_price = payload.get("deal_price")
+    db = SessionLocal()
+    try:
+        mlc = db.query(MLItemCache).filter(MLItemCache.user_id == user.id,
+                                           MLItemCache.item_id == item_id).first()
+        if not mlc:
+            raise HTTPException(status_code=404, detail="Item não está no cache do Mercado Livre.")
+        preco_atual = float(mlc.preco or 0)
+        titulo, sku = mlc.titulo, mlc.sku
+        prod = None
+        if sku:
+            prod = db.query(ProdutoCache).filter(ProdutoCache.user_id == user.id,
+                                                 ProdutoCache.sku == sku).first()
+        preco_bling = float(prod.preco) if (prod and prod.preco) else None
+        custo = float(prod.custo) if (prod and prod.custo) else None
+    finally:
+        db.close()
+    if deal_price is None:
+        d = float(desconto or 0)
+        deal_price = round(preco_atual * (1 - d / 100.0), 2)
+    else:
+        deal_price = round(float(deal_price), 2)
+        desconto = round((1 - deal_price / preco_atual) * 100, 1) if preco_atual else None
+    cfg = precificacao.obter_config(user.id)
+    mr = precificacao.margem_real_canal(cfg, "mercadolivre", deal_price, custo) or {}
+    liquido = mr.get("liquido")
+    piso_preco = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                  if preco_bling is not None else None)
+    acima_do_piso = (liquido >= preco_bling) if (liquido is not None and preco_bling is not None) else None
+    return {
+        "item_id": item_id, "titulo": titulo, "sku": sku,
+        "preco_atual": round(preco_atual, 2), "desconto_pct": desconto, "deal_price": deal_price,
+        "liquido": liquido, "taxas": mr.get("taxas"), "custo": custo,
+        "lucro": mr.get("lucro"), "margem_pct": mr.get("margem_pct"),
+        "preco_bling": preco_bling, "piso_preco": piso_preco, "acima_do_piso": acima_do_piso,
+    }
+
+
 @app.get("/api/mercadolivre/promocoes")
 def ml_promocoes(user: User = Depends(auth.get_current_user)):
     return _ml_run(lambda ml: ml.promocoes_do_vendedor(user.id))

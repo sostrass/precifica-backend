@@ -372,6 +372,35 @@ def divergencias(cfg, base_venda, precos_atuais=None) -> list:
 # Configurações: comissão % + fixo % da faixa do preço, + imposto + cartão +
 # embalagem dos custos globais. `custo` = precoCusto do Bling (quando houver).
 # --------------------------------------------------------------------------- #
+def preco_minimo_para_liquido(cfg: dict, canal: str, liquido_alvo: float) -> float | None:
+    """Menor preço de venda cujo líquido (modelo base-venda) cobre o `liquido_alvo`
+    (o Preço Bling). É o PISO das promoções: abaixo dele, a oferta fura a margem.
+    Inverte a fórmula liquido = preco*(1-pct) - fixos, respeitando a faixa consistente."""
+    liquido_alvo = float(liquido_alvo or 0)
+    canais = cfg.get("canais") or []
+    c = next((x for x in canais if (x.get("canal") or "").lower() == (canal or "").lower()), None)
+    if not c:
+        return None
+    faixas = sorted(c.get("faixas") or [], key=lambda f: (f.get("ate") is None, f.get("ate") or 0))
+    imp = float(cfg.get("imposto", 0)); car = float(cfg.get("cartao", 0)); emb = float(cfg.get("embalagem", 0))
+    for f in faixas:
+        pct = (float(f.get("comissao", 0)) + float(f.get("fixo_pct", 0)) + imp + car) / 100.0
+        if pct >= 1:
+            continue
+        fixos = float(f.get("fixo", 0)) + emb
+        preco = (liquido_alvo + fixos) / (1 - pct)
+        teto = f.get("ate")
+        if teto is None or preco <= float(teto):
+            return round(preco, 2)
+    if faixas:  # nenhuma faixa "fecha": usa a última
+        f = faixas[-1]
+        pct = (float(f.get("comissao", 0)) + float(f.get("fixo_pct", 0)) + imp + car) / 100.0
+        if pct < 1:
+            fixos = float(f.get("fixo", 0)) + emb
+            return round((liquido_alvo + fixos) / (1 - pct), 2)
+    return None
+
+
 def margem_real_canal(cfg: dict, canal: str, preco: float, custo=None) -> dict | None:
     preco = float(preco or 0)
     if preco <= 0:
