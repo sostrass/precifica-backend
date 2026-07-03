@@ -3063,6 +3063,28 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
             "total": len(base), "truncado": truncado, "sem_preco_bling": sem_bling}
 
 
+@app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/contagem")
+def ml_promo_contagem(promotion_id: str, promotion_type: str = Query(...),
+                      user: User = Depends(auth.get_current_user)):
+    """Contagem leve: total de itens/candidatos (elegíveis) + quantos participando (status ativo).
+    Sem enriquecimento — só para os cards mostrarem elegíveis × participando."""
+    def _run(ml):
+        total, participando, sa = 0, 0, None
+        for _ in range(20):
+            raw = ml.itens_promocao(promotion_id, promotion_type, user_id=user.id, limit=50, search_after=sa) or {}
+            lst = (raw.get("results") if isinstance(raw, dict) else raw) or []
+            total += len(lst)
+            for it in lst:
+                if (it.get("status") or "").lower() in ("active", "started", "enabled"):
+                    participando += 1
+            paging = (raw.get("paging") if isinstance(raw, dict) else {}) or {}
+            sa = paging.get("searchAfter") or paging.get("search_after")
+            if not sa or len(lst) < 50:
+                break
+        return {"total": total, "participando": participando}
+    return _ml_run(lambda ml: _run(ml))
+
+
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/metricas")
 def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(...),
                                inicio: str = Query(None), fim: str = Query(None),
