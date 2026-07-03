@@ -2970,12 +2970,25 @@ def ml_promo_itens(q: str = Query(None), limit: int = Query(30, le=60), offset: 
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/itens")
 def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
                             user: User = Depends(auth.get_current_user)):
-    """Itens candidatos/participantes de um convite, com banda de preço (min/max/sugerido) + piso do Bling."""
-    raw = _ml_run(lambda ml: ml.itens_promocao(promotion_id, promotion_type, user_id=user.id))
-    lista = raw.get("results") if isinstance(raw, dict) else raw
-    lista = lista or []
+    """Itens candidatos/participantes de um convite (paginado — TODOS), com banda de preço
+    (min/max/sugerido), estoque reservável + piso do Bling, enriquecidos com título/imagem/estoque."""
+    from . import mercadolivre as _ml
+    # 1) paginar todos os itens do convite (ML pagina em ~50 via searchAfter)
+    todos, sa, truncado = [], None, False
+    for i in range(12):  # teto de 12 páginas ≈ 600 itens
+        raw = _ml_run(lambda ml, _sa=sa: ml.itens_promocao(
+            promotion_id, promotion_type, user_id=user.id, limit=50, search_after=_sa)) or {}
+        lst = (raw.get("results") if isinstance(raw, dict) else raw) or []
+        todos.extend(lst)
+        paging = (raw.get("paging") if isinstance(raw, dict) else {}) or {}
+        sa = paging.get("searchAfter") or paging.get("search_after")
+        if not sa or len(lst) < 50:
+            break
+        if i == 11:
+            truncado = True
+    # 2) normaliza
     base = []
-    for it in lista:
+    for it in todos:
         iid = it.get("id") or it.get("item_id")
         if not iid:
             continue
@@ -2992,8 +3005,8 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
             "stock_min": stock.get("min"), "stock_max": stock.get("max"),
             "status": it.get("status"),
         })
-    # enriquece com cache (título/imagem/sku) + piso do Bling
     ids = [b["item_id"] for b in base]
+    # 3) cache local (título/imagem/estoque/sku)
     from .models import MLItemCache, ProdutoCache
     db = SessionLocal()
     try:
@@ -3004,19 +3017,46 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
                   ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
     finally:
         db.close()
+    # 4) enriquecer via /items os que faltam no cache (título/imagem/estoque/sku)
+    faltantes = [b["item_id"] for b in base if not (mlc.get(b["item_id"]) and mlc[b["item_id"]].titulo)]
+    extra = {}
+    if faltantes:
+        try:
+            for x in _ml.obter_itens(faltantes, user.id,
+                                     attributes="id,title,thumbnail,pictures,available_quantity,price,seller_custom_field,attributes,status"):
+                if x.get("item_id"):
+                    extra[x["item_id"]] = x
+        except Exception:  # noqa: BLE001
+            extra = {}
+    skus_extra = [x.get("sku") for x in extra.values() if x.get("sku") and x.get("sku") not in prods]
+    if skus_extra:
+        db2 = SessionLocal()
+        try:
+            for p in db2.query(ProdutoCache).filter(
+                    ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus_extra)).all():
+                if p.sku:
+                    prods[p.sku] = p
+        finally:
+            db2.close()
     cfg = precificacao.obter_config(user.id)
     for b in base:
-        m = mlc.get(b["item_id"])
-        b["titulo"] = m.titulo if m else None
-        b["imagem"] = m.imagem if m else None
-        b["sku"] = m.sku if m else None
-        b["estoque"] = m.estoque if m else None
-        prod = prods.get(m.sku) if (m and m.sku) else None
+        m = mlc.get(b["item_id"]); x = extra.get(b["item_id"])
+        b["titulo"] = (m.titulo if (m and m.titulo) else None) or (x.get("titulo") if x else None)
+        b["imagem"] = (m.imagem if (m and m.imagem) else None) or (x.get("imagem") if x else None)
+        sku = (m.sku if (m and m.sku) else None) or (x.get("sku") if x else None)
+        b["sku"] = sku
+        est = (m.estoque if (m and m.estoque is not None) else None)
+        if est is None and x is not None:
+            est = x.get("estoque")
+        b["estoque"] = est
+        prod = prods.get(sku) if sku else None
         preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
         b["preco_bling"] = preco_bling
         b["piso_preco"] = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
                            if preco_bling is not None else None)
-    return {"promotion_id": promotion_id, "promotion_type": promotion_type, "itens": base}
+    sem_bling = sum(1 for b in base if b["preco_bling"] is None)
+    return {"promotion_id": promotion_id, "promotion_type": promotion_type, "itens": base,
+            "total": len(base), "truncado": truncado, "sem_preco_bling": sem_bling}
 
 
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/metricas")

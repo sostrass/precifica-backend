@@ -883,12 +883,17 @@ def detalhe_promocao(promotion_id: str, promotion_type: str, user_id=None) -> di
                 params={"promotion_type": promotion_type, "app_version": "v2"}, user_id=user_id)
 
 
-def itens_promocao(promotion_id: str, promotion_type: str, status_item=None, user_id=None) -> dict:
+def itens_promocao(promotion_id: str, promotion_type: str, status_item=None, user_id=None,
+                   limit=None, search_after=None) -> dict:
     """GET /seller-promotions/promotions/{id}/items — itens da campanha, com
     net_proceeds (líquido estimado do ML), min/max_discounted_price e sugestão."""
     params = {"promotion_type": promotion_type, "app_version": "v2"}
     if status_item:
         params["status_item"] = status_item
+    if limit:
+        params["limit"] = limit
+    if search_after:
+        params["searchAfter"] = search_after
     return _get(f"/seller-promotions/promotions/{promotion_id}/items", params=params, user_id=user_id)
 
 
