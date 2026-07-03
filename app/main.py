@@ -2896,7 +2896,9 @@ def ml_promo_aderir(item_id: str, payload: dict = Body(...), user: User = Depend
     if not (pid and ptype):
         raise HTTPException(status_code=422, detail="Informe promotion_id e promotion_type.")
     deal = payload.get("deal_price")
-    if deal is not None:
+    # Trava de margem ativa por padrão. Só é ignorada com override manual explícito
+    # (decisão consciente do operador — ex.: loss-leader de Relâmpago para giro/visibilidade).
+    if deal is not None and not payload.get("permitir_abaixo_piso"):
         _checa_piso(user.id, item_id, deal)
     return _ml_run(lambda ml: ml.add_item_promocao(
         item_id, pid, ptype, deal, payload.get("top_deal_price"), payload.get("stock"), user.id))
