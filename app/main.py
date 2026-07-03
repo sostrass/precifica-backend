@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -3238,6 +3238,23 @@ def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(..
             add("info", "Info", "Sem base para comparar vendas",
                 "Há vendas na janela, mas não há histórico anterior suficiente. Amplie a sincronização para comparar.")
 
+    # --- projeção: no ritmo de venda dos últimos 30 dias, quanto renderia na duração da campanha ---
+    projecao = None
+    if det:
+        _idsp = [d["item_id"] for d in det if d["item_id"]]
+        _look = 30
+        _hist = _vendas_itens(user.id, _idsp, datetime.utcnow() - timedelta(days=_look), datetime.utcnow())
+        _diasc = dias_total or 7
+        _rate = _hist["unidades"] / _look
+        _unest = round(_rate * _diasc)
+        _pmed = round(preco_promo_total / len(det), 2) if (preco_promo_total and det) else None
+        _recest = round(_unest * _pmed, 2) if (_pmed and _unest) else (0.0 if _pmed else None)
+        projecao = {
+            "base_dias": _look, "base_unidades": _hist["unidades"], "rate_dia": round(_rate, 2),
+            "dias_campanha": _diasc, "unidades_estimadas": _unest, "receita_estimada": _recest,
+            "preco_medio": _pmed, "cache_vazio": (vendas or {}).get("cache_vazio", _hist["unidades"] == 0),
+        }
+
     return {
         "promotion_id": promotion_id, "promotion_type": promotion_type,
         "itens": n, "itens_ativos": ativos, "com_custo": com_custo, "sem_custo": sem_custo,
@@ -3245,7 +3262,7 @@ def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(..
         "margem_media_pct": margem_media, "abaixo_piso": abaixo_piso, "oportunidades": oportunidades,
         "estoque_baixo": estoque_baixo, "preco_promo_total": preco_promo_total, "preco_original_total": preco_orig_total,
         "dias_total": dias_total, "dias_decorridos": dias_dec, "dias_restantes": dias_rest, "pct_tempo": pct_tempo,
-        "saude": saude, "insights": ins, "itens_detalhe": det, "vendas": vendas,
+        "saude": saude, "insights": ins, "itens_detalhe": det, "vendas": vendas, "projecao": projecao,
     }
 
 
@@ -3383,6 +3400,51 @@ def ml_pedidos_cache_status(user: User = Depends(auth.get_current_user)):
     return {"pedidos": total, "vazio": total == 0,
             "primeiro": primeiro.isoformat() if primeiro else None,
             "ultimo": ultimo.isoformat() if ultimo else None}
+
+
+@app.get("/api/mercadolivre/pedidos/parados")
+def ml_pedidos_parados(dias: int = Query(30, ge=1, le=365), limit: int = Query(20, ge=1, le=60),
+                       user: User = Depends(auth.get_current_user)):
+    """Produtos ativos SEM venda nos últimos `dias` (do cache), com folga de margem — candidatos a promoção."""
+    from .models import MLItemCache, MLPedidoItemCache, ProdutoCache
+    from sqlalchemy import func
+    corte = datetime.utcnow() - timedelta(days=dias)
+    db = SessionLocal()
+    try:
+        ultimas = dict(db.query(MLPedidoItemCache.item_id, func.max(MLPedidoItemCache.date_created))
+                       .filter(MLPedidoItemCache.user_id == user.id, MLPedidoItemCache.item_id.isnot(None))
+                       .group_by(MLPedidoItemCache.item_id).all())
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.status == "active").all()
+        skus = [i.sku for i in itens if i.sku]
+        prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
+                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+        tem_cache = db.query(MLPedidoItemCache).filter(MLPedidoItemCache.user_id == user.id).first() is not None
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user.id)
+    parados = []
+    agora = datetime.utcnow()
+    for it in itens:
+        ult = ultimas.get(it.item_id)
+        if ult and ult >= corte:
+            continue  # vendeu no período — não é parado
+        dias_sem = (agora - ult).days if ult else None  # None = sem venda registrada no cache
+        prod = prods.get(it.sku) if it.sku else None
+        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
+                if preco_bling is not None else None)
+        preco = float(it.preco or 0)
+        folga = round((1 - piso / preco) * 100, 1) if (piso and preco > 0 and piso < preco) else 0.0
+        parados.append({
+            "item_id": it.item_id, "titulo": it.titulo, "sku": it.sku, "imagem": it.imagem,
+            "preco": preco, "estoque": it.estoque, "preco_bling": preco_bling, "piso": piso,
+            "dias_sem_venda": dias_sem, "folga_desconto_pct": folga,
+        })
+    # promováveis (folga>0) primeiro; depois mais parados (nunca vendeu = topo); depois maior folga
+    parados.sort(key=lambda x: (x["folga_desconto_pct"] > 0,
+                                x["dias_sem_venda"] if x["dias_sem_venda"] is not None else 99999,
+                                x["folga_desconto_pct"]), reverse=True)
+    return {"dias": dias, "cache_vazio": not tem_cache, "total": len(parados), "itens": parados[:limit]}
 
 
 @app.get("/api/mercadolivre/promocoes")
