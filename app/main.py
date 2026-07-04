@@ -2907,8 +2907,30 @@ def ml_promo_aderir(item_id: str, payload: dict = Body(...), user: User = Depend
 
 @app.delete("/api/mercadolivre/promocoes/item/{item_id}")
 def ml_promo_remover_item(item_id: str, promotion_type: str = Query(...),
-                          promotion_id: str = Query(None), user: User = Depends(auth.get_current_user)):
-    return _ml_run(lambda ml: ml.remover_item_promocao(item_id, promotion_type, promotion_id, user_id=user.id))
+                          promotion_id: str = Query(None), offer_id: str = Query(None),
+                          user: User = Depends(auth.get_current_user)):
+    return _ml_run(lambda ml: ml.remover_item_promocao(item_id, promotion_type, promotion_id, offer_id, user.id))
+
+
+@app.post("/api/mercadolivre/promocoes/promocao/{promotion_id}/sair")
+def ml_promo_sair(promotion_id: str, promotion_type: str = Query(...),
+                  user: User = Depends(auth.get_current_user)):
+    """Deixa de aderir: remove TODOS os itens participando (status ativo) de um convite/campanha."""
+    base, _tr, _sb = _itens_convite_enriquecidos(user.id, promotion_id, promotion_type)
+    participando = [it for it in base if (it.get("status") or "").lower() in ("active", "started", "enabled")]
+    resumo = {"removidos": 0, "falhas": [], "participando": len(participando)}
+
+    def _run(ml):
+        for it in participando:
+            try:
+                ml.remover_item_promocao(it["item_id"], promotion_type, promotion_id, it.get("offer_id"), user.id)
+                resumo["removidos"] += 1
+            except Exception as e:  # noqa: BLE001
+                resumo["falhas"].append({"item_id": it["item_id"], "erro": str(e)[:140]})
+        return None
+
+    _ml_run(lambda ml: _run(ml))
+    return resumo
 
 
 @app.post("/api/mercadolivre/promocoes/exclusao/seller")
