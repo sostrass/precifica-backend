@@ -3278,10 +3278,12 @@ _PART_TTL = 300  # 5 min
 
 
 @app.get("/api/mercadolivre/promocoes/participantes")
-def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(auth.get_current_user)):
-    """Produtos que estão participando de campanhas, agrupados — com os títulos das campanhas de cada um.
-    Varre as promoções (com teto) e coleta os itens ativos. Cacheado 5 min (forcar=true refaz)."""
-    ent = _PART_CACHE.get(user.id)
+def ml_promo_participantes(forcar: bool = Query(False), dias: int = Query(30, ge=1, le=365),
+                           mes: str = Query(None), user: User = Depends(auth.get_current_user)):
+    """Produtos que estão participando de campanhas, agrupados — com os títulos das campanhas.
+    Vendas na janela escolhida: `dias` (7/15/30/60/90...) OU `mes` (YYYY-MM). Cache 5 min por período."""
+    chave = (user.id, mes or f"d{dias}")
+    ent = _PART_CACHE.get(chave)
     if ent and not forcar and (datetime.utcnow() - ent["ts"]).total_seconds() < _PART_TTL:
         d = dict(ent["data"]); d["cache"] = True; d["atualizado_em"] = ent["ts"].isoformat()
         return d
@@ -3317,8 +3319,12 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
                                     e["desconto_max"] = _d
                                     e["preco_promo"] = _pr
                             cf = camp_fin.setdefault(pid, {"id": pid, "nome": pname, "type": ptype,
-                                                           "n": 0, "voce_recebe": 0.0, "desconto": 0.0})
+                                                           "start_date": p.get("start_date"),
+                                                           "finish_date": p.get("finish_date"),
+                                                           "n": 0, "voce_recebe": 0.0, "desconto": 0.0,
+                                                           "itens": set()})
                             cf["n"] += 1
+                            cf["itens"].add(iid)
                             price = _npx(it.get("price"))
                             original = _npx(it.get("original_price"))
                             if price:
@@ -3344,21 +3350,36 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
         db.close()
     faltando = [iid for iid in ids if iid not in mlc or not mlc[iid].titulo]
     extra = (_ml_run(lambda ml: ml.obter_itens(
-        faltando, user.id, attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes"))
+        faltando, user.id,
+        attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes,"
+                   "available_quantity,shipping,health,catalog_listing,catalog_product_id"))
         if faltando else [])
     extra_map = {e["item_id"]: e for e in (extra or [])}
     # vendas reais (cache de pedidos, 30d) por item_id e por SKU
     from .models import MLPedidoItemCache
-    corte = datetime.utcnow() - timedelta(days=30)
+    if mes:
+        try:
+            ano_m, mes_m = int(mes[:4]), int(mes[5:7])
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="Parâmetro mes deve ser YYYY-MM.")
+        corte = datetime(ano_m, mes_m, 1)
+        fim_janela = datetime(ano_m + 1, 1, 1) if mes_m == 12 else datetime(ano_m, mes_m + 1, 1)
+        rotulo_janela = f"{mes_m:02d}/{ano_m}"
+    else:
+        corte = datetime.utcnow() - timedelta(days=dias)
+        fim_janela = None
+        rotulo_janela = f"{dias}d"
     vendas_por_item, vendas_por_sku = {}, {}
     if ids:
         db = SessionLocal()
         try:
-            rows = (db.query(MLPedidoItemCache)
-                    .filter(MLPedidoItemCache.user_id == user.id,
-                            MLPedidoItemCache.date_created >= corte,
-                            MLPedidoItemCache.status.notin_(["cancelled", "invalid"]))
-                    .all())
+            qq = (db.query(MLPedidoItemCache)
+                  .filter(MLPedidoItemCache.user_id == user.id,
+                          MLPedidoItemCache.date_created >= corte,
+                          MLPedidoItemCache.status.notin_(["cancelled", "invalid"])))
+            if fim_janela is not None:
+                qq = qq.filter(MLPedidoItemCache.date_created < fim_janela)
+            rows = qq.all()
         finally:
             db.close()
         for r in rows:
@@ -3383,25 +3404,94 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
                          "imagem": (m.imagem if m else None) or ex.get("imagem"),
                          "preco": (float(m.preco) if (m and m.preco) else ex.get("preco")),
                          "estoque": (m.estoque if (m and m.estoque is not None) else ex.get("estoque")),
+                         "logistic_type": (m.logistic_type if m else None) or ex.get("logistic_type"),
+                         "frete_gratis": ex.get("frete_gratis"),
+                         "catalogo": ex.get("catalogo"),
+                         "saude": (float(m.saude) if (m and m.saude is not None) else ex.get("health")),
+                         "listing_type": (m.listing_type_id if m else None),
+                         "permalink": (m.permalink if m else None),
                          "desconto_max_pct": v.get("desconto_max") or 0,
                          "preco_promo": v.get("preco_promo"),
                          "vendas_30d": _v30["un"], "receita_30d": round(_v30["receita"], 2),
                          "campanhas": v["campanhas"], "n": len(v["campanhas"])})
     produtos.sort(key=lambda x: x["n"], reverse=True)
+
+    # ---- Radar de eficiência: giro DURANTE a campanha × período ANTERIOR igual ----
+    if tem_pedidos and camp_fin:
+        agora = datetime.utcnow()
+        corte_lift = agora - timedelta(days=180)
+        db = SessionLocal()
+        try:
+            rows_all = (db.query(MLPedidoItemCache)
+                        .filter(MLPedidoItemCache.user_id == user.id,
+                                MLPedidoItemCache.date_created >= corte_lift,
+                                MLPedidoItemCache.status.notin_(["cancelled", "invalid"]))
+                        .all())
+        finally:
+            db.close()
+        por_item_datas = {}
+        for r in rows_all:
+            if r.item_id and r.date_created:
+                por_item_datas.setdefault(r.item_id, []).append((r.date_created, r.quantidade or 0))
+
+        def _pdt(x):
+            try:
+                return datetime.fromisoformat(str(x)[:19])
+            except (ValueError, TypeError):
+                return None
+
+        for cf in camp_fin.values():
+            ini = _pdt(cf.get("start_date"))
+            fim_c = _pdt(cf.get("finish_date"))
+            itens_c = cf.get("itens") or set()
+            if not ini or not itens_c or ini > agora:
+                cf["lift"] = None
+                continue
+            fim_efetivo = min(agora, fim_c) if fim_c else agora
+            dur = max(1, min((fim_efetivo - ini).days or 1, 60))
+            fim_dur = ini + timedelta(days=dur)
+            antes_ini = ini - timedelta(days=dur)
+            un_dur = un_antes = 0
+            for iid in itens_c:
+                for (dt, qtd) in por_item_datas.get(iid, []):
+                    if ini <= dt < fim_dur:
+                        un_dur += qtd
+                    elif antes_ini <= dt < ini:
+                        un_antes += qtd
+            if un_dur == 0 and un_antes == 0:
+                cf["lift"] = {"status": "sem_dados", "dur_dias": dur, "un_durante": 0, "un_antes": 0, "pct": None}
+            elif un_antes == 0:
+                cf["lift"] = {"status": "novo_giro", "pct": None, "un_durante": un_dur, "un_antes": 0, "dur_dias": dur}
+            else:
+                pct = round((un_dur / un_antes - 1) * 100, 1)
+                st = "acelerou" if pct >= 15 else ("revisar" if pct <= -15 else "neutra")
+                cf["lift"] = {"status": st, "pct": pct, "un_durante": un_dur, "un_antes": un_antes, "dur_dias": dur}
+    else:
+        for cf in camp_fin.values():
+            cf["lift"] = None
+
     campanhas = sorted(camp_fin.values(), key=lambda c: c["voce_recebe"], reverse=True)
     for c in campanhas:
         c["voce_recebe"] = round(c["voce_recebe"], 2)
         c["desconto"] = round(c["desconto"], 2)
+        c.pop("itens", None)
     totais = {"voce_recebe": round(sum(c["voce_recebe"] for c in campanhas), 2),
               "desconto": round(sum(c["desconto"] for c in campanhas), 2),
               "produtos": len(produtos), "campanhas": len(campanhas),
               "vendas_30d": sum(p["vendas_30d"] for p in produtos),
               "receita_30d": round(sum(p["receita_30d"] for p in produtos), 2),
-              "cache_pedidos": tem_pedidos}
+              "cache_pedidos": tem_pedidos,
+              "lift": {
+                  "aceleraram": sum(1 for c in campanhas if (c.get("lift") or {}).get("status") == "acelerou"),
+                  "neutras": sum(1 for c in campanhas if (c.get("lift") or {}).get("status") == "neutra"),
+                  "revisar": sum(1 for c in campanhas if (c.get("lift") or {}).get("status") == "revisar"),
+                  "novo_giro": sum(1 for c in campanhas if (c.get("lift") or {}).get("status") == "novo_giro"),
+              }}
     resultado = {"total_produtos": len(produtos), "promocoes_varridas": min(len(promos), 30),
                  "produtos": produtos, "campanhas": campanhas, "totais": totais,
+                 "janela": rotulo_janela,
                  "atualizado_em": datetime.utcnow().isoformat(), "cache": False}
-    _PART_CACHE[user.id] = {"ts": datetime.utcnow(), "data": resultado}
+    _PART_CACHE[chave] = {"ts": datetime.utcnow(), "data": resultado}
     return resultado
 
 
