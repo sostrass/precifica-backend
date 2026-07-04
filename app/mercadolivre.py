@@ -289,6 +289,30 @@ def _post(path, json=None, user_id=None, headers=None, params=None):
 
 
 # =========================================================================== #
+# Product Ads (Mercado Ads) — requer permissão Advertising + advertiser_id
+# =========================================================================== #
+
+def ads_advertisers(user_id=None):
+    """Lista os advertisers de Product Ads do usuário. 403/404 = Advertising não habilitado."""
+    return _req("GET", "/advertising/advertisers", user_id=user_id,
+                params={"product_id": "PADS"}, headers={"Api-Version": "1"})
+
+
+def ads_campanhas(advertiser_id, site_id, user_id=None, date_from=None, date_to=None,
+                  limit=50, offset=0):
+    """Campanhas de Product Ads com métricas (últimos dias)."""
+    metrics = ("clicks,prints,ctr,cost,cpc,acos,roas,cvr,total_amount,"
+               "organic_units_amount,direct_amount,indirect_amount")
+    params = {"limit": limit, "offset": offset, "metrics": metrics}
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    return _req("GET", f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search",
+                user_id=user_id, params=params, headers={"api-version": "2"})
+
+
+# =========================================================================== #
 # Domínio A — Conta
 # =========================================================================== #
 def conta(user_id=None) -> dict:

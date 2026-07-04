@@ -3180,16 +3180,31 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
     db = SessionLocal()
     try:
         mi = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.item_id == item_id).first()
-        titulo = mi.titulo if mi else item_id
+        titulo = mi.titulo if mi else None
         sku = mi.sku if mi else None
         preco_cat = float(mi.preco) if (mi and mi.preco) else None
         imagem = mi.imagem if mi else None
-        prod = (db.query(ProdutoCache).filter(ProdutoCache.user_id == user.id, ProdutoCache.sku == sku).first()
-                if sku else None)
-        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
-        custo = float(prod.custo) if (prod and prod.custo and prod.custo > 0) else None
     finally:
         db.close()
+    if not titulo or not imagem or not sku:  # não está no cache → busca no ML
+        fetched = _ml_run(lambda ml: ml.obter_itens(
+            [item_id], user.id, attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes")) or []
+        if fetched:
+            f = fetched[0]
+            titulo = titulo or f.get("titulo")
+            sku = sku or f.get("sku")
+            preco_cat = preco_cat if preco_cat is not None else f.get("preco")
+            imagem = imagem or f.get("imagem")
+    titulo = titulo or item_id
+    preco_bling = custo = None
+    if sku:
+        db = SessionLocal()
+        try:
+            prod = db.query(ProdutoCache).filter(ProdutoCache.user_id == user.id, ProdutoCache.sku == sku).first()
+            preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+            custo = float(prod.custo) if (prod and prod.custo and prod.custo > 0) else None
+        finally:
+            db.close()
     cfg = precificacao.obter_config(user.id)
     piso = precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling) if preco_bling is not None else None
 
@@ -3220,6 +3235,7 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
                 "deadline_date": info.get("deadline"), "preco_final": price, "original": original,
                 "desconto_pct": desc, "meli_percentage": _npx(pr.get("meli_percentage")),
                 "seller_percentage": _npx(pr.get("seller_percentage")), "voce_recebe": liq, "piso": piso,
+                "offer_id": pr.get("offer_id") or pr.get("candidate_id"),
                 "acima_piso": (piso is None or (price is not None and price >= piso)),
             })
         out.sort(key=lambda x: (x["status"] or "").lower() not in ("active", "started", "enabled"))
@@ -3232,13 +3248,23 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
             "promocoes": proms}
 
 
+_PART_CACHE = {}
+_PART_TTL = 300  # 5 min
+
+
 @app.get("/api/mercadolivre/promocoes/participantes")
-def ml_promo_participantes(user: User = Depends(auth.get_current_user)):
+def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(auth.get_current_user)):
     """Produtos que estão participando de campanhas, agrupados — com os títulos das campanhas de cada um.
-    Varre as promoções (com teto) e coleta os itens ativos. Operação sob demanda (pode demorar)."""
+    Varre as promoções (com teto) e coleta os itens ativos. Cacheado 5 min (forcar=true refaz)."""
+    ent = _PART_CACHE.get(user.id)
+    if ent and not forcar and (datetime.utcnow() - ent["ts"]).total_seconds() < _PART_TTL:
+        d = dict(ent["data"]); d["cache"] = True; d["atualizado_em"] = ent["ts"].isoformat()
+        return d
     painel = _ml_run(lambda ml: ml.painel_promocoes(user.id)) or {}
     promos = (painel.get("convites") or []) + (painel.get("minhas") or [])
     prod_map = {}
+    cfg = precificacao.obter_config(user.id)
+    camp_fin = {}
 
     def _run(ml):
         for p in promos[:30]:
@@ -3257,6 +3283,17 @@ def ml_promo_participantes(user: User = Depends(auth.get_current_user)):
                             if pid not in e["ids"]:
                                 e["ids"].add(pid)
                                 e["campanhas"].append({"id": pid, "nome": pname, "type": ptype})
+                            cf = camp_fin.setdefault(pid, {"id": pid, "nome": pname, "type": ptype,
+                                                           "n": 0, "voce_recebe": 0.0, "desconto": 0.0})
+                            cf["n"] += 1
+                            price = _npx(it.get("price"))
+                            original = _npx(it.get("original_price"))
+                            if price:
+                                liq = (precificacao.margem_real_canal(cfg, "mercadolivre", price, None) or {}).get("liquido")
+                                if liq:
+                                    cf["voce_recebe"] += liq
+                            if price and original and original > price:
+                                cf["desconto"] += (original - price)
                 paging = (raw.get("paging") if isinstance(raw, dict) else {}) or {}
                 sa = paging.get("searchAfter") or paging.get("search_after")
                 if not sa or len(lst) < 50:
@@ -3272,14 +3309,88 @@ def ml_promo_participantes(user: User = Depends(auth.get_current_user)):
                 MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
     finally:
         db.close()
+    faltando = [iid for iid in ids if iid not in mlc or not mlc[iid].titulo]
+    extra = (_ml_run(lambda ml: ml.obter_itens(
+        faltando, user.id, attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes"))
+        if faltando else [])
+    extra_map = {e["item_id"]: e for e in (extra or [])}
     produtos = []
     for iid, v in prod_map.items():
         m = mlc.get(iid)
-        produtos.append({"item_id": iid, "titulo": (m.titulo if m else None) or iid, "sku": (m.sku if m else None),
-                         "imagem": (m.imagem if m else None), "preco": float(m.preco) if (m and m.preco) else None,
+        ex = extra_map.get(iid, {})
+        produtos.append({"item_id": iid,
+                         "titulo": (m.titulo if m else None) or ex.get("titulo") or iid,
+                         "sku": (m.sku if m else None) or ex.get("sku"),
+                         "imagem": (m.imagem if m else None) or ex.get("imagem"),
+                         "preco": (float(m.preco) if (m and m.preco) else ex.get("preco")),
                          "campanhas": v["campanhas"], "n": len(v["campanhas"])})
     produtos.sort(key=lambda x: x["n"], reverse=True)
-    return {"total_produtos": len(produtos), "promocoes_varridas": min(len(promos), 30), "produtos": produtos}
+    campanhas = sorted(camp_fin.values(), key=lambda c: c["voce_recebe"], reverse=True)
+    for c in campanhas:
+        c["voce_recebe"] = round(c["voce_recebe"], 2)
+        c["desconto"] = round(c["desconto"], 2)
+    totais = {"voce_recebe": round(sum(c["voce_recebe"] for c in campanhas), 2),
+              "desconto": round(sum(c["desconto"] for c in campanhas), 2),
+              "produtos": len(produtos), "campanhas": len(campanhas)}
+    resultado = {"total_produtos": len(produtos), "promocoes_varridas": min(len(promos), 30),
+                 "produtos": produtos, "campanhas": campanhas, "totais": totais,
+                 "atualizado_em": datetime.utcnow().isoformat(), "cache": False}
+    _PART_CACHE[user.id] = {"ts": datetime.utcnow(), "data": resultado}
+    return resultado
+
+
+@app.get("/api/mercadolivre/ads/painel")
+def ml_ads_painel(dias: int = Query(30), user: User = Depends(auth.get_current_user)):
+    """Product Ads real: verifica se o Advertising está habilitado; se sim, traz campanhas + métricas.
+    Sem dados fabricados — 403/404 vira estado 'não habilitado'."""
+    from . import mercadolivre as ml
+    try:
+        adv = ml.ads_advertisers(user.id)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=f"Mercado Livre não conectado: {e}")
+    except ml.MLErro as e:
+        return {"habilitado": False,
+                "motivo": "Product Ads (permissão Advertising) não está habilitado nesta conta.",
+                "detalhe": str(e)[:200]}
+    lista = (adv.get("advertisers") if isinstance(adv, dict) else adv) or []
+    if not lista:
+        return {"habilitado": False, "motivo": "Nenhum advertiser de Product Ads encontrado nesta conta."}
+    a0 = lista[0]
+    advertiser_id = a0.get("advertiser_id") or a0.get("id")
+    site_id = a0.get("site_id") or "MLB"
+    conta = a0.get("account_name") or a0.get("nickname")
+    df = (datetime.utcnow() - timedelta(days=dias)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        camp = ml.ads_campanhas(advertiser_id, site_id, user.id, date_from=df, date_to=dt)
+    except ml.MLErro as e:
+        return {"habilitado": True, "advertiser_id": advertiser_id, "site_id": site_id, "conta": conta,
+                "erro_campanhas": str(e)[:200], "campanhas": [], "totais": {}}
+    results = (camp.get("results") if isinstance(camp, dict) else camp) or []
+    campanhas = []
+    tot = {"cost": 0.0, "amount": 0.0, "clicks": 0, "prints": 0}
+    for c in results:
+        mtr = c.get("metrics") or {}
+        campanhas.append({
+            "id": c.get("id") or c.get("campaign_id"), "nome": c.get("name"),
+            "status": c.get("status"), "budget": _npx(c.get("budget")),
+            "acos_target": _npx(c.get("acos_target")), "strategy": c.get("strategy"),
+            "clicks": mtr.get("clicks"), "prints": mtr.get("prints"), "ctr": _npx(mtr.get("ctr")),
+            "cost": _npx(mtr.get("cost")), "cpc": _npx(mtr.get("cpc")), "acos": _npx(mtr.get("acos")),
+            "roas": _npx(mtr.get("roas")), "cvr": _npx(mtr.get("cvr")),
+            "gmv": _npx(mtr.get("total_amount")),
+        })
+        tot["cost"] += mtr.get("cost") or 0
+        tot["amount"] += mtr.get("total_amount") or 0
+        tot["clicks"] += mtr.get("clicks") or 0
+        tot["prints"] += mtr.get("prints") or 0
+    campanhas.sort(key=lambda x: x.get("cost") or 0, reverse=True)
+    roas = round(tot["amount"] / tot["cost"], 2) if tot["cost"] else None
+    acos = round(tot["cost"] / tot["amount"] * 100, 1) if tot["amount"] else None
+    return {"habilitado": True, "advertiser_id": advertiser_id, "site_id": site_id, "conta": conta,
+            "periodo_dias": dias, "campanhas": campanhas,
+            "totais": {"gasto": round(tot["cost"], 2), "gmv": round(tot["amount"], 2),
+                       "clicks": tot["clicks"], "prints": tot["prints"], "roas": roas, "acos": acos}}
 
 
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/metricas")
