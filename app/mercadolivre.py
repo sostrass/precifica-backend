@@ -956,6 +956,11 @@ def _classifica_promocoes(results: list) -> dict:
             "status": p.get("status"), "name": p.get("name"),
             "start_date": p.get("start_date"), "finish_date": p.get("finish_date"),
             "deadline_date": p.get("deadline_date"), "benefits": p.get("benefits"),
+            "budget": p.get("budget"), "remaining_budget": p.get("remaining_budget"),
+            "used": p.get("used") if p.get("used") is not None else p.get("used_coupons"),
+            "fixed_amount": p.get("fixed_amount"), "fixed_percentage": p.get("fixed_percentage"),
+            "min_purchase_amount": p.get("min_purchase_amount"),
+            "max_purchase_amount": p.get("max_purchase_amount"),
         }
         (minhas if p.get("type") in PROMO_CRIA else convites).append(item)
     ativas = sum(1 for m in minhas if (m.get("status") or "") in ("started", "active"))

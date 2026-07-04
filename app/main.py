@@ -123,6 +123,24 @@ async def _agendador_promo():
                     await loop.run_in_executor(None, shopee_promo_auto.snapshot_vendas, uid)
             for uid in autos:  # auto_ciclo respeita o intervalo internamente
                 await loop.run_in_executor(None, shopee_promo_auto.auto_ciclo, uid)
+            # --- Agentes do Mercado Livre em modo automático (piso-safe, teto, respeita intervalo) ---
+            try:
+                from .models import AgenteConfig
+                db = SessionLocal()
+                try:
+                    pend = db.query(AgenteConfig).filter(
+                        AgenteConfig.automatico.is_(True), AgenteConfig.kill_switch.is_(False)).all()
+                    agora_ml = datetime.utcnow()
+                    alvos_ml = [c.user_id for c in pend
+                                if (c.ultima_execucao_auto is None
+                                    or (agora_ml - c.ultima_execucao_auto).total_seconds()
+                                    >= (c.intervalo_horas or 6) * 3600)]
+                finally:
+                    db.close()
+                for uid in alvos_ml:
+                    await loop.run_in_executor(None, _rodar_agentes, uid, "auto")
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001 — nunca derruba o app
             pass
         ticks += 1
@@ -3228,6 +3246,14 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
             if price:
                 liq = (precificacao.margem_real_canal(cfg, "mercadolivre", price, custo) or {}).get("liquido")
             info = nomes.get(pid, {})
+            # offer_id: LIGHTNING/SMART/etc. exigem o candidato. O ML o entrega em offers[]/candidate/ref_id.
+            offer_id = pr.get("offer_id") or pr.get("candidate_id") or pr.get("ref_id")
+            offers = pr.get("offers") or []
+            if not offer_id and offers:
+                cand = next((o for o in offers
+                             if (o.get("status") or "").lower() in ("candidate", "available", "started", "pending")),
+                            offers[0])
+                offer_id = cand.get("id") or cand.get("offer_id")
             out.append({
                 "id": pid, "nome": info.get("nome") or pr.get("name") or pr.get("type"), "type": pr.get("type"),
                 "sub_type": pr.get("sub_type"), "status": pr.get("status"),
@@ -3235,7 +3261,7 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
                 "deadline_date": info.get("deadline"), "preco_final": price, "original": original,
                 "desconto_pct": desc, "meli_percentage": _npx(pr.get("meli_percentage")),
                 "seller_percentage": _npx(pr.get("seller_percentage")), "voce_recebe": liq, "piso": piso,
-                "offer_id": pr.get("offer_id") or pr.get("candidate_id"),
+                "offer_id": offer_id,
                 "acima_piso": (piso is None or (price is not None and price >= piso)),
             })
         out.sort(key=lambda x: (x["status"] or "").lower() not in ("active", "started", "enabled"))
@@ -3271,6 +3297,34 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
             "preco": preco_cat, "preco_bling": preco_bling, "piso": piso,
             "participando": sum(1 for p in proms if (p.get("status") or "").lower() in ("active", "started", "enabled")),
             "promocoes": proms}
+
+
+@app.get("/api/mercadolivre/promocoes/item/{item_id}/offer")
+def ml_item_offer(item_id: str, promotion_id: str = Query(...), promotion_type: str = Query(...),
+                  user: User = Depends(auth.get_current_user)):
+    """Resolve o offer_id (candidato) de UM item numa promoção — para tipos que exigem offer_id na adesão."""
+    def _run(ml):
+        sa = None
+        for _ in range(8):
+            raw = ml.itens_promocao(promotion_id, promotion_type, user_id=user.id, limit=50, search_after=sa) or {}
+            lst = (raw.get("results") if isinstance(raw, dict) else raw) or []
+            for it in lst:
+                iid = it.get("id") or it.get("item_id")
+                if iid == item_id:
+                    off = it.get("offer_id") or it.get("candidate_id") or it.get("ref_id")
+                    offers = it.get("offers") or []
+                    if not off and offers:
+                        cand = next((o for o in offers
+                                     if (o.get("status") or "").lower()
+                                     in ("candidate", "available", "started", "pending")), offers[0])
+                        off = cand.get("id") or cand.get("offer_id")
+                    return {"offer_id": off, "found": True}
+            paging = (raw.get("paging") if isinstance(raw, dict) else {}) or {}
+            sa = paging.get("searchAfter") or paging.get("search_after")
+            if not sa or len(lst) < 50:
+                break
+        return {"offer_id": None, "found": False}
+    return _ml_run(lambda ml: _run(ml))
 
 
 _PART_CACHE = {}
@@ -3576,7 +3630,19 @@ def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(..
     try:
         mlc = ({m.item_id: m for m in db.query(MLItemCache).filter(
                 MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
-        skus = [m.sku for m in mlc.values() if m.sku]
+    finally:
+        db.close()
+    faltando = [i for i in ids if i not in mlc or not mlc[i].titulo]
+    extra_map = {}
+    if faltando:
+        extra = _ml_run(lambda ml: ml.obter_itens(
+            faltando[:50], user.id,
+            attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes,"
+                       "available_quantity,shipping,health,catalog_listing,catalog_product_id")) or []
+        extra_map = {e["item_id"]: e for e in extra}
+    skus = [m.sku for m in mlc.values() if m.sku] + [e.get("sku") for e in extra_map.values() if e.get("sku")]
+    db = SessionLocal()
+    try:
         prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
                   ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
     finally:
@@ -3585,7 +3651,9 @@ def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(..
     det = []
     for b in base:
         m = mlc.get(b["item_id"])
-        prod = prods.get(m.sku) if (m and m.sku) else None
+        ex = extra_map.get(b["item_id"], {})
+        sku_i = (m.sku if m else None) or ex.get("sku")
+        prod = prods.get(sku_i) if sku_i else None
         preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
         custo = float(prod.custo) if (prod and prod.custo and prod.custo > 0) else None
         piso = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
@@ -3601,11 +3669,21 @@ def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(..
         oport = (b["suggested"] is not None and price is not None and b["suggested"] < price - 0.005
                  and (piso is None or b["suggested"] >= piso))
         det.append({
-            "item_id": b["item_id"], "titulo": (m.titulo if m else None), "sku": (m.sku if m else None),
-            "imagem": (m.imagem if m else None), "price": price, "original_price": orig, "desconto_pct": desc,
+            "item_id": b["item_id"],
+            "titulo": (m.titulo if m else None) or ex.get("titulo"),
+            "sku": sku_i,
+            "imagem": (m.imagem if m else None) or ex.get("imagem"),
+            "preco_catalogo": (float(m.preco) if (m and m.preco) else ex.get("preco")),
+            "logistic_type": (m.logistic_type if m else None) or ex.get("logistic_type"),
+            "frete_gratis": ex.get("frete_gratis"),
+            "catalogo": ex.get("catalogo"),
+            "saude_item": (float(m.saude) if (m and m.saude is not None) else ex.get("health")),
+            "em_promocao": bool(m.em_promocao) if m else None,
+            "price": price, "original_price": orig, "desconto_pct": desc,
             "liquido": liquido, "custo": custo, "lucro": lucro, "margem_pct": margem,
             "preco_bling": preco_bling, "abaixo_piso": bool(abaixo), "suggested": b["suggested"],
-            "oportunidade": bool(oport), "estoque": estoque, "status": b["status"],
+            "oportunidade": bool(oport), "estoque": (estoque if estoque is not None else ex.get("estoque")),
+            "status": b["status"],
         })
 
     def _avg(xs):
@@ -4033,8 +4111,7 @@ def ml_buybox_ajustar(payload: dict = Body(...), user: User = Depends(auth.get_c
     return _ml_run(lambda ml: ml.atualizar_preco(iid, float(preco), user.id))
 
 
-@app.get("/api/mercadolivre/agentes/sugestoes")
-def ml_agentes_sugestoes(limit: int = Query(40, ge=1, le=120), user: User = Depends(auth.get_current_user)):
+def _gerar_sugestoes(user_id, limit=40):
     """Motor de sugestões dos agentes (modo sugestivo): analisa catálogo + cache de pedidos + margem e
     devolve ações recomendadas por item (uma por item, a de maior prioridade), sempre acima do piso."""
     from .models import MLItemCache, MLPedidoItemCache, ProdutoCache
@@ -4043,18 +4120,18 @@ def ml_agentes_sugestoes(limit: int = Query(40, ge=1, le=120), user: User = Depe
     j30, j60 = agora - timedelta(days=30), agora - timedelta(days=60)
     db = SessionLocal()
     try:
-        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.status == "active").all()
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user_id, MLItemCache.status == "active").all()
         skus = [i.sku for i in itens if i.sku]
         prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
-                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+                  ProdutoCache.user_id == user_id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
         rows = db.query(MLPedidoItemCache.item_id, MLPedidoItemCache.quantidade,
                         MLPedidoItemCache.date_created, MLPedidoItemCache.status).filter(
-            MLPedidoItemCache.user_id == user.id, MLPedidoItemCache.date_created >= j60,
+            MLPedidoItemCache.user_id == user_id, MLPedidoItemCache.date_created >= j60,
             MLPedidoItemCache.item_id.isnot(None)).all()
         ultima = dict(db.query(MLPedidoItemCache.item_id, func.max(MLPedidoItemCache.date_created)).filter(
-            MLPedidoItemCache.user_id == user.id, MLPedidoItemCache.item_id.isnot(None))
+            MLPedidoItemCache.user_id == user_id, MLPedidoItemCache.item_id.isnot(None))
             .group_by(MLPedidoItemCache.item_id).all())
-        tem_cache = db.query(MLPedidoItemCache).filter(MLPedidoItemCache.user_id == user.id).first() is not None
+        tem_cache = db.query(MLPedidoItemCache).filter(MLPedidoItemCache.user_id == user_id).first() is not None
     finally:
         db.close()
     recente, anterior = {}, {}
@@ -4063,7 +4140,7 @@ def ml_agentes_sugestoes(limit: int = Query(40, ge=1, le=120), user: User = Depe
             continue
         alvo = recente if dt >= j30 else anterior
         alvo[iid] = alvo.get(iid, 0) + (qty or 0)
-    cfg = precificacao.obter_config(user.id)
+    cfg = precificacao.obter_config(user_id)
     sugs = []
     for it in itens:
         prod = prods.get(it.sku) if it.sku else None
@@ -4124,6 +4201,178 @@ def ml_agentes_sugestoes(limit: int = Query(40, ge=1, le=120), user: User = Depe
                       "n_margem": por_agente.get("margem", 0), "n_estoque_baixo": por_agente.get("estoque_baixo", 0)}
     return {"cache_vazio": not tem_cache, "total": len(sugs), "por_agente": por_agente,
             "resumo_impacto": resumo_impacto, "sugestoes": sugs[:limit]}
+
+
+@app.get("/api/mercadolivre/agentes/sugestoes")
+def ml_agentes_sugestoes(limit: int = Query(40, ge=1, le=120), user: User = Depends(auth.get_current_user)):
+    return _gerar_sugestoes(user.id, limit)
+
+
+def _rodar_agentes(user_id, gatilho="manual"):
+    """Executa os agentes: aplica as sugestões SEGURAS (piso-safe) dos agentes ligados, com teto. Loga tudo."""
+    from . import mercadolivre as ml
+    from .models import AgenteConfig, AgenteExecucao
+    db = SessionLocal()
+    try:
+        cfg = db.query(AgenteConfig).filter(AgenteConfig.user_id == user_id).first()
+        if cfg and cfg.kill_switch:
+            return {"aplicados": 0, "ignorados": 0, "falhas": 0, "candidatos": 0,
+                    "bloqueado": "kill_switch", "detalhe": []}
+        ligados = cfg.agentes if (cfg and cfg.agentes) else None
+        teto = (cfg.max_por_execucao if (cfg and cfg.max_por_execucao) else 15)
+        teto_desc = (cfg.teto_desconto_pct if cfg else None)
+        if cfg and gatilho == "auto":  # marca cedo p/ evitar corrida entre workers
+            cfg.ultima_execucao_auto = datetime.utcnow()
+            db.add(cfg); db.commit()
+    finally:
+        db.close()
+
+    dados = _gerar_sugestoes(user_id, limit=250)
+    sugs = dados.get("sugestoes") or []
+
+    def _ativo(k):
+        return ligados is None or ligados.get(k) is not False
+
+    aplicaveis = [s for s in sugs if s.get("deal_price_sugerido") is not None and _ativo(s.get("agente"))][:teto]
+    aplicados = falhas = ignorados = 0
+    detalhe = []
+    fim_iso = (datetime.utcnow() + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59.000-03:00")
+    for s in aplicaveis:
+        preco = s["deal_price_sugerido"]
+        piso = s.get("piso")
+        # teto de desconto: nunca aplica mais que o limite configurado (mas nunca abaixo do piso)
+        if teto_desc and s.get("preco") and s.get("desconto_pct") and s["desconto_pct"] > teto_desc:
+            preco_teto = round(s["preco"] * (1 - teto_desc / 100), 2)
+            preco = max(preco, preco_teto)
+            if piso is not None:
+                preco = max(preco, round(piso, 2))
+        base = {"item_id": s["item_id"], "titulo": s.get("titulo"), "agente": s.get("agente"),
+                "desconto_pct": (round((1 - preco / s["preco"]) * 100, 1) if s.get("preco") else s.get("desconto_pct")),
+                "preco": preco, "de": s.get("preco")}
+        if piso is not None and preco < piso - 0.005:
+            ignorados += 1
+            detalhe.append({**base, "status": "ignorado_piso"})
+            continue
+        try:
+            ml.criar_desconto_item(s["item_id"], preco, None, fim_iso, None, user_id)
+            aplicados += 1
+            detalhe.append({**base, "status": "aplicado"})
+        except Exception as e:  # noqa: BLE001
+            falhas += 1
+            detalhe.append({**base, "status": "erro", "msg": str(e)[:120]})
+
+    db = SessionLocal()
+    try:
+        db.add(AgenteExecucao(user_id=user_id, gatilho=gatilho, aplicados=aplicados,
+                              ignorados=ignorados, falhas=falhas, detalhe=detalhe[:60]))
+        db.commit()
+    finally:
+        db.close()
+    return {"aplicados": aplicados, "ignorados": ignorados, "falhas": falhas,
+            "candidatos": len(aplicaveis), "cache_vazio": dados.get("cache_vazio"), "detalhe": detalhe}
+
+
+@app.post("/api/mercadolivre/agentes/rodar")
+def ml_agentes_rodar(user: User = Depends(auth.get_current_user)):
+    return _rodar_agentes(user.id, gatilho="manual")
+
+
+@app.get("/api/mercadolivre/agentes/config")
+def ml_agentes_config_get(user: User = Depends(auth.get_current_user)):
+    from .models import AgenteConfig, AgenteExecucao
+    db = SessionLocal()
+    try:
+        c = db.query(AgenteConfig).filter(AgenteConfig.user_id == user.id).first()
+        ult = (db.query(AgenteExecucao).filter(AgenteExecucao.user_id == user.id)
+               .order_by(AgenteExecucao.quando.desc()).first())
+        base = {"automatico": False, "kill_switch": False, "agentes": None, "max_por_execucao": 15,
+                "teto_desconto_pct": None, "intervalo_horas": 6, "ultima_execucao_auto": None}
+        if c:
+            base = {"automatico": c.automatico, "kill_switch": c.kill_switch, "agentes": c.agentes,
+                    "max_por_execucao": c.max_por_execucao, "teto_desconto_pct": c.teto_desconto_pct,
+                    "intervalo_horas": c.intervalo_horas,
+                    "ultima_execucao_auto": c.ultima_execucao_auto.isoformat() if c.ultima_execucao_auto else None}
+        base["ultima_execucao"] = ult.quando.isoformat() if (ult and ult.quando) else None
+        return base
+    finally:
+        db.close()
+
+
+@app.put("/api/mercadolivre/agentes/config")
+def ml_agentes_config_put(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    from .models import AgenteConfig
+    db = SessionLocal()
+    try:
+        c = db.query(AgenteConfig).filter(AgenteConfig.user_id == user.id).first()
+        if not c:
+            c = AgenteConfig(user_id=user.id); db.add(c)
+        if "automatico" in payload:
+            c.automatico = bool(payload["automatico"])
+        if "kill_switch" in payload:
+            c.kill_switch = bool(payload["kill_switch"])
+        if "agentes" in payload:
+            c.agentes = payload["agentes"]
+        if "max_por_execucao" in payload:
+            c.max_por_execucao = max(1, min(int(payload["max_por_execucao"]), 100))
+        if "teto_desconto_pct" in payload:
+            v = payload["teto_desconto_pct"]
+            c.teto_desconto_pct = None if v in (None, "", 0) else max(1, min(int(v), 70))
+        if "intervalo_horas" in payload:
+            c.intervalo_horas = max(1, min(int(payload["intervalo_horas"]), 168))
+        c.atualizado_em = datetime.utcnow()
+        db.commit()
+        return {"ok": True, "automatico": c.automatico, "kill_switch": c.kill_switch}
+    finally:
+        db.close()
+
+
+@app.get("/api/mercadolivre/agentes/resumo-semana")
+def ml_agentes_resumo_semana(dias: int = Query(7, ge=1, le=90), user: User = Depends(auth.get_current_user)):
+    """Resumo do que a automação fez na janela: total aplicado, por agente, por dia e por gatilho."""
+    from .models import AgenteExecucao
+    corte = datetime.utcnow() - timedelta(days=dias)
+    db = SessionLocal()
+    try:
+        rows = (db.query(AgenteExecucao)
+                .filter(AgenteExecucao.user_id == user.id, AgenteExecucao.quando >= corte)
+                .order_by(AgenteExecucao.quando.desc()).all())
+    finally:
+        db.close()
+    tot_aplic = sum(r.aplicados or 0 for r in rows)
+    tot_ign = sum(r.ignorados or 0 for r in rows)
+    tot_falha = sum(r.falhas or 0 for r in rows)
+    por_agente, por_dia = {}, {}
+    autos = manuais = 0
+    for r in rows:
+        if (r.gatilho or "") == "auto":
+            autos += r.aplicados or 0
+        else:
+            manuais += r.aplicados or 0
+        dia = r.quando.strftime("%Y-%m-%d") if r.quando else "?"
+        por_dia[dia] = por_dia.get(dia, 0) + (r.aplicados or 0)
+        for d in (r.detalhe or []):
+            if d.get("status") == "aplicado":
+                ag = d.get("agente") or "outro"
+                e = por_agente.setdefault(ag, {"itens": 0})
+                e["itens"] += 1
+    serie = [{"dia": k, "aplicados": por_dia[k]} for k in sorted(por_dia.keys())]
+    return {"dias": dias, "execucoes": len(rows), "aplicados": tot_aplic, "ignorados_piso": tot_ign,
+            "falhas": tot_falha, "por_gatilho": {"auto": autos, "manual": manuais},
+            "por_agente": por_agente, "serie": serie}
+
+
+@app.get("/api/mercadolivre/agentes/execucoes")
+def ml_agentes_execucoes(limit: int = Query(10, ge=1, le=50), user: User = Depends(auth.get_current_user)):
+    from .models import AgenteExecucao
+    db = SessionLocal()
+    try:
+        rows = (db.query(AgenteExecucao).filter(AgenteExecucao.user_id == user.id)
+                .order_by(AgenteExecucao.quando.desc()).limit(limit).all())
+        return {"execucoes": [{"quando": r.quando.isoformat() if r.quando else None, "gatilho": r.gatilho,
+                               "aplicados": r.aplicados, "ignorados": r.ignorados, "falhas": r.falhas,
+                               "detalhe": r.detalhe or []} for r in rows]}
+    finally:
+        db.close()
 
 
 @app.get("/api/mercadolivre/promocoes")

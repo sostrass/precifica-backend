@@ -665,3 +665,35 @@ class MLPedidoItemCache(Base):
     date_created = Column(DateTime, nullable=True, index=True)
 
     __table_args__ = (UniqueConstraint("user_id", "order_id", "item_id", name="uq_mlpeditem_user_order_item"),)
+
+
+class AgenteConfig(Base):
+    """Configuração de automação dos agentes por usuário (modo automático, agentes ligados, teto)."""
+
+    __tablename__ = "agente_config"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    automatico = Column(Boolean, default=False)          # roda sozinho no agendador
+    kill_switch = Column(Boolean, default=False)         # trava tudo (nada é aplicado)
+    agentes = Column(JSON, nullable=True)                # {"margem": true, "giro": true, ...}
+    max_por_execucao = Column(Integer, default=15)       # teto de aplicações por rodada
+    teto_desconto_pct = Column(Integer, nullable=True)   # desconto máximo que a automação aplica (None = sem teto)
+    intervalo_horas = Column(Integer, default=6)         # de quantas em quantas horas
+    ultima_execucao_auto = Column(DateTime, nullable=True)
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+
+class AgenteExecucao(Base):
+    """Log de cada rodada dos agentes (manual ou automática)."""
+
+    __tablename__ = "agente_execucao"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    quando = Column(DateTime, default=datetime.utcnow, index=True)
+    gatilho = Column(String, nullable=True)              # manual | auto
+    aplicados = Column(Integer, default=0)
+    ignorados = Column(Integer, default=0)
+    falhas = Column(Integer, default=0)
+    detalhe = Column(JSON, nullable=True)                # [{item_id, titulo, agente, desconto_pct, preco, status}]

@@ -76,6 +76,9 @@ def garantir_colunas_extras():
             ("imagem", "VARCHAR"),
             ("marketplaces", "JSON"),
         ],
+        "agente_config": [
+            ("teto_desconto_pct", "INTEGER"),
+        ],
     }
     try:
         with engine.begin() as conn:
