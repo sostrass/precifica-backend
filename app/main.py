@@ -3279,10 +3279,18 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
                     if (it.get("status") or "").lower() in ("active", "started", "enabled"):
                         iid = it.get("id") or it.get("item_id")
                         if iid:
-                            e = prod_map.setdefault(iid, {"campanhas": [], "ids": set()})
+                            e = prod_map.setdefault(iid, {"campanhas": [], "ids": set(),
+                                                          "desconto_max": 0.0, "preco_promo": None})
                             if pid not in e["ids"]:
                                 e["ids"].add(pid)
                                 e["campanhas"].append({"id": pid, "nome": pname, "type": ptype})
+                            _pr = _npx(it.get("price"))
+                            _og = _npx(it.get("original_price"))
+                            if _pr and _og and _og > _pr:
+                                _d = round((1 - _pr / _og) * 100, 1)
+                                if _d > e["desconto_max"]:
+                                    e["desconto_max"] = _d
+                                    e["preco_promo"] = _pr
                             cf = camp_fin.setdefault(pid, {"id": pid, "nome": pname, "type": ptype,
                                                            "n": 0, "voce_recebe": 0.0, "desconto": 0.0})
                             cf["n"] += 1
@@ -3323,6 +3331,9 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
                          "sku": (m.sku if m else None) or ex.get("sku"),
                          "imagem": (m.imagem if m else None) or ex.get("imagem"),
                          "preco": (float(m.preco) if (m and m.preco) else ex.get("preco")),
+                         "estoque": (m.estoque if (m and m.estoque is not None) else ex.get("estoque")),
+                         "desconto_max_pct": v.get("desconto_max") or 0,
+                         "preco_promo": v.get("preco_promo"),
                          "campanhas": v["campanhas"], "n": len(v["campanhas"])})
     produtos.sort(key=lambda x: x["n"], reverse=True)
     campanhas = sorted(camp_fin.values(), key=lambda c: c["voce_recebe"], reverse=True)
@@ -3802,7 +3813,7 @@ def ml_buybox(limit: int = Query(20, ge=1, le=40), offset: int = Query(0),
         page_ids = ids_ativos[offset:offset + limit]
         det = (_ml_run(lambda ml: ml.obter_itens(
             page_ids, user.id,
-            attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes,available_quantity"))
+            attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes,available_quantity,catalog_listing,catalog_product_id"))
             if page_ids else [])
         itens = [SimpleNamespace(item_id=d.get("item_id"), sku=d.get("sku"), preco=d.get("preco"),
                                  titulo=d.get("titulo"), imagem=d.get("imagem"), estoque=d.get("estoque"))
@@ -3818,12 +3829,14 @@ def ml_buybox(limit: int = Query(20, ge=1, le=40), offset: int = Query(0),
 
     def _run(ml):
         out = []
-        resumo = {"ganhando": 0, "perdendo": 0, "compartilhando": 0, "fora": 0, "recuperavel": 0}
+        resumo = {"ganhando": 0, "perdendo": 0, "compartilhando": 0, "fora": 0,
+                  "sem_catalogo": 0, "recuperavel": 0}
         for it in itens:
             try:
                 ptw = ml.preco_para_ganhar(it.item_id, user.id) or {}
             except Exception:  # noqa: BLE001
-                resumo["fora"] += 1
+                # price_to_win só existe para anúncios de CATÁLOGO — comuns caem aqui
+                resumo["sem_catalogo"] += 1
                 continue
             status_ml = (ptw.get("status") or "").lower()
             p2w = _npx(ptw.get("price_to_win"))

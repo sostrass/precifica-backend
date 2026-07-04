@@ -370,6 +370,7 @@ def _norm_item(it: dict) -> dict:
         "health": it.get("health"),
         "variacoes": it.get("variations") or [],
         "imagem": (fotos[0].get("secure_url") if fotos else it.get("thumbnail")),
+        "catalogo": bool(it.get("catalog_listing")) or bool(it.get("catalog_product_id")),
     }
 
 
