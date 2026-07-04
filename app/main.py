@@ -3033,6 +3033,9 @@ def _itens_convite_enriquecidos(user_id, promotion_id, promotion_type):
         base.append({
             "item_id": iid,
             "original_price": _npx(it.get("original_price")) or _npx(it.get("price")),
+            "price": _npx(it.get("price")),
+            "meli_percentage": _npx(it.get("meli_percentage")),
+            "seller_percentage": _npx(it.get("seller_percentage")),
             "min_discounted_price": _npx(it.get("min_discounted_price")),
             "max_discounted_price": _npx(it.get("max_discounted_price")),
             "suggested_discounted_price": _npx(it.get("suggested_discounted_price")),
@@ -3086,6 +3089,7 @@ def _itens_convite_enriquecidos(user_id, promotion_id, promotion_type):
         b["estoque"] = est
         prod = prods.get(sku) if sku else None
         preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        b["preco"] = float(m.preco) if (m and m.preco and m.preco > 0) else (x.get("preco") if x else None)
         b["preco_bling"] = preco_bling
         b["piso_preco"] = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
                            if preco_bling is not None else None)
