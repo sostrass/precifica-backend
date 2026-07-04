@@ -2970,17 +2970,29 @@ def ml_promo_itens(q: str = Query(None), limit: int = Query(30, le=60), offset: 
     return {"total": total, "offset": offset, "limit": limit, "itens": itens}
 
 
-@app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/itens")
-def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
-                            user: User = Depends(auth.get_current_user)):
-    """Itens candidatos/participantes de um convite (paginado — TODOS), com banda de preço
-    (min/max/sugerido), estoque reservável + piso do Bling, enriquecidos com título/imagem/estoque."""
+_TIPOS_OFFER_ID = {"LIGHTNING", "SMART", "PRE_NEGOTIATED", "UNHEALTHY_STOCK", "BANK", "PRICE_MATCHING", "PRICE_MATCHING_MELI_ALL"}
+
+
+def _deal_convite(it, pct):
+    """Preço do item no convite: original - pct%, grampeado na banda do ML
+    (max_discounted_price = piso da banda; min_discounted_price = teto)."""
+    dp = (it.get("original_price") or 0) * (1 - float(pct) / 100)
+    maxd, mind = it.get("max_discounted_price"), it.get("min_discounted_price")
+    if maxd is not None:
+        dp = max(dp, maxd)
+    if mind is not None:
+        dp = min(dp, mind)
+    return round(dp, 2)
+
+
+def _itens_convite_enriquecidos(user_id, promotion_id, promotion_type):
+    """Pagina + normaliza + enriquece (título/imagem/estoque/sku) + piso do Bling para os
+    itens/candidatos de um convite. Retorna (base, truncado, sem_bling)."""
     from . import mercadolivre as _ml
-    # 1) paginar todos os itens do convite (ML pagina em ~50 via searchAfter)
     todos, sa, truncado = [], None, False
-    for i in range(12):  # teto de 12 páginas ≈ 600 itens
+    for i in range(12):
         raw = _ml_run(lambda ml, _sa=sa: ml.itens_promocao(
-            promotion_id, promotion_type, user_id=user.id, limit=50, search_after=_sa)) or {}
+            promotion_id, promotion_type, user_id=user_id, limit=50, search_after=_sa)) or {}
         lst = (raw.get("results") if isinstance(raw, dict) else raw) or []
         todos.extend(lst)
         paging = (raw.get("paging") if isinstance(raw, dict) else {}) or {}
@@ -2989,7 +3001,6 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
             break
         if i == 11:
             truncado = True
-    # 2) normaliza
     base = []
     for it in todos:
         iid = it.get("id") or it.get("item_id")
@@ -3010,23 +3021,21 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
             "status": it.get("status"),
         })
     ids = [b["item_id"] for b in base]
-    # 3) cache local (título/imagem/estoque/sku)
     from .models import MLItemCache, ProdutoCache
     db = SessionLocal()
     try:
         mlc = ({m.item_id: m for m in db.query(MLItemCache).filter(
-                MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
+                MLItemCache.user_id == user_id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
         skus = [m.sku for m in mlc.values() if m.sku]
         prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
-                  ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
+                  ProdutoCache.user_id == user_id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
     finally:
         db.close()
-    # 4) enriquecer via /items os que faltam no cache (título/imagem/estoque/sku)
     faltantes = [b["item_id"] for b in base if not (mlc.get(b["item_id"]) and mlc[b["item_id"]].titulo)]
     extra = {}
     if faltantes:
         try:
-            for x in _ml.obter_itens(faltantes, user.id,
+            for x in _ml.obter_itens(faltantes, user_id,
                                      attributes="id,title,thumbnail,pictures,available_quantity,price,seller_custom_field,attributes,status"):
                 if x.get("item_id"):
                     extra[x["item_id"]] = x
@@ -3037,12 +3046,12 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
         db2 = SessionLocal()
         try:
             for p in db2.query(ProdutoCache).filter(
-                    ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus_extra)).all():
+                    ProdutoCache.user_id == user_id, ProdutoCache.sku.in_(skus_extra)).all():
                 if p.sku:
                     prods[p.sku] = p
         finally:
             db2.close()
-    cfg = precificacao.obter_config(user.id)
+    cfg = precificacao.obter_config(user_id)
     for b in base:
         m = mlc.get(b["item_id"]); x = extra.get(b["item_id"])
         b["titulo"] = (m.titulo if (m and m.titulo) else None) or (x.get("titulo") if x else None)
@@ -3059,8 +3068,60 @@ def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
         b["piso_preco"] = (precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling)
                            if preco_bling is not None else None)
     sem_bling = sum(1 for b in base if b["preco_bling"] is None)
+    return base, truncado, sem_bling
+
+
+@app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/itens")
+def ml_promo_promocao_itens(promotion_id: str, promotion_type: str = Query(...),
+                            user: User = Depends(auth.get_current_user)):
+    """Itens candidatos/participantes de um convite (paginado — TODOS), com banda de preço, piso e enriquecimento."""
+    base, truncado, sem_bling = _itens_convite_enriquecidos(user.id, promotion_id, promotion_type)
     return {"promotion_id": promotion_id, "promotion_type": promotion_type, "itens": base,
             "total": len(base), "truncado": truncado, "sem_preco_bling": sem_bling}
+
+
+@app.post("/api/mercadolivre/promocoes/promocao/{promotion_id}/aderir-auto")
+def ml_promo_aderir_auto(promotion_id: str, promotion_type: str = Query(...),
+                         desconto_pct: float = Query(15, ge=5, le=80),
+                         user: User = Depends(auth.get_current_user)):
+    """Auto-adesão de um convite: adere todos os itens elegíveis cujo preço fica ACIMA do piso
+    (a automação NUNCA fura a margem). Pula os que furam o piso e os sem Preço Bling."""
+    base, _tr, _sb = _itens_convite_enriquecidos(user.id, promotion_id, promotion_type)
+    resumo = {"aderidos": 0, "ignorados_piso": 0, "sem_preco_bling": 0, "ja_participando": 0,
+              "falhas": [], "total_candidatos": len(base)}
+
+    def _run(ml):
+        for it in base:
+            if (it.get("status") or "").lower() in ("active", "started", "enabled"):
+                resumo["ja_participando"] += 1
+                continue
+            piso = it.get("piso_preco")
+            if piso is None:
+                resumo["sem_preco_bling"] += 1
+                continue
+            dp = _deal_convite(it, desconto_pct)
+            if dp < piso:
+                resumo["ignorados_piso"] += 1
+                continue
+            offer_id = it.get("offer_id") if promotion_type in _TIPOS_OFFER_ID else None
+            stock = None
+            if promotion_type == "LIGHTNING":
+                lo = (it.get("stock_min") + 1) if it.get("stock_min") is not None else 1
+                hi = (it.get("stock_max") - 1) if it.get("stock_max") is not None else None
+                sv = it.get("estoque") if it.get("estoque") is not None else lo
+                sv = max(sv, lo)
+                if hi is not None:
+                    sv = min(sv, max(hi, lo))
+                stock = max(1, int(round(sv)))
+            try:
+                ml.add_item_promocao(it["item_id"], promotion_id, promotion_type, dp, None, stock, offer_id, user.id)
+                resumo["aderidos"] += 1
+            except Exception as e:  # noqa: BLE001
+                resumo["falhas"].append({"item_id": it["item_id"], "erro": str(e)[:140]})
+        return None
+
+    _ml_run(lambda ml: _run(ml))
+    return resumo
 
 
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/contagem")
