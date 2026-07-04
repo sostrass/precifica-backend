@@ -3172,6 +3172,116 @@ def ml_promo_contagem(promotion_id: str, promotion_type: str = Query(...),
     return _ml_run(lambda ml: _run(ml))
 
 
+@app.get("/api/mercadolivre/promocoes/item/{item_id}/promocoes")
+def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user)):
+    """Todas as promoções de UM anúncio (como o painel por-produto do ML): desconto, preço final,
+    você recebe (líquido estimado), estado e vigência — para ver em quais campanhas o produto está."""
+    from .models import MLItemCache, ProdutoCache
+    db = SessionLocal()
+    try:
+        mi = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.item_id == item_id).first()
+        titulo = mi.titulo if mi else item_id
+        sku = mi.sku if mi else None
+        preco_cat = float(mi.preco) if (mi and mi.preco) else None
+        imagem = mi.imagem if mi else None
+        prod = (db.query(ProdutoCache).filter(ProdutoCache.user_id == user.id, ProdutoCache.sku == sku).first()
+                if sku else None)
+        preco_bling = float(prod.preco) if (prod and prod.preco and prod.preco > 0) else None
+        custo = float(prod.custo) if (prod and prod.custo and prod.custo > 0) else None
+    finally:
+        db.close()
+    cfg = precificacao.obter_config(user.id)
+    piso = precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling) if preco_bling is not None else None
+
+    def _run(ml):
+        raw = ml.promocoes_do_item(item_id, user.id) or {}
+        lst = raw.get("results") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        painel = ml.painel_promocoes(user.id) or {}
+        nomes = {}
+        for p in (painel.get("convites") or []) + (painel.get("minhas") or []):
+            if p.get("id"):
+                nomes[p["id"]] = {"nome": p.get("name"), "deadline": p.get("deadline_date")}
+        out = []
+        for pr in (lst or []):
+            pid = pr.get("id") or pr.get("promotion_id")
+            price = _npx(pr.get("price"))
+            original = _npx(pr.get("original_price")) or preco_cat
+            coop = (_npx(pr.get("meli_percentage")) or 0) + (_npx(pr.get("seller_percentage")) or 0)
+            desc = round(coop, 1) if coop > 0 else (round((1 - price / original) * 100, 1)
+                                                    if (original and price and price < original) else 0)
+            liq = None
+            if price:
+                liq = (precificacao.margem_real_canal(cfg, "mercadolivre", price, custo) or {}).get("liquido")
+            info = nomes.get(pid, {})
+            out.append({
+                "id": pid, "nome": info.get("nome") or pr.get("name") or pr.get("type"), "type": pr.get("type"),
+                "sub_type": pr.get("sub_type"), "status": pr.get("status"),
+                "start_date": pr.get("start_date"), "finish_date": pr.get("finish_date"),
+                "deadline_date": info.get("deadline"), "preco_final": price, "original": original,
+                "desconto_pct": desc, "meli_percentage": _npx(pr.get("meli_percentage")),
+                "seller_percentage": _npx(pr.get("seller_percentage")), "voce_recebe": liq, "piso": piso,
+                "acima_piso": (piso is None or (price is not None and price >= piso)),
+            })
+        out.sort(key=lambda x: (x["status"] or "").lower() not in ("active", "started", "enabled"))
+        return out
+
+    proms = _ml_run(lambda ml: _run(ml))
+    return {"item_id": item_id, "titulo": titulo, "sku": sku, "imagem": imagem,
+            "preco": preco_cat, "preco_bling": preco_bling, "piso": piso,
+            "participando": sum(1 for p in proms if (p.get("status") or "").lower() in ("active", "started", "enabled")),
+            "promocoes": proms}
+
+
+@app.get("/api/mercadolivre/promocoes/participantes")
+def ml_promo_participantes(user: User = Depends(auth.get_current_user)):
+    """Produtos que estão participando de campanhas, agrupados — com os títulos das campanhas de cada um.
+    Varre as promoções (com teto) e coleta os itens ativos. Operação sob demanda (pode demorar)."""
+    painel = _ml_run(lambda ml: ml.painel_promocoes(user.id)) or {}
+    promos = (painel.get("convites") or []) + (painel.get("minhas") or [])
+    prod_map = {}
+
+    def _run(ml):
+        for p in promos[:30]:
+            pid, ptype, pname = p.get("id"), p.get("type"), p.get("name")
+            if not pid:
+                continue
+            sa = None
+            for _ in range(4):
+                raw = ml.itens_promocao(pid, ptype, user_id=user.id, limit=50, search_after=sa) or {}
+                lst = (raw.get("results") if isinstance(raw, dict) else raw) or []
+                for it in lst:
+                    if (it.get("status") or "").lower() in ("active", "started", "enabled"):
+                        iid = it.get("id") or it.get("item_id")
+                        if iid:
+                            e = prod_map.setdefault(iid, {"campanhas": [], "ids": set()})
+                            if pid not in e["ids"]:
+                                e["ids"].add(pid)
+                                e["campanhas"].append({"id": pid, "nome": pname, "type": ptype})
+                paging = (raw.get("paging") if isinstance(raw, dict) else {}) or {}
+                sa = paging.get("searchAfter") or paging.get("search_after")
+                if not sa or len(lst) < 50:
+                    break
+        return None
+
+    _ml_run(lambda ml: _run(ml))
+    ids = list(prod_map.keys())
+    from .models import MLItemCache
+    db = SessionLocal()
+    try:
+        mlc = ({m.item_id: m for m in db.query(MLItemCache).filter(
+                MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
+    finally:
+        db.close()
+    produtos = []
+    for iid, v in prod_map.items():
+        m = mlc.get(iid)
+        produtos.append({"item_id": iid, "titulo": (m.titulo if m else None) or iid, "sku": (m.sku if m else None),
+                         "imagem": (m.imagem if m else None), "preco": float(m.preco) if (m and m.preco) else None,
+                         "campanhas": v["campanhas"], "n": len(v["campanhas"])})
+    produtos.sort(key=lambda x: x["n"], reverse=True)
+    return {"total_produtos": len(produtos), "promocoes_varridas": min(len(promos), 30), "produtos": produtos}
+
+
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/metricas")
 def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(...),
                                inicio: str = Query(None), fim: str = Query(None),
