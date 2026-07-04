@@ -3242,7 +3242,32 @@ def ml_item_promocoes(item_id: str, user: User = Depends(auth.get_current_user))
         return out
 
     proms = _ml_run(lambda ml: _run(ml))
+    from .models import MLPedidoItemCache
+    corte = datetime.utcnow() - timedelta(days=30)
+    db = SessionLocal()
+    try:
+        filtro = [MLPedidoItemCache.user_id == user.id,
+                  MLPedidoItemCache.date_created >= corte,
+                  MLPedidoItemCache.status.notin_(["cancelled", "invalid"])]
+        if sku:
+            from sqlalchemy import or_
+            filtro.append(or_(MLPedidoItemCache.item_id == item_id, MLPedidoItemCache.sku == sku))
+        else:
+            filtro.append(MLPedidoItemCache.item_id == item_id)
+        rows = db.query(MLPedidoItemCache).filter(*filtro).all()
+    finally:
+        db.close()
+    vistos = set()
+    vendas_30d, receita_30d = 0, 0.0
+    for r in rows:
+        chave = (r.order_id, r.item_id or r.sku)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        vendas_30d += r.quantidade or 0
+        receita_30d += r.receita or 0.0
     return {"item_id": item_id, "titulo": titulo, "sku": sku, "imagem": imagem,
+            "vendas_30d": vendas_30d, "receita_30d": round(receita_30d, 2),
             "preco": preco_cat, "preco_bling": preco_bling, "piso": piso,
             "participando": sum(1 for p in proms if (p.get("status") or "").lower() in ("active", "started", "enabled")),
             "promocoes": proms}
@@ -3322,10 +3347,36 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
         faltando, user.id, attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes"))
         if faltando else [])
     extra_map = {e["item_id"]: e for e in (extra or [])}
+    # vendas reais (cache de pedidos, 30d) por item_id e por SKU
+    from .models import MLPedidoItemCache
+    corte = datetime.utcnow() - timedelta(days=30)
+    vendas_por_item, vendas_por_sku = {}, {}
+    if ids:
+        db = SessionLocal()
+        try:
+            rows = (db.query(MLPedidoItemCache)
+                    .filter(MLPedidoItemCache.user_id == user.id,
+                            MLPedidoItemCache.date_created >= corte,
+                            MLPedidoItemCache.status.notin_(["cancelled", "invalid"]))
+                    .all())
+        finally:
+            db.close()
+        for r in rows:
+            if r.item_id:
+                v = vendas_por_item.setdefault(r.item_id, {"un": 0, "receita": 0.0})
+                v["un"] += r.quantidade or 0
+                v["receita"] += r.receita or 0.0
+            if r.sku:
+                v2 = vendas_por_sku.setdefault(r.sku, {"un": 0, "receita": 0.0})
+                v2["un"] += r.quantidade or 0
+                v2["receita"] += r.receita or 0.0
+    tem_pedidos = bool(vendas_por_item or vendas_por_sku)
     produtos = []
     for iid, v in prod_map.items():
         m = mlc.get(iid)
         ex = extra_map.get(iid, {})
+        _sku = (m.sku if m else None) or ex.get("sku")
+        _v30 = vendas_por_item.get(iid) or (vendas_por_sku.get(_sku) if _sku else None) or {"un": 0, "receita": 0.0}
         produtos.append({"item_id": iid,
                          "titulo": (m.titulo if m else None) or ex.get("titulo") or iid,
                          "sku": (m.sku if m else None) or ex.get("sku"),
@@ -3334,6 +3385,7 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
                          "estoque": (m.estoque if (m and m.estoque is not None) else ex.get("estoque")),
                          "desconto_max_pct": v.get("desconto_max") or 0,
                          "preco_promo": v.get("preco_promo"),
+                         "vendas_30d": _v30["un"], "receita_30d": round(_v30["receita"], 2),
                          "campanhas": v["campanhas"], "n": len(v["campanhas"])})
     produtos.sort(key=lambda x: x["n"], reverse=True)
     campanhas = sorted(camp_fin.values(), key=lambda c: c["voce_recebe"], reverse=True)
@@ -3342,7 +3394,10 @@ def ml_promo_participantes(forcar: bool = Query(False), user: User = Depends(aut
         c["desconto"] = round(c["desconto"], 2)
     totais = {"voce_recebe": round(sum(c["voce_recebe"] for c in campanhas), 2),
               "desconto": round(sum(c["desconto"] for c in campanhas), 2),
-              "produtos": len(produtos), "campanhas": len(campanhas)}
+              "produtos": len(produtos), "campanhas": len(campanhas),
+              "vendas_30d": sum(p["vendas_30d"] for p in produtos),
+              "receita_30d": round(sum(p["receita_30d"] for p in produtos), 2),
+              "cache_pedidos": tem_pedidos}
     resultado = {"total_produtos": len(produtos), "promocoes_varridas": min(len(promos), 30),
                  "produtos": produtos, "campanhas": campanhas, "totais": totais,
                  "atualizado_em": datetime.utcnow().isoformat(), "cache": False}
