@@ -3785,12 +3785,31 @@ def ml_buybox(limit: int = Query(20, ge=1, le=40), offset: int = Query(0),
     """Rastreio de buybox: para uma página de anúncios ativos, consulta price_to_win, normaliza
     ganhando/perdendo/compartilhando e cruza com o piso — sugere o preço que recupera o topo sem furar a margem."""
     from .models import MLItemCache, ProdutoCache
+    from types import SimpleNamespace
     db = SessionLocal()
     try:
         base_q = db.query(MLItemCache).filter(MLItemCache.user_id == user.id, MLItemCache.status == "active")
         total = base_q.count()
-        itens = base_q.order_by(MLItemCache.preco.desc()).offset(offset).limit(limit).all()
-        skus = [i.sku for i in itens if i.sku]
+        itens = [SimpleNamespace(item_id=i.item_id, sku=i.sku, preco=i.preco, titulo=i.titulo,
+                                 imagem=i.imagem, estoque=i.estoque)
+                 for i in base_q.order_by(MLItemCache.preco.desc()).offset(offset).limit(limit).all()]
+    finally:
+        db.close()
+    if total == 0:  # cache de anúncios vazio → busca ativos direto do ML
+        ids_ativos = _ml_run(lambda ml: ml.listar_ids(user.id, filtros={"status": "active"},
+                                                       limite=offset + limit + 10)) or []
+        total = len(ids_ativos)
+        page_ids = ids_ativos[offset:offset + limit]
+        det = (_ml_run(lambda ml: ml.obter_itens(
+            page_ids, user.id,
+            attributes="id,title,price,thumbnail,pictures,seller_custom_field,attributes,available_quantity"))
+            if page_ids else [])
+        itens = [SimpleNamespace(item_id=d.get("item_id"), sku=d.get("sku"), preco=d.get("preco"),
+                                 titulo=d.get("titulo"), imagem=d.get("imagem"), estoque=d.get("estoque"))
+                 for d in det]
+    skus = [i.sku for i in itens if i.sku]
+    db = SessionLocal()
+    try:
         prods = ({p.sku: p for p in db.query(ProdutoCache).filter(
                   ProdutoCache.user_id == user.id, ProdutoCache.sku.in_(skus)).all()} if skus else {})
     finally:
