@@ -4665,6 +4665,93 @@ def ml_produto_editar(item_id: str, payload: dict = Body(...),
             "produto": _produto_um(user.id, item_id)}
 
 
+# --------------------------------------------------------------------------- #
+# IA do anúncio — Copiloto (título e descrição). Usa o Gemini (ai._gerar_texto).
+# --------------------------------------------------------------------------- #
+def _linhas_ia(txt: str, n: int = 3) -> list:
+    """Extrai até N linhas limpas de um retorno da IA (tira número, bullet, aspas, cerca)."""
+    import re
+    out = []
+    for ln in (txt or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        s = re.sub(r"^```[a-z]*", "", s).strip()
+        if s.startswith("```"):
+            continue
+        s = re.sub(r"^\s*(\d+[\.\)\-]|[\-\*•])\s*", "", s)   # 1. / 2) / - / *
+        s = s.strip().strip('"').strip("'").strip("`").strip()
+        if s and len(s) > 3:
+            out.append(s[:60])
+        if len(out) >= n:
+            break
+    return out
+
+
+def _titulo_atual(user_id, item_id, titulo):
+    if titulo:
+        return titulo
+    from .models import MLItemCache
+    db = SessionLocal()
+    try:
+        it = db.query(MLItemCache).filter(MLItemCache.user_id == user_id,
+                                          MLItemCache.item_id == item_id).first()
+        return (it.titulo if it else "") or ""
+    finally:
+        db.close()
+
+
+@app.post("/api/mercadolivre/produtos/ia/titulo")
+def ml_produto_ia_titulo(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Sugere 3 títulos otimizados para o Mercado Livre (≤60 car., sem palavras proibidas)."""
+    item_id = (payload or {}).get("item_id")
+    atual = _titulo_atual(user.id, item_id, (payload or {}).get("titulo"))
+    if not atual.strip():
+        raise HTTPException(status_code=422, detail="Sem título de base. Informe item_id ou titulo.")
+    categoria = (payload or {}).get("categoria") or ""
+    prompt = (
+        "Você é especialista em SEO de marketplace no Mercado Livre Brasil.\n"
+        "Reescreva o título do anúncio abaixo em 3 variações otimizadas para busca.\n"
+        "Regras OBRIGATÓRIAS:\n"
+        "- No máximo 60 caracteres cada.\n"
+        "- Estrutura: Produto + Marca/Modelo + atributo-chave (tamanho, cor, material, quantidade).\n"
+        "- NÃO use: 'frete grátis', 'promoção', 'oferta', 'imperdível', emojis, LETRAS TODAS MAIÚSCULAS.\n"
+        "- Sem repetir palavras. Português do Brasil.\n"
+        "Responda APENAS as 3 opções, uma por linha, sem numeração e sem comentários.\n\n"
+        f"Categoria: {categoria}\n"
+        f"Título atual: {atual}\n"
+    )
+    txt = ai._gerar_texto(user.id, prompt)
+    sugestoes = _linhas_ia(txt, 3)
+    if not sugestoes:
+        raise HTTPException(status_code=502, detail="A IA não retornou sugestões. Tente novamente.")
+    return {"atual": atual, "sugestoes": sugestoes, "melhor": sugestoes[0]}
+
+
+@app.post("/api/mercadolivre/produtos/ia/descricao")
+def ml_produto_ia_descricao(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Gera uma descrição em texto puro (o ML não aceita HTML desde 2021)."""
+    item_id = (payload or {}).get("item_id")
+    nome = _titulo_atual(user.id, item_id, (payload or {}).get("titulo"))
+    if not nome.strip():
+        raise HTTPException(status_code=422, detail="Sem título de base. Informe item_id ou titulo.")
+    caracteristicas = (payload or {}).get("caracteristicas") or ""
+    prompt = (
+        "Você é redator de anúncios do Mercado Livre Brasil. Escreva uma descrição vendedora "
+        "em TEXTO PURO (sem HTML, sem markdown), pronta para colar no anúncio.\n"
+        "Estrutura: 1 parágrafo de abertura com o benefício principal; depois uma lista curta de "
+        "características (uma por linha, com '- '); feche com uma linha de reforço.\n"
+        "Seja específico com medidas e materiais. Não invente marca nem garantia. Português do Brasil.\n\n"
+        f"Produto: {nome}\n"
+        f"Características informadas: {caracteristicas or '(use o que dá para inferir do título)'}\n"
+    )
+    texto = ai._gerar_texto(user.id, prompt)
+    texto = (texto or "").strip()
+    if not texto:
+        raise HTTPException(status_code=502, detail="A IA não retornou descrição. Tente novamente.")
+    return {"texto": texto, "chars": len(texto)}
+
+
 @app.get("/api/mercadolivre/agentes/execucoes")
 def ml_agentes_execucoes(limit: int = Query(10, ge=1, le=50), user: User = Depends(auth.get_current_user)):
     from .models import AgenteExecucao
