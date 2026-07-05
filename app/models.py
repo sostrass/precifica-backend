@@ -576,6 +576,23 @@ class MLSync(Base):
     concluido_em = Column(DateTime, nullable=True)
 
 
+class MLWebhookEvento(Base):
+    """Log das notificações (webhooks) do Mercado Livre — alimenta o painel de
+    sincronização em tempo real (eventos por tópico, latência, taxa de processamento)."""
+
+    __tablename__ = "ml_webhook_evento"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    topic = Column(String, nullable=True, index=True)      # items | items_prices | stock_locations | ...
+    resource = Column(String, nullable=True)               # ex.: /items/MLB123
+    resource_id = Column(String, nullable=True, index=True)
+    attempts = Column(Integer, default=1)
+    processado = Column(Boolean, default=False)
+    resultado = Column(String, nullable=True)
+    recebido_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class MLEnvioCache(Base):
     """Cache do estado de cada envio (shipment) do Mercado Livre.
 

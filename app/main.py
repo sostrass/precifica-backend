@@ -5007,6 +5007,356 @@ def ml_produto_publicar(payload: dict = Body(...), user: User = Depends(auth.get
             "status": criado.get("status") if isinstance(criado, dict) else None, "criado": criado}
 
 
+# =========================================================================== #
+# SINCRONIZAÇÃO Bling ↔ ML — divergências linha-a-linha (preço/estoque/órfãos).
+# As ações (reprecificar/igualar estoque) reusam o endpoint de edição de item.
+# =========================================================================== #
+def _divergencias(user_id, tipo="preco", page=1, page_size=40):
+    from .models import MLItemCache, ProdutoCache
+    cfg = precificacao.obter_config(user_id)
+    db = SessionLocal()
+    try:
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user_id).all()
+        blings = db.query(ProdutoCache).filter(ProdutoCache.user_id == user_id).all()
+    finally:
+        db.close()
+    bling_por_sku = {}
+    for b in blings:
+        if b.sku:
+            bling_por_sku[b.sku.strip().upper()] = b
+
+    def _regra(preco_bling):
+        if not preco_bling:
+            return None
+        av = precificacao.avaliar_com_cfg(cfg, 0.0, preco_atual=float(preco_bling), canal="mercadolivre")
+        return av.get("preco_sugerido")
+
+    skus_ml = set()
+    preco_list, estoque_list = [], []
+    for it in itens:
+        sku = (it.sku or "").strip()
+        if sku:
+            skus_ml.add(sku.upper())
+        b = bling_por_sku.get(sku.upper()) if sku else None
+        preco_bling = float(b.preco) if (b and b.preco) else None
+        saldo_bling = int(b.saldo) if (b and b.saldo is not None) else None
+        liquido = _liquido_ml_preco(cfg, it.preco) if it.preco else None
+        piso = precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling) if preco_bling else None
+        if liquido is not None and preco_bling is not None and liquido < preco_bling - 0.01:
+            preco_regra = _regra(preco_bling)
+            preco_list.append({
+                "item_id": it.item_id, "sku": sku or None, "titulo": it.titulo, "imagem": it.imagem,
+                "preco": round(it.preco, 2) if it.preco else None,
+                "liquido": liquido, "preco_bling": round(preco_bling, 2),
+                "piso": round(piso, 2) if piso else None,
+                "preco_regra": round(preco_regra, 2) if preco_regra else None,
+                "delta": round(preco_bling - liquido, 2),
+            })
+        if saldo_bling is not None and it.estoque is not None and saldo_bling != it.estoque:
+            estoque_list.append({
+                "item_id": it.item_id, "sku": sku or None, "titulo": it.titulo, "imagem": it.imagem,
+                "estoque_ml": it.estoque, "estoque_bling": saldo_bling,
+                "diff": saldo_bling - it.estoque,
+            })
+
+    orfaos = []
+    for b in blings:
+        sku_up = (b.sku or "").strip().upper()
+        if not sku_up or sku_up not in skus_ml:
+            preco_bling = float(b.preco) if b.preco else None
+            orfaos.append({
+                "produto_id": b.produto_id, "sku": b.sku, "nome": b.nome, "imagem": b.imagem,
+                "saldo": int(b.saldo) if b.saldo is not None else 0,
+                "preco_bling": round(preco_bling, 2) if preco_bling else None,
+                "preco_regra": round(_regra(preco_bling), 2) if preco_bling else None,
+            })
+
+    counts = {"preco": len(preco_list), "estoque": len(estoque_list), "orfaos": len(orfaos),
+              "total_ml": len(itens), "total_bling": len(blings)}
+    em_dia = max(0, len(itens) - len(preco_list) - len(estoque_list))
+    counts["em_dia"] = em_dia
+    sel = {"preco": preco_list, "estoque": estoque_list, "orfaos": orfaos}.get(tipo, preco_list)
+    total = len(sel)
+    ini = max(0, (page - 1) * page_size)
+    return {"counts": counts, "itens": sel[ini:ini + page_size], "total": total,
+            "tipo": tipo, "page": page, "page_size": page_size}
+
+
+@app.get("/api/mercadolivre/sync/divergencias")
+def ml_sync_divergencias(tipo: str = Query("preco"), page: int = Query(1, ge=1),
+                         page_size: int = Query(40, ge=1, le=200),
+                         user: User = Depends(auth.get_current_user)):
+    if tipo not in ("preco", "estoque", "orfaos"):
+        tipo = "preco"
+    return _divergencias(user.id, tipo=tipo, page=page, page_size=page_size)
+
+
+# =========================================================================== #
+# FISCAL (bloqueante) — prontidão + cadastro NCM/origem, Bling como fonte.
+# can_invoice é 1 req/item: o painel usa o NCM do Bling como proxy de prontidão;
+# o drill-down por item faz a checagem real no ML.
+# =========================================================================== #
+_ORIGENS_NACIONAIS = {"0", "3", "4", "5", "8"}   # SEFAZ: nacionais; 1/2/6/7 = importado
+
+
+def _ncm_bling(dados):
+    if not isinstance(dados, dict):
+        return ""
+    ncm = (dados.get("tributacao") or {}).get("ncm") or dados.get("ncm") or ""
+    return "".join(ch for ch in str(ncm) if ch.isdigit())
+
+
+def _fiscal_sugerido_bling(dados):
+    """Deriva NCM + origem do produto do Bling para pré-preencher o ML."""
+    ncm = _ncm_bling(dados)
+    origem = None
+    cest = ""
+    if isinstance(dados, dict):
+        trib = dados.get("tributacao") or {}
+        origem = trib.get("origem")
+        cest = "".join(ch for ch in str(trib.get("cest") or "") if ch.isdigit())
+    origin_detail = str(origem) if origem not in (None, "") else "0"
+    nacional = origin_detail in _ORIGENS_NACIONAIS
+    return {
+        "ncm": ncm if len(ncm) == 8 else "",
+        "origin_type": "reseller" if nacional else "imported",
+        "origin_detail": origin_detail,
+        "cest": cest,
+        "tem_ncm": len(ncm) == 8,
+    }
+
+
+def _fiscal_painel(user_id, situacao="todos", busca=None, page=1, page_size=40):
+    from .models import MLItemCache, ProdutoCache
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user_id).all()
+        blings = db.query(ProdutoCache).filter(ProdutoCache.user_id == user_id).all()
+    finally:
+        db.close()
+    bling_por_sku = {}
+    for b in blings:
+        if b.sku:
+            bling_por_sku[b.sku.strip().upper()] = b
+    linhas = []
+    for it in itens:
+        sku = (it.sku or "").strip()
+        b = bling_por_sku.get(sku.upper()) if sku else None
+        sug = _fiscal_sugerido_bling(b.dados if b else None)
+        if b is None:
+            estado = "sem_bling"
+        elif sug["tem_ncm"]:
+            estado = "pronto"          # tem NCM no Bling → dá para enviar
+        else:
+            estado = "sem_ncm"
+        linhas.append({
+            "item_id": it.item_id, "sku": sku or None, "titulo": it.titulo, "imagem": it.imagem,
+            "tem_bling": b is not None, "ncm": sug["ncm"], "origin_type": sug["origin_type"],
+            "origin_detail": sug["origin_detail"], "cest": sug["cest"], "estado": estado,
+        })
+    kpis = {
+        "total": len(linhas),
+        "pronto": sum(1 for x in linhas if x["estado"] == "pronto"),
+        "sem_ncm": sum(1 for x in linhas if x["estado"] == "sem_ncm"),
+        "sem_bling": sum(1 for x in linhas if x["estado"] == "sem_bling"),
+    }
+
+    def _passa(x):
+        if situacao and situacao != "todos" and x["estado"] != situacao:
+            return False
+        if busca:
+            q = busca.strip().lower()
+            if q not in f"{x['titulo'] or ''} {x['sku'] or ''} {x['item_id']}".lower():
+                return False
+        return True
+
+    filtrados = [x for x in linhas if _passa(x)]
+    total = len(filtrados)
+    ini = max(0, (page - 1) * page_size)
+    return {"kpis": kpis, "itens": filtrados[ini:ini + page_size], "total": total,
+            "situacao": situacao, "page": page, "page_size": page_size}
+
+
+@app.get("/api/mercadolivre/fiscal/painel")
+def ml_fiscal_painel(situacao: str = Query("todos"), busca: str = Query(""),
+                     page: int = Query(1, ge=1), page_size: int = Query(40, ge=1, le=200),
+                     user: User = Depends(auth.get_current_user)):
+    if situacao not in ("todos", "pronto", "sem_ncm", "sem_bling"):
+        situacao = "todos"
+    return _fiscal_painel(user.id, situacao=situacao, busca=busca or None, page=page, page_size=page_size)
+
+
+@app.get("/api/mercadolivre/fiscal/regras")
+def ml_fiscal_regras(user: User = Depends(auth.get_current_user)):
+    regras = _ml_run(lambda ml: ml.regras_fiscais(user.id))
+    out = [{"id": r.get("id"), "description": r.get("description")}
+           for r in (regras or []) if isinstance(r, dict)]
+    return {"regras": out}
+
+
+@app.get("/api/mercadolivre/fiscal/item/{item_id}")
+def ml_fiscal_item(item_id: str, user: User = Depends(auth.get_current_user)):
+    """Prontidão real (can_invoice) + fiscal atual no ML + sugestão vinda do Bling."""
+    from .models import MLItemCache, ProdutoCache
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        it = db.query(MLItemCache).filter(MLItemCache.user_id == user.id,
+                                          MLItemCache.item_id == item_id).first()
+        b = None
+        if it and it.sku:
+            b = db.query(ProdutoCache).filter(
+                ProdutoCache.user_id == user.id,
+                func.upper(ProdutoCache.sku) == it.sku.strip().upper()).first()
+    finally:
+        db.close()
+    if not it:
+        raise HTTPException(status_code=404, detail="Anúncio não encontrado no cache.")
+    sku = (it.sku or "").strip()
+    sug = _fiscal_sugerido_bling(b.dados if b else None)
+    can = _ml_run(lambda ml: ml.pode_faturar(item_id, user.id))
+    atual = _ml_run(lambda ml: ml.fiscal_do_item(sku, user.id)) if sku else None
+    return {
+        "item_id": item_id, "sku": sku or None, "titulo": it.titulo,
+        "pode_faturar": (can or {}).get("status"),
+        "fiscal_atual": (atual.get("tax_information") if isinstance(atual, dict) else None),
+        "sugestao_bling": sug, "tem_bling": b is not None,
+    }
+
+
+@app.post("/api/mercadolivre/fiscal/item/{item_id}")
+def ml_fiscal_salvar(item_id: str, payload: dict = Body(None),
+                     user: User = Depends(auth.get_current_user)):
+    """Grava dados fiscais do item (POST /items/fiscal_information) e rec]heca can_invoice.
+    Sem payload, usa o que veio do Bling (NCM/origem)."""
+    from .models import MLItemCache, ProdutoCache
+    from sqlalchemy import func
+    payload = payload or {}
+    db = SessionLocal()
+    try:
+        it = db.query(MLItemCache).filter(MLItemCache.user_id == user.id,
+                                          MLItemCache.item_id == item_id).first()
+        b = None
+        if it and it.sku:
+            b = db.query(ProdutoCache).filter(
+                ProdutoCache.user_id == user.id,
+                func.upper(ProdutoCache.sku) == it.sku.strip().upper()).first()
+    finally:
+        db.close()
+    if not it or not (it.sku or "").strip():
+        raise HTTPException(status_code=422, detail="Item sem SKU — o cadastro fiscal do ML é por SKU.")
+    sku = it.sku.strip()
+    sug = _fiscal_sugerido_bling(b.dados if b else None)
+    ncm = "".join(ch for ch in str(payload.get("ncm") or sug["ncm"] or "") if ch.isdigit())
+    if len(ncm) != 8:
+        raise HTTPException(status_code=422, detail={
+            "erro": "ncm_invalido",
+            "mensagem": "NCM de 8 dígitos é obrigatório. Cadastre o NCM no Bling ou informe manualmente."})
+    tax = {"ncm": ncm,
+           "origin_type": payload.get("origin_type") or sug["origin_type"],
+           "origin_detail": str(payload.get("origin_detail") or sug["origin_detail"] or "0")}
+    if payload.get("cest") or sug["cest"]:
+        tax["cest"] = "".join(ch for ch in str(payload.get("cest") or sug["cest"]) if ch.isdigit())
+    if payload.get("csosn"):
+        tax["csosn"] = str(payload["csosn"])
+    if payload.get("ean"):
+        tax["ean"] = str(payload["ean"])
+    if payload.get("tax_rule_id"):            # só Regime Normal
+        try:
+            tax["tax_rule_id"] = int(payload["tax_rule_id"])
+        except (TypeError, ValueError):
+            pass
+    _ml_run(lambda ml: ml.salvar_fiscal(sku, tax, user.id))
+    can = _ml_run(lambda ml: ml.pode_faturar(item_id, user.id))
+    return {"ok": True, "item_id": item_id, "sku": sku, "enviado": tax,
+            "pode_faturar": (can or {}).get("status")}
+
+
+# =========================================================================== #
+# WEBHOOKS — painel em tempo real (eventos por tópico, latência, recuperação).
+# =========================================================================== #
+_ML_TOPICOS = ["items", "items_prices", "stock_locations", "catalog_item_competition",
+               "price_suggestion", "moderations_reports", "shipments", "orders_v2", "messages"]
+
+
+@app.get("/api/mercadolivre/webhooks/painel")
+def ml_webhooks_painel(horas: int = Query(24, ge=1, le=168),
+                       user: User = Depends(auth.get_current_user)):
+    from .models import MLWebhookEvento
+    from sqlalchemy import func
+    limite = datetime.utcnow() - timedelta(hours=horas)
+    db = SessionLocal()
+    try:
+        base = db.query(MLWebhookEvento).filter(MLWebhookEvento.user_id == user.id)
+        total_geral = base.count()
+        janela = base.filter(MLWebhookEvento.recebido_em >= limite)
+        total_janela = janela.count()
+        processados = janela.filter(MLWebhookEvento.processado == True).count()  # noqa: E712
+        # por tópico (na janela)
+        por_topico_raw = dict(
+            db.query(MLWebhookEvento.topic, func.count(MLWebhookEvento.id))
+            .filter(MLWebhookEvento.user_id == user.id, MLWebhookEvento.recebido_em >= limite)
+            .group_by(MLWebhookEvento.topic).all())
+        # último recebido por tópico (geral)
+        ultimo_raw = dict(
+            db.query(MLWebhookEvento.topic, func.max(MLWebhookEvento.recebido_em))
+            .filter(MLWebhookEvento.user_id == user.id)
+            .group_by(MLWebhookEvento.topic).all())
+        recentes = (db.query(MLWebhookEvento)
+                    .filter(MLWebhookEvento.user_id == user.id)
+                    .order_by(MLWebhookEvento.recebido_em.desc()).limit(30).all())
+        ultimo_geral = db.query(func.max(MLWebhookEvento.recebido_em)).filter(
+            MLWebhookEvento.user_id == user.id).scalar()
+    finally:
+        db.close()
+
+    por_topico = [{"topic": t, "n": por_topico_raw.get(t, 0),
+                   "ultimo": ultimo_raw.get(t).isoformat() if ultimo_raw.get(t) else None}
+                  for t in _ML_TOPICOS if por_topico_raw.get(t)]
+    # tópicos conhecidos sem eventos entram com 0 (para o gráfico ficar completo)
+    for t in _ML_TOPICOS:
+        if t not in por_topico_raw:
+            por_topico.append({"topic": t, "n": 0,
+                               "ultimo": ultimo_raw.get(t).isoformat() if ultimo_raw.get(t) else None})
+    por_topico.sort(key=lambda x: x["n"], reverse=True)
+
+    lista = [{"topic": e.topic, "resource_id": e.resource_id, "processado": bool(e.processado),
+              "resultado": e.resultado, "attempts": e.attempts,
+              "recebido_em": e.recebido_em.isoformat() if e.recebido_em else None} for e in recentes]
+
+    taxa = round((processados / total_janela) * 100) if total_janela else None
+    return {
+        "conectado": total_geral > 0,
+        "total_geral": total_geral, "janela_horas": horas, "total_janela": total_janela,
+        "processados": processados, "taxa_processamento": taxa,
+        "ultimo_recebido": ultimo_geral.isoformat() if ultimo_geral else None,
+        "por_topico": por_topico, "recentes": lista, "topicos_assinados": _ML_TOPICOS,
+    }
+
+
+@app.post("/api/mercadolivre/webhooks/recuperar")
+def ml_webhooks_recuperar(user: User = Depends(auth.get_current_user)):
+    """Reprocessa notificações perdidas (GET /missed_feeds) — reconciliação."""
+    from . import mercadolivre as ml
+    try:
+        perdidas = _ml_run(lambda ml: ml.missed_feeds(user.id))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Não foi possível consultar missed_feeds: {e}")
+    itens = perdidas if isinstance(perdidas, list) else (perdidas.get("results") or []) if isinstance(perdidas, dict) else []
+    reprocessados = 0
+    for n in itens[:200]:
+        if not isinstance(n, dict):
+            continue
+        try:
+            r = _ml_run(lambda ml: ml.processar_notificacao(user.id, n.get("topic"), n.get("resource")))
+            if r.get("ok") and not r.get("erro"):
+                reprocessados += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "encontradas": len(itens), "reprocessadas": reprocessados}
+
+
 @app.get("/api/mercadolivre/agentes/execucoes")
 def ml_agentes_execucoes(limit: int = Query(10, ge=1, le=50), user: User = Depends(auth.get_current_user)):
     from .models import AgenteExecucao
@@ -5056,29 +5406,71 @@ def ml_qualidade(item_id: str, user: User = Depends(auth.get_current_user)):
 
 
 # --- Webhook do ML (notificações; sem auth, path fixo p/ cadastrar no app) ---
+def _processar_notificacao_ml(uid, topic, resource, ev_id):
+    """Processa a notificação em background e atualiza o log (respeita o SLA de 500ms)."""
+    from . import mercadolivre as ml
+    from .models import MLWebhookEvento
+    resultado = None
+    ok = False
+    try:
+        r = ml.processar_notificacao(uid, topic, resource)
+        ok = bool(r.get("ok")) and not r.get("erro")
+        resultado = ("item " + r["item_id"]) if r.get("item_id") else \
+                    ("envio " + r["shipment_id"]) if r.get("shipment_id") else \
+                    (r.get("erro") or ("ignorado" if r.get("ignorado") else "ok"))
+    except Exception as e:  # noqa: BLE001
+        resultado = str(e)[:200]
+    if ev_id:
+        db = SessionLocal()
+        try:
+            ev = db.query(MLWebhookEvento).filter_by(id=ev_id).first()
+            if ev:
+                ev.processado = ok
+                ev.resultado = (resultado or "")[:200]
+                db.commit()
+        finally:
+            db.close()
+
+
 @app.post("/api/mercadolivre/notificacoes")
-async def ml_notificacoes(request: Request):
+async def ml_notificacoes(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
     topic = body.get("topic")
     resource = body.get("resource")
+    attempts = body.get("attempts") or 1
+    resource_id = str(resource).rstrip("/").split("/")[-1] if resource else None
+    # resolve o usuário pelo seller_id
+    uid = None
+    sid = str(body.get("user_id") or "")
+    if sid:
+        db = SessionLocal()
+        try:
+            from .models import MLConta
+            c = db.query(MLConta).filter_by(seller_id=sid).first()
+            uid = c.user_id if c else None
+        finally:
+            db.close()
+    # registra o evento (rápido) para o painel/auditoria
+    ev_id = None
     try:
-        from . import mercadolivre as ml
-        from .models import MLConta
-        uid = None
-        sid = str(body.get("user_id") or "")
-        if sid:
-            db = SessionLocal()
-            try:
-                c = db.query(MLConta).filter_by(seller_id=sid).first()
-                uid = c.user_id if c else None
-            finally:
-                db.close()
-        ml.processar_notificacao(uid, topic, resource)
+        from .models import MLWebhookEvento
+        db = SessionLocal()
+        try:
+            ev = MLWebhookEvento(user_id=uid, topic=topic, resource=resource,
+                                 resource_id=resource_id, attempts=int(attempts or 1), processado=False)
+            db.add(ev)
+            db.commit()
+            db.refresh(ev)
+            ev_id = ev.id
+        finally:
+            db.close()
     except Exception:  # noqa: BLE001
         pass
+    # processa em background e responde 200 já (SLA < 500ms)
+    background_tasks.add_task(_processar_notificacao_ml, uid, topic, resource, ev_id)
     return {"ok": True}
 
 

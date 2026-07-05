@@ -548,6 +548,61 @@ def publicar_item(body, user_id=None):
 
 
 # =========================================================================== #
+# Domínio B3 — Fiscal (bloqueante): can_invoice + fiscal_information + tax_rules
+# =========================================================================== #
+def pode_faturar(item_id, user_id=None):
+    """GET /can_invoice/items/{id} → {status:bool}. status=true só com fiscal completo."""
+    try:
+        return _get("/can_invoice/items/" + str(item_id), user_id=user_id)
+    except MLErro as e:
+        return {"status": None, "erro": str(e)}
+
+
+def fiscal_do_item(sku, user_id=None):
+    """GET /items/fiscal_information/{sku} → dados fiscais atuais (ou None se não houver)."""
+    try:
+        return _get("/items/fiscal_information/" + str(sku), user_id=user_id)
+    except MLErro:
+        return None
+
+
+def salvar_fiscal(sku, tax_information, user_id=None):
+    """POST /items/fiscal_information — grava NCM/origem/regra por SKU."""
+    return _post("/items/fiscal_information",
+                 json={"sku": str(sku), "tax_information": tax_information}, user_id=user_id)
+
+
+def regras_fiscais(user_id=None):
+    """GET /users/{id}/invoices/tax_rules — grupos de regra (só Regime Normal)."""
+    sid = _seller_id(user_id)
+    try:
+        d = _get("/users/" + str(sid) + "/invoices/tax_rules", user_id=user_id)
+        if isinstance(d, list):
+            return d
+        if isinstance(d, dict):
+            return d.get("results") or d.get("tax_rules") or []
+    except MLErro:
+        pass
+    return []
+
+
+def missed_feeds(user_id=None):
+    """GET /missed_feeds?app_id= — notificações que não receberam 200 após 8 tentativas em 1h."""
+    app_id = _app().get("client_id")
+    if not app_id:
+        return []
+    try:
+        d = _get("/missed_feeds", params={"app_id": app_id}, user_id=user_id)
+        if isinstance(d, list):
+            return d
+        if isinstance(d, dict):
+            return d.get("results") or d.get("messages") or []
+    except MLErro:
+        return []
+    return []
+
+
+# =========================================================================== #
 # Domínio C — Preço & Líquido
 # =========================================================================== #
 def atualizar_preco(item_id: str, preco: float, user_id=None) -> dict:
@@ -1498,7 +1553,9 @@ def sincronizar_envios(user_id, shipment_ids, cap=60) -> dict:
 
 def processar_notificacao(user_id, topic, resource) -> dict:
     try:
-        if topic in ("items", "marketplace_items", "items_prices") and resource:
+        item_topics = ("items", "marketplace_items", "items_prices",
+                       "stock_locations", "moderations_reports", "catalog_item_competition")
+        if topic in item_topics and resource:
             item_id = str(resource).rstrip("/").split("/")[-1]
             if item_id.startswith("ML") or item_id.startswith("CBT"):
                 it = obter_item(item_id, user_id=user_id)
