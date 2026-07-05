@@ -491,6 +491,63 @@ def adicionar_foto(item_id: str, url: str, user_id=None):
 
 
 # =========================================================================== #
+# Domínio B2 — Publicação (categoria, atributos, validação, criação)
+# =========================================================================== #
+def prever_categoria(titulo, user_id=None, limit=6):
+    """Prediz categorias a partir do título (GET /sites/MLB/domain_discovery/search)."""
+    d = _get("/sites/MLB/domain_discovery/search",
+             params={"q": (titulo or "").strip(), "limit": limit}, user_id=user_id)
+    out = []
+    for x in (d if isinstance(d, list) else []):
+        if isinstance(x, dict) and x.get("category_id"):
+            out.append({"category_id": x.get("category_id"), "category_name": x.get("category_name"),
+                        "domain_id": x.get("domain_id"), "domain_name": x.get("domain_name")})
+    return out
+
+
+def atributos_categoria(category_id, user_id=None):
+    """Atributos da categoria (GET /categories/{cat}/attributes)."""
+    return _get("/categories/" + str(category_id) + "/attributes", user_id=user_id)
+
+
+def tipos_anuncio(user_id=None):
+    """Tipos de anúncio do site (GET /sites/MLB/listing_types); com fallback."""
+    try:
+        d = _get("/sites/MLB/listing_types", user_id=user_id)
+        if isinstance(d, list) and d:
+            return d
+    except MLErro:
+        pass
+    return [{"id": "gold_special", "name": "Clássico"}, {"id": "gold_pro", "name": "Premium"}]
+
+
+def validar_item(body, user_id=None):
+    """POST /items/validate — {ok, erros:[{code,message}]} sem levantar em 400."""
+    r = _req("POST", "/items/validate", json=body, user_id=user_id, raw=True)
+    if r.status_code < 400:
+        return {"ok": True, "erros": []}
+    try:
+        j = r.json()
+    except ValueError:
+        j = {}
+    causas = j.get("cause") if isinstance(j, dict) else None
+    erros = []
+    for c in (causas or []):
+        if isinstance(c, dict):
+            erros.append({"code": c.get("code"), "message": c.get("message") or c.get("cause") or str(c)})
+        else:
+            erros.append({"code": None, "message": str(c)})
+    if not erros:
+        erros = [{"code": r.status_code, "message": (isinstance(j, dict) and j.get("message")) or r.text[:200]}]
+    return {"ok": False, "erros": erros}
+
+
+def publicar_item(body, user_id=None):
+    """POST /items — cria o anúncio (levanta MLErro em falha)."""
+    return _post("/items", json=body, user_id=user_id)
+
+
+# =========================================================================== #
 # Domínio C — Preço & Líquido
 # =========================================================================== #
 def atualizar_preco(item_id: str, preco: float, user_id=None) -> dict:

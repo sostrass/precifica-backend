@@ -4752,6 +4752,261 @@ def ml_produto_ia_descricao(payload: dict = Body(...), user: User = Depends(auth
     return {"texto": texto, "chars": len(texto)}
 
 
+# =========================================================================== #
+# MOTOR DE PUBLICAÇÃO — origem Bling, categoria, atributos, validação, criação.
+# =========================================================================== #
+@app.get("/api/mercadolivre/publicar/bling")
+def ml_publicar_bling(busca: str = Query(""), somente_novos: bool = Query(False),
+                      page: int = Query(1, ge=1), page_size: int = Query(30, ge=1, le=100),
+                      user: User = Depends(auth.get_current_user)):
+    """Produtos do Bling candidatos a publicar, com flag se já existem no ML e preço sugerido."""
+    from .models import ProdutoCache, MLItemCache
+    cfg = precificacao.obter_config(user.id)
+    db = SessionLocal()
+    try:
+        skus_ml = {(x.sku or "").strip().upper() for x in
+                   db.query(MLItemCache.sku).filter(MLItemCache.user_id == user.id).all() if x.sku}
+        q = db.query(ProdutoCache).filter(ProdutoCache.user_id == user.id)
+        if busca.strip():
+            like = f"%{busca.strip()}%"
+            q = q.filter((ProdutoCache.nome.ilike(like)) | (ProdutoCache.sku.ilike(like)))
+        produtos = q.all()
+    finally:
+        db.close()
+    itens = []
+    for p in produtos:
+        sku_up = (p.sku or "").strip().upper()
+        ja = bool(sku_up and sku_up in skus_ml)
+        if somente_novos and ja:
+            continue
+        preco_bling = float(p.preco) if p.preco else None
+        preco_regra = None
+        if preco_bling:
+            av = precificacao.avaliar_com_cfg(cfg, 0.0, preco_atual=preco_bling, canal="mercadolivre")
+            preco_regra = av.get("preco_sugerido")
+        itens.append({
+            "produto_id": p.produto_id, "sku": p.sku, "nome": p.nome, "imagem": p.imagem,
+            "preco_bling": round(preco_bling, 2) if preco_bling else None,
+            "preco_regra": round(preco_regra, 2) if preco_regra else None,
+            "saldo": int(p.saldo) if p.saldo is not None else 0,
+            "ja_no_ml": ja,
+        })
+    total = len(itens)
+    novos = sum(1 for i in itens if not i["ja_no_ml"])
+    ini = (page - 1) * page_size
+    return {"itens": itens[ini:ini + page_size], "total": total, "novos": novos,
+            "page": page, "page_size": page_size}
+
+
+@app.get("/api/mercadolivre/categorias/prever")
+def ml_categoria_prever(titulo: str = Query(...), user: User = Depends(auth.get_current_user)):
+    if not titulo.strip():
+        raise HTTPException(status_code=422, detail="Informe o título para prever a categoria.")
+    return {"sugestoes": _ml_run(lambda ml: ml.prever_categoria(titulo, user.id))}
+
+
+def _atributos_uteis(bruto):
+    """Reduz os atributos da categoria ao que a UI usa (id, nome, obrigatório, valores)."""
+    out = []
+    for a in (bruto or []):
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        tags = a.get("tags") or {}
+        vtype = a.get("value_type") or "string"
+        valores = [{"id": v.get("id"), "nome": v.get("name")}
+                   for v in (a.get("values") or []) if isinstance(v, dict)][:60]
+        out.append({
+            "id": a.get("id"), "nome": a.get("name"),
+            "obrigatorio": bool(tags.get("required") or tags.get("catalog_required")),
+            "tipo": vtype, "valores": valores,
+            "permite_livre": vtype in ("string", "number", "number_unit") or not valores,
+        })
+    # obrigatórios primeiro
+    out.sort(key=lambda x: (not x["obrigatorio"], x["nome"] or ""))
+    return out
+
+
+@app.get("/api/mercadolivre/categorias/{category_id}/atributos")
+def ml_categoria_atributos(category_id: str, user: User = Depends(auth.get_current_user)):
+    bruto = _ml_run(lambda ml: ml.atributos_categoria(category_id, user.id))
+    uteis = _atributos_uteis(bruto)
+    return {"category_id": category_id, "atributos": uteis,
+            "obrigatorios": sum(1 for a in uteis if a["obrigatorio"]), "total": len(uteis)}
+
+
+@app.post("/api/mercadolivre/categorias/{category_id}/atributos/ia")
+def ml_categoria_atributos_ia(category_id: str, payload: dict = Body(...),
+                              user: User = Depends(auth.get_current_user)):
+    """IA preenche valores de atributos a partir do título. Retorna sugestões (revisáveis)."""
+    titulo = (payload or {}).get("titulo") or ""
+    if not titulo.strip():
+        raise HTTPException(status_code=422, detail="Informe o título para a IA inferir atributos.")
+    bruto = _ml_run(lambda ml: ml.atributos_categoria(category_id, user.id))
+    uteis = _atributos_uteis(bruto)
+    # foca nos mais úteis: obrigatórios + alguns comuns
+    comuns = {"BRAND", "MODEL", "COLOR", "MATERIAL", "GTIN", "LINE", "SIZE",
+              "PACKAGE_LENGTH", "ITEM_CONDITION"}
+    alvo = [a for a in uteis if a["obrigatorio"] or a["id"] in comuns][:14]
+    if not alvo:
+        return {"sugestoes": []}
+    linhas = "\n".join(f"- {a['id']} ({a['nome']})" for a in alvo)
+    prompt = (
+        "Você preenche fichas técnicas de produtos do Mercado Livre.\n"
+        "A partir do título abaixo, infira o valor de cada atributo listado. "
+        "Se não der para inferir com segurança, deixe vazio.\n"
+        "Responda em linhas no formato ATRIBUTO_ID=valor (uma por linha), sem comentários.\n\n"
+        f"Título: {titulo}\n\nAtributos:\n{linhas}\n"
+    )
+    txt = ai._gerar_texto(user.id, prompt)
+    mapa = {}
+    for ln in (txt or "").splitlines():
+        if "=" in ln:
+            kk, _, vv = ln.partition("=")
+            kk = kk.strip().strip("-").strip().upper()
+            vv = vv.strip().strip('"').strip("'").strip()
+            if kk and vv and vv.lower() not in ("vazio", "n/a", "na", "-", "nulo", "none"):
+                mapa[kk] = vv
+    por_id = {a["id"]: a for a in alvo}
+    sugestoes = []
+    for aid, val in mapa.items():
+        a = por_id.get(aid)
+        if not a:
+            continue
+        vid = None
+        for v in a["valores"]:
+            if (v["nome"] or "").strip().lower() == val.strip().lower():
+                vid = v["id"]
+                break
+        sugestoes.append({"id": aid, "nome": a["nome"], "value_name": val,
+                          "value_id": vid, "obrigatorio": a["obrigatorio"]})
+    return {"sugestoes": sugestoes}
+
+
+def _montar_item_body(titulo, category_id, preco, quantidade, listing_type_id="gold_special",
+                      condicao="new", pictures=None, atributos=None, sku=None, descricao=None):
+    body = {
+        "title": (titulo or "").strip()[:60],
+        "category_id": category_id,
+        "price": round(float(preco), 2),
+        "currency_id": "BRL",
+        "available_quantity": int(quantidade),
+        "buying_mode": "buy_it_now",
+        "listing_type_id": listing_type_id or "gold_special",
+        "condition": condicao or "new",
+        "pictures": [{"source": u} for u in (pictures or []) if u],
+    }
+    attrs = []
+    for a in (atributos or []):
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        item = {"id": a["id"]}
+        if a.get("value_id"):
+            item["value_id"] = a["value_id"]
+        if a.get("value_name"):
+            item["value_name"] = a["value_name"]
+        attrs.append(item)
+    if sku and not any(a.get("id") == "SELLER_SKU" for a in attrs):
+        attrs.append({"id": "SELLER_SKU", "value_name": str(sku)})
+    if attrs:
+        body["attributes"] = attrs
+    return body
+
+
+def _piso_guard_preco(user_id, sku, preco, permitir):
+    """Aplica a golden rule usando o Preço Bling do SKU. Levanta HTTPException se furar."""
+    if not sku:
+        return
+    from .models import ProdutoCache
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        b = db.query(ProdutoCache).filter(ProdutoCache.user_id == user_id,
+                                          func.upper(ProdutoCache.sku) == sku.strip().upper()).first()
+    finally:
+        db.close()
+    if not b or not b.preco:
+        return
+    cfg = precificacao.obter_config(user_id)
+    piso = precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", float(b.preco))
+    if piso is not None and preco < piso - 0.01 and not permitir:
+        raise HTTPException(status_code=400, detail={
+            "erro": "abaixo_do_piso",
+            "mensagem": f"R$ {preco:.2f} fica abaixo do piso de R$ {piso:.2f} (fura a margem).",
+            "piso": round(piso, 2), "minimo_seguro": round(piso, 2)})
+
+
+@app.post("/api/mercadolivre/produtos/validar")
+def ml_produto_validar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Monta o corpo do anúncio e roda POST /items/validate — devolve erros/avisos do ML."""
+    titulo = (payload or {}).get("titulo")
+    category_id = (payload or {}).get("category_id")
+    preco = (payload or {}).get("preco")
+    quantidade = (payload or {}).get("quantidade")
+    if not titulo or not category_id or preco is None or quantidade is None:
+        raise HTTPException(status_code=422, detail="Informe título, categoria, preço e quantidade.")
+    body = _montar_item_body(
+        titulo, category_id, preco, quantidade,
+        listing_type_id=payload.get("listing_type_id"), condicao=payload.get("condicao"),
+        pictures=payload.get("pictures"), atributos=payload.get("atributos"),
+        sku=payload.get("sku"), descricao=payload.get("descricao"))
+    res = _ml_run(lambda ml: ml.validar_item(body, user.id))
+    return {**res, "body": body}
+
+
+@app.post("/api/mercadolivre/produtos/publicar")
+def ml_produto_publicar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Publica o anúncio (POST /items) com trava de piso; grava no cache; devolve o item."""
+    from . import mercadolivre as ml
+    from .models import MLItemCache
+    titulo = (payload or {}).get("titulo")
+    category_id = (payload or {}).get("category_id")
+    preco = (payload or {}).get("preco")
+    quantidade = (payload or {}).get("quantidade")
+    sku = (payload or {}).get("sku")
+    if not titulo or not category_id or preco is None or quantidade is None:
+        raise HTTPException(status_code=422, detail="Informe título, categoria, preço e quantidade.")
+    try:
+        preco = round(float(preco), 2)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="Preço inválido.")
+    _piso_guard_preco(user.id, sku, preco, bool(payload.get("permitir_abaixo_piso")))
+    body = _montar_item_body(
+        titulo, category_id, preco, quantidade,
+        listing_type_id=payload.get("listing_type_id"), condicao=payload.get("condicao"),
+        pictures=payload.get("pictures"), atributos=payload.get("atributos"),
+        sku=sku, descricao=payload.get("descricao"))
+    criado = _ml_run(lambda ml: ml.publicar_item(body, user.id))
+    item_id = criado.get("id") if isinstance(criado, dict) else None
+    # descrição (endpoint separado no ML)
+    descricao = (payload or {}).get("descricao")
+    if item_id and descricao and str(descricao).strip():
+        try:
+            _ml_run(lambda ml: ml.atualizar_descricao(item_id, str(descricao).strip(), user.id))
+        except Exception:
+            pass
+    # grava no cache local
+    if item_id:
+        db = SessionLocal()
+        try:
+            if not db.query(MLItemCache).filter(MLItemCache.user_id == user.id,
+                                                MLItemCache.item_id == item_id).first():
+                db.add(MLItemCache(
+                    user_id=user.id, item_id=item_id, sku=sku,
+                    titulo=criado.get("title"), preco=criado.get("price"),
+                    status=criado.get("status"), estoque=criado.get("available_quantity"),
+                    category_id=criado.get("category_id"),
+                    listing_type_id=criado.get("listing_type_id"),
+                    logistic_type=((criado.get("shipping") or {}).get("logistic_type")),
+                    permalink=criado.get("permalink"),
+                    imagem=((criado.get("pictures") or [{}])[0].get("url") if criado.get("pictures") else None),
+                    dados={"catalog_listing": criado.get("catalog_listing", False)}))
+                db.commit()
+        finally:
+            db.close()
+    return {"ok": True, "item_id": item_id, "permalink": criado.get("permalink") if isinstance(criado, dict) else None,
+            "status": criado.get("status") if isinstance(criado, dict) else None, "criado": criado}
+
+
 @app.get("/api/mercadolivre/agentes/execucoes")
 def ml_agentes_execucoes(limit: int = Query(10, ge=1, le=50), user: User = Depends(auth.get_current_user)):
     from .models import AgenteExecucao
