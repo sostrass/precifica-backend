@@ -454,6 +454,12 @@ def atualizar_status(item_id: str, status: str, user_id=None):
     return {"ok": True, "item_id": item_id, "status": status}
 
 
+def atualizar_titulo(item_id: str, titulo: str, user_id=None):
+    """Renomeia o anúncio (PUT /items/{id} {title}). Anúncios de catálogo não permitem."""
+    _put(f"/items/{item_id}", json={"title": (titulo or "").strip()[:60]}, user_id=user_id)
+    return {"ok": True, "item_id": item_id, "titulo": (titulo or "").strip()[:60]}
+
+
 def atualizar_estoque(item_id: str, qtd: int, user_id=None):
     _put(f"/items/{item_id}", json={"available_quantity": int(qtd)}, user_id=user_id)
     return {"ok": True, "item_id": item_id, "estoque": int(qtd)}

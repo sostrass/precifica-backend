@@ -4534,6 +4534,137 @@ def ml_produtos_painel(
         promo=promo or None, busca=busca or None, sort=sort, page=page, page_size=page_size)
 
 
+def _produto_um(user_id, item_id):
+    """Item único enriquecido (mesmos campos do painel) + preço sugerido pela regra."""
+    from .models import MLItemCache, ProdutoCache
+    from sqlalchemy import func
+    cfg = precificacao.obter_config(user_id)
+    db = SessionLocal()
+    try:
+        it = db.query(MLItemCache).filter(MLItemCache.user_id == user_id,
+                                          MLItemCache.item_id == item_id).first()
+        if not it:
+            return None
+        b = None
+        if it.sku:
+            b = db.query(ProdutoCache).filter(
+                ProdutoCache.user_id == user_id,
+                func.upper(ProdutoCache.sku) == it.sku.strip().upper()).first()
+    finally:
+        db.close()
+    preco_bling = float(b.preco) if (b and b.preco) else None
+    saldo_bling = int(b.saldo) if (b and b.saldo is not None) else None
+    piso = precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling) if preco_bling else None
+    liquido = _liquido_ml_preco(cfg, it.preco) if it.preco else None
+    # preço IDEAL pela regra (gross-up que preserva o líquido-alvo = Preço Bling)
+    preco_regra = None
+    if preco_bling:
+        av = precificacao.avaliar_com_cfg(cfg, 0.0, preco_atual=preco_bling, canal="mercadolivre")
+        preco_regra = av.get("preco_sugerido")
+    logi = (it.logistic_type or "").lower()
+    logi = "full" if logi == "fulfillment" else ("flex" if logi in ("self_service", "me2") else "normal")
+    dados = it.dados or {}
+    return {
+        "item_id": it.item_id, "sku": it.sku, "titulo": it.titulo,
+        "preco": round(it.preco, 2) if it.preco else None,
+        "status": it.status, "estoque": it.estoque, "logistica": logi,
+        "listing_type_id": it.listing_type_id,
+        "catalogo": bool(dados.get("catalog_listing")) if isinstance(dados, dict) else False,
+        "saude": round((it.saude or 0) * 100) if it.saude is not None else None,
+        "imagem": it.imagem, "permalink": it.permalink, "em_promocao": bool(it.em_promocao),
+        "preco_bling": round(preco_bling, 2) if preco_bling else None,
+        "liquido": liquido, "piso": round(piso, 2) if piso else None,
+        "preco_regra": round(preco_regra, 2) if preco_regra else None,
+        "abaixo_regra": (liquido is not None and preco_bling is not None and liquido < preco_bling - 0.01),
+        "tem_bling": b is not None, "estoque_bling": saldo_bling,
+        "estoque_divergente": (saldo_bling is not None and it.estoque is not None and abs(saldo_bling - it.estoque) > 0),
+        "sem_estoque": (it.estoque == 0),
+    }
+
+
+def _cache_item_patch(user_id, item_id, **campos):
+    """Atualiza in-loco a linha do cache do anúncio (sem re-sync completo)."""
+    from .models import MLItemCache
+    db = SessionLocal()
+    try:
+        it = db.query(MLItemCache).filter(MLItemCache.user_id == user_id,
+                                          MLItemCache.item_id == item_id).first()
+        if it:
+            for k, v in campos.items():
+                if v is not None and hasattr(it, k):
+                    setattr(it, k, v)
+            db.commit()
+    finally:
+        db.close()
+
+
+@app.get("/api/mercadolivre/produtos/{item_id}")
+def ml_produto_um(item_id: str, user: User = Depends(auth.get_current_user)):
+    r = _produto_um(user.id, item_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Anúncio não encontrado no cache. Sincronize o catálogo.")
+    return r
+
+
+@app.post("/api/mercadolivre/produtos/{item_id}/editar")
+def ml_produto_editar(item_id: str, payload: dict = Body(...),
+                      user: User = Depends(auth.get_current_user)):
+    """Edita título / preço / estoque / status de um anúncio, com TRAVA DE PISO no preço.
+    Body: {titulo?, preco?, estoque?, status?, permitir_abaixo_piso?}. Aplica só o que veio."""
+    from . import mercadolivre as ml
+    titulo = payload.get("titulo")
+    preco = payload.get("preco")
+    estoque = payload.get("estoque")
+    status = payload.get("status")
+    permitir = bool(payload.get("permitir_abaixo_piso"))
+
+    aplicados = {}
+    patch = {}
+
+    # ---- preço: golden rule (nunca abaixo do piso, salvo override manual) ----
+    if preco is not None:
+        try:
+            preco = round(float(preco), 2)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="Preço inválido.")
+        if preco <= 0:
+            raise HTTPException(status_code=422, detail="Preço deve ser maior que zero.")
+        _, piso = _piso_item(user.id, item_id)
+        if piso is not None and preco < piso - 0.01 and not permitir:
+            raise HTTPException(status_code=400, detail={
+                "erro": "abaixo_do_piso",
+                "mensagem": f"R$ {preco:.2f} fica abaixo do piso de R$ {piso:.2f} (fura a margem).",
+                "piso": round(piso, 2), "minimo_seguro": round(piso, 2),
+            })
+
+    # ---- aplica cada mudança que veio ----
+    if titulo is not None and str(titulo).strip():
+        _ml_run(lambda ml: ml.atualizar_titulo(item_id, str(titulo), user.id))
+        aplicados["titulo"] = str(titulo).strip()[:60]
+        patch["titulo"] = aplicados["titulo"]
+    if status is not None:
+        if status not in ("active", "paused", "closed"):
+            raise HTTPException(status_code=422, detail="Status deve ser active | paused | closed.")
+        _ml_run(lambda ml: ml.atualizar_status(item_id, status, user.id))
+        aplicados["status"] = status
+        patch["status"] = status
+    if estoque is not None:
+        _ml_run(lambda ml: ml.atualizar_estoque(item_id, int(estoque), user.id))
+        aplicados["estoque"] = int(estoque)
+        patch["estoque"] = int(estoque)
+    if preco is not None:
+        _ml_run(lambda ml: ml.atualizar_preco(item_id, preco, user.id))
+        aplicados["preco"] = preco
+        patch["preco"] = preco
+
+    if not aplicados:
+        raise HTTPException(status_code=422, detail="Nada para editar. Envie ao menos um campo.")
+
+    _cache_item_patch(user.id, item_id, **patch)
+    return {"ok": True, "item_id": item_id, "aplicados": aplicados,
+            "produto": _produto_um(user.id, item_id)}
+
+
 @app.get("/api/mercadolivre/agentes/execucoes")
 def ml_agentes_execucoes(limit: int = Query(10, ge=1, le=50), user: User = Depends(auth.get_current_user)):
     from .models import AgenteExecucao
