@@ -548,6 +548,7 @@ class MLItemCache(Base):
     preco = Column(Float, default=0.0)
     preco_original = Column(Float, default=0.0)
     status = Column(String, nullable=True)               # active | paused | closed
+    sub_status = Column(String, nullable=True)           # motivos (moderação/pausa), separados por vírgula
     estoque = Column(Integer, nullable=True)
     category_id = Column(String, nullable=True)
     listing_type_id = Column(String, nullable=True)      # free | gold_special | gold_pro

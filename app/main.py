@@ -2107,6 +2107,76 @@ def ml_reputacao(user: User = Depends(auth.get_current_user)):
     return _ml_run(lambda ml: ml.reputacao(user.id))
 
 
+def _cor_nivel(level_id):
+    l = (level_id or "").lower()
+    if "green" in l:
+        return "verde"
+    if "yellow" in l:
+        return "amarelo"
+    if "orange" in l:
+        return "laranja"
+    if "red" in l:
+        return "vermelho"
+    return None
+
+
+_TIER_LABEL = {"platinum": "Mercado Líder Platinum", "gold": "Mercado Líder Gold",
+               "silver": "Mercado Líder"}
+
+
+def _metrica(m, meta):
+    """Normaliza uma métrica do ML (rate fração -> %) com meta e veredito."""
+    if not isinstance(m, dict):
+        return None
+    rate = m.get("rate")
+    pct = round(float(rate) * 100, 2) if rate is not None else None
+    return {"rate": pct, "valor": m.get("value"), "periodo": m.get("period"),
+            "meta": meta, "ok": (pct is not None and pct <= meta)}
+
+
+@app.get("/api/mercadolivre/reputacao/painel")
+def ml_reputacao_painel(user: User = Depends(auth.get_current_user)):
+    """Reputação do vendedor normalizada para o painel (nível/cor, tier, métricas)."""
+    from . import mercadolivre as ml
+    try:
+        rep = ml.reputacao(user.id)
+    except ml.MLNaoConfigurado:
+        return {"conectado": False}
+    except ml.MLErro as e:
+        return {"conectado": False, "erro": str(e)[:200]}
+    if not rep or not (rep.get("nivel") or rep.get("metricas") or rep.get("transacoes")):
+        return {"conectado": True, "sem_dados": True}
+    nivel = rep.get("nivel")
+    cor = _cor_nivel(nivel)
+    nivel_num = None
+    for ch in (nivel or ""):
+        if ch.isdigit():
+            nivel_num = int(ch)
+            break
+    tier = rep.get("status")
+    metr = rep.get("metricas") or {}
+    trans = rep.get("transacoes") or {}
+    ratings = trans.get("ratings") or {}
+    return {
+        "conectado": True,
+        "nivel": nivel, "nivel_num": nivel_num, "cor": cor,
+        "tier": tier, "tier_label": _TIER_LABEL.get(tier), "eh_lider": bool(tier),
+        "metricas": {
+            "reclamacoes": _metrica(metr.get("claims"), 3.0),
+            "envio_atrasado": _metrica(metr.get("delayed_handling_time"), 15.0),
+            "cancelamentos": _metrica(metr.get("cancellations"), 3.0),
+            "vendas": {"completadas": (metr.get("sales") or {}).get("completed"),
+                       "periodo": (metr.get("sales") or {}).get("period")},
+        },
+        "transacoes": {
+            "total": trans.get("total"), "completadas": trans.get("completed"),
+            "canceladas": trans.get("canceled"),
+            "positivas": ratings.get("positive"), "neutras": ratings.get("neutral"),
+            "negativas": ratings.get("negative"),
+        },
+    }
+
+
 # --- Conexão multi-tenant (popup, salva a conta no banco) ---
 @app.get("/api/mercadolivre/auth/login")
 def ml_auth_login(request: Request, user: User = Depends(auth.get_current_user)):
@@ -3603,6 +3673,87 @@ def ml_ads_painel(dias: int = Query(30), user: User = Depends(auth.get_current_u
                        "clicks": tot["clicks"], "prints": tot["prints"], "roas": roas, "acos": acos}}
 
 
+def _ads_advertiser(user_id):
+    """Resolve (advertiser_id, site_id) do primeiro advertiser de Product Ads."""
+    from . import mercadolivre as ml
+    adv = ml.ads_advertisers(user_id)
+    lista = (adv.get("advertisers") if isinstance(adv, dict) else adv) or []
+    if not lista:
+        raise HTTPException(status_code=400, detail="Nenhum advertiser de Product Ads nesta conta.")
+    a0 = lista[0]
+    return (a0.get("advertiser_id") or a0.get("id"), a0.get("site_id") or "MLB")
+
+
+@app.get("/api/mercadolivre/ads/campanha/{campaign_id}/itens")
+def ml_ads_campanha_itens(campaign_id: str, dias: int = Query(30),
+                          user: User = Depends(auth.get_current_user)):
+    """Anúncios dentro de uma campanha, com métricas por item (best-effort)."""
+    from . import mercadolivre as ml
+    try:
+        _adv, site_id = _ads_advertiser(user.id)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=f"Mercado Livre não conectado: {e}")
+    df = (datetime.utcnow() - timedelta(days=dias)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        raw = ml.ads_itens_campanha(campaign_id, site_id, user.id, date_from=df, date_to=dt)
+    except ml.MLErro as e:
+        return {"itens": [], "indisponivel": True, "detalhe": str(e)[:200]}
+    results = (raw.get("results") if isinstance(raw, dict) else raw) or []
+    itens = []
+    from .models import MLItemCache
+    ids = [str(c.get("id") or c.get("item_id")) for c in results if (c.get("id") or c.get("item_id"))]
+    db = SessionLocal()
+    try:
+        cache = ({m.item_id: m for m in db.query(MLItemCache).filter(
+                  MLItemCache.user_id == user.id, MLItemCache.item_id.in_(ids)).all()} if ids else {})
+    finally:
+        db.close()
+    for c in results:
+        iid = str(c.get("id") or c.get("item_id") or "")
+        mtr = c.get("metrics") or {}
+        m = cache.get(iid)
+        itens.append({
+            "item_id": iid, "titulo": (m.titulo if m else c.get("title")),
+            "imagem": (m.imagem if m else c.get("thumbnail")), "status": c.get("status"),
+            "clicks": mtr.get("clicks"), "prints": mtr.get("prints"), "ctr": _npx(mtr.get("ctr")),
+            "cost": _npx(mtr.get("cost")), "cpc": _npx(mtr.get("cpc")), "acos": _npx(mtr.get("acos")),
+            "roas": _npx(mtr.get("roas")), "cvr": _npx(mtr.get("cvr")), "gmv": _npx(mtr.get("total_amount")),
+        })
+    itens.sort(key=lambda x: x.get("cost") or 0, reverse=True)
+    return {"campaign_id": campaign_id, "itens": itens}
+
+
+@app.post("/api/mercadolivre/ads/campanha/{campaign_id}")
+def ml_ads_campanha_editar(campaign_id: str, payload: dict = Body(...),
+                           user: User = Depends(auth.get_current_user)):
+    """Pausa/ativa ou ajusta budget/ACOS-alvo da campanha (best-effort — PUT campaigns/{id})."""
+    from . import mercadolivre as ml
+    campos = {}
+    if payload.get("status") in ("active", "paused"):
+        campos["status"] = payload["status"]
+    if payload.get("budget") is not None:
+        try:
+            campos["budget"] = round(float(payload["budget"]), 2)
+        except (TypeError, ValueError):
+            pass
+    if payload.get("acos_target") is not None:
+        try:
+            campos["acos_target"] = float(payload["acos_target"])
+        except (TypeError, ValueError):
+            pass
+    if not campos:
+        raise HTTPException(status_code=422, detail="Nada para editar (status, budget ou acos_target).")
+    try:
+        _adv, site_id = _ads_advertiser(user.id)
+        r = ml.ads_editar_campanha(campaign_id, site_id, campos, user.id)
+    except ml.MLNaoConfigurado as e:
+        raise HTTPException(status_code=400, detail=f"Mercado Livre não conectado: {e}")
+    except ml.MLErro as e:
+        raise HTTPException(status_code=502, detail=f"Mercado Ads recusou a alteração: {str(e)[:200]}")
+    return {"ok": True, "campaign_id": campaign_id, "aplicado": campos, "retorno": r}
+
+
 @app.get("/api/mercadolivre/promocoes/promocao/{promotion_id}/metricas")
 def ml_promo_promocao_metricas(promotion_id: str, promotion_type: str = Query(...),
                                inicio: str = Query(None), fim: str = Query(None),
@@ -4564,6 +4715,16 @@ def _produto_um(user_id, item_id):
     logi = (it.logistic_type or "").lower()
     logi = "full" if logi == "fulfillment" else ("flex" if logi in ("self_service", "me2") else "normal")
     dados = it.dados or {}
+    # fotos: o cache guarda só a capa; busca ao vivo todas as imagens (best-effort)
+    fotos = [it.imagem] if it.imagem else []
+    try:
+        from . import mercadolivre as ml
+        live = ml.obter_item(item_id, user_id=user_id)
+        lf = [f for f in (live.get("fotos") or []) if f]
+        if lf:
+            fotos = lf
+    except Exception:  # noqa: BLE001 — sem foto ao vivo não pode derrubar o cockpit
+        pass
     return {
         "item_id": it.item_id, "sku": it.sku, "titulo": it.titulo,
         "preco": round(it.preco, 2) if it.preco else None,
@@ -4571,7 +4732,7 @@ def _produto_um(user_id, item_id):
         "listing_type_id": it.listing_type_id,
         "catalogo": bool(dados.get("catalog_listing")) if isinstance(dados, dict) else False,
         "saude": round((it.saude or 0) * 100) if it.saude is not None else None,
-        "imagem": it.imagem, "permalink": it.permalink, "em_promocao": bool(it.em_promocao),
+        "imagem": it.imagem, "fotos": fotos, "permalink": it.permalink, "em_promocao": bool(it.em_promocao),
         "preco_bling": round(preco_bling, 2) if preco_bling else None,
         "liquido": liquido, "piso": round(piso, 2) if piso else None,
         "preco_regra": round(preco_regra, 2) if preco_regra else None,
@@ -4784,8 +4945,14 @@ def ml_publicar_bling(busca: str = Query(""), somente_novos: bool = Query(False)
         if preco_bling:
             av = precificacao.avaliar_com_cfg(cfg, 0.0, preco_atual=preco_bling, canal="mercadolivre")
             preco_regra = av.get("preco_sugerido")
+        _d = p.dados or {}
+        _ext = (((_d.get("midia") or {}).get("imagens") or {}).get("externas") or []) if isinstance(_d, dict) else []
+        imagens = [i.get("link") for i in _ext if isinstance(i, dict) and i.get("link")]
+        if not imagens and p.imagem:
+            imagens = [p.imagem]
         itens.append({
             "produto_id": p.produto_id, "sku": p.sku, "nome": p.nome, "imagem": p.imagem,
+            "imagens": imagens,
             "preco_bling": round(preco_bling, 2) if preco_bling else None,
             "preco_regra": round(preco_regra, 2) if preco_regra else None,
             "saldo": int(p.saldo) if p.saldo is not None else 0,
@@ -5355,6 +5522,127 @@ def ml_webhooks_recuperar(user: User = Depends(auth.get_current_user)):
         except Exception:  # noqa: BLE001
             pass
     return {"ok": True, "encontradas": len(itens), "reprocessadas": reprocessados}
+
+
+# =========================================================================== #
+# SAÚDE & MODERAÇÃO — anúncios pausados/em revisão e saúde baixa, com o motivo
+# e o que corrigir (reusa o diagnóstico qualidade_ml).
+# =========================================================================== #
+_SUBSTATUS_LABEL = {
+    "under_review": "Em revisão pelo Mercado Livre",
+    "pending_documentation": "Documentação pendente",
+    "waiting_for_pictures": "Aguardando fotos",
+    "picture_download_pending": "Fotos em processamento",
+    "suspended": "Suspenso",
+    "banned": "Banido por infração",
+    "forbidden": "Conteúdo proibido",
+    "freeze": "Congelado",
+    "deleted": "Excluído",
+    "out_of_stock": "Sem estoque",
+    "expired": "Expirado",
+    "inactive": "Inativo",
+    "moderation_reports": "Reportado por moderação",
+    "warning": "Advertência de qualidade",
+}
+_SUBSTATUS_GRAVE = {"suspended", "banned", "forbidden", "pending_documentation", "under_review", "freeze"}
+
+
+def _substatus_lista(sub):
+    if not sub:
+        return []
+    if isinstance(sub, list):
+        return [str(x) for x in sub if x]
+    return [p for p in str(sub).split(",") if p]
+
+
+def _saude_painel(user_id, situacao="todos", busca=None, page=1, page_size=40):
+    from .models import MLItemCache
+    db = SessionLocal()
+    try:
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user_id).all()
+    finally:
+        db.close()
+    linhas = []
+    dist = {"critico": 0, "medio": 0, "bom": 0, "sem": 0}
+    for it in itens:
+        subs = _substatus_lista(it.sub_status)
+        grave = any(s in _SUBSTATUS_GRAVE for s in subs)
+        saude_pct = round((it.saude or 0) * 100) if it.saude is not None else None
+        if saude_pct is None:
+            dist["sem"] += 1
+        elif saude_pct < 50:
+            dist["critico"] += 1
+        elif saude_pct < 80:
+            dist["medio"] += 1
+        else:
+            dist["bom"] += 1
+        # classifica em qual balde de atenção cai
+        estado = None
+        if it.status == "under_review" or grave:
+            estado = "revisao"
+        elif it.status == "paused":
+            estado = "pausado"
+        elif it.status == "active" and saude_pct is not None and saude_pct < 80:
+            estado = "saude_baixa"
+        if estado:
+            linhas.append({
+                "item_id": it.item_id, "sku": it.sku, "titulo": it.titulo, "imagem": it.imagem,
+                "status": it.status, "sub_status": subs,
+                "motivos": [_SUBSTATUS_LABEL.get(s, s) for s in subs],
+                "grave": grave, "saude": saude_pct, "permalink": it.permalink, "estado": estado,
+            })
+    kpis = {
+        "total": len(itens),
+        "revisao": sum(1 for x in linhas if x["estado"] == "revisao"),
+        "pausados": sum(1 for x in linhas if x["estado"] == "pausado"),
+        "saude_baixa": sum(1 for x in linhas if x["estado"] == "saude_baixa"),
+        "atencao": len(linhas),
+        "distribuicao": dist,
+        "saude_media": (round(sum((it.saude or 0) * 100 for it in itens if it.saude is not None)
+                              / max(1, sum(1 for it in itens if it.saude is not None)))
+                        if any(it.saude is not None for it in itens) else None),
+    }
+
+    def _passa(x):
+        if situacao and situacao != "todos" and x["estado"] != situacao:
+            return False
+        if busca:
+            q = busca.strip().lower()
+            if q not in f"{x['titulo'] or ''} {x['sku'] or ''} {x['item_id']}".lower():
+                return False
+        return True
+
+    filtrados = [x for x in linhas if _passa(x)]
+    # graves primeiro, depois menor saúde
+    filtrados.sort(key=lambda x: (not x["grave"], x["saude"] if x["saude"] is not None else 100))
+    total = len(filtrados)
+    ini = max(0, (page - 1) * page_size)
+    return {"kpis": kpis, "itens": filtrados[ini:ini + page_size], "total": total,
+            "situacao": situacao, "page": page, "page_size": page_size}
+
+
+@app.get("/api/mercadolivre/saude/painel")
+def ml_saude_painel(situacao: str = Query("todos"), busca: str = Query(""),
+                    page: int = Query(1, ge=1), page_size: int = Query(40, ge=1, le=200),
+                    user: User = Depends(auth.get_current_user)):
+    if situacao not in ("todos", "revisao", "pausado", "saude_baixa"):
+        situacao = "todos"
+    return _saude_painel(user.id, situacao=situacao, busca=busca or None, page=page, page_size=page_size)
+
+
+@app.get("/api/mercadolivre/saude/item/{item_id}")
+def ml_saude_item(item_id: str, user: User = Depends(auth.get_current_user)):
+    """Diagnóstico do anúncio: status/motivos de moderação + o que corrigir (score e componentes)."""
+    diag = _ml_run(lambda ml: ml.qualidade_ml(item_id, user.id))
+    subs = _substatus_lista(diag.get("sub_status"))
+    grave = any(s in _SUBSTATUS_GRAVE for s in subs)
+    return {
+        "item_id": item_id, "titulo": diag.get("titulo"), "status": diag.get("status"),
+        "sub_status": subs, "motivos": [_SUBSTATUS_LABEL.get(s, s) for s in subs], "grave": grave,
+        "score": diag.get("score"), "health": diag.get("health"),
+        "componentes": diag.get("componentes") or [],
+        "reativavel": (diag.get("status") in ("paused",) and not grave),
+    }
 
 
 @app.get("/api/mercadolivre/agentes/execucoes")

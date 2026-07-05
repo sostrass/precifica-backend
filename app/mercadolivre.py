@@ -312,6 +312,25 @@ def ads_campanhas(advertiser_id, site_id, user_id=None, date_from=None, date_to=
                 user_id=user_id, params=params, headers={"api-version": "2"})
 
 
+def ads_itens_campanha(campaign_id, site_id, user_id=None, date_from=None, date_to=None,
+                       limit=50, offset=0):
+    """Anúncios (itens) dentro de uma campanha de Product Ads, com métricas."""
+    metrics = "clicks,prints,ctr,cost,cpc,acos,roas,cvr,total_amount"
+    params = {"limit": limit, "offset": offset, "metrics": metrics}
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    return _req("GET", f"/advertising/{site_id}/product_ads/campaigns/{campaign_id}/items/search",
+                user_id=user_id, params=params, headers={"api-version": "2"})
+
+
+def ads_editar_campanha(campaign_id, site_id, campos, user_id=None):
+    """Edita a campanha (status/budget/acos_target/strategy) — PUT product_ads/campaigns/{id}."""
+    return _req("PUT", f"/advertising/{site_id}/product_ads/campaigns/{campaign_id}",
+                user_id=user_id, json=campos, headers={"api-version": "2"})
+
+
 # =========================================================================== #
 # Domínio A — Conta
 # =========================================================================== #
@@ -1250,7 +1269,8 @@ def qualidade_ml(item_id: str, user_id=None) -> dict:
     comp.append({"chave": "video", "label": "Vídeo", "valor": 15 if tv else 0, "max": 15,
                  "status": "ok" if tv else "alerta", "detalhe": "com vídeo" if tv else "sem vídeo"})
     return {"item_id": item_id, "score": sum(c["valor"] for c in comp), "health": it.get("health"),
-            "titulo": t, "status": it.get("status"), "componentes": comp}
+            "titulo": t, "status": it.get("status"), "sub_status": it.get("sub_status"),
+            "componentes": comp}
 
 
 # =========================================================================== #
@@ -1266,6 +1286,8 @@ def _upsert_cache(db, user_id, it):
     c.preco = it.get("preco") or 0
     c.preco_original = it.get("preco_original") or 0
     c.status = it.get("status")
+    ss = it.get("sub_status")
+    c.sub_status = (",".join([str(x) for x in ss]) if isinstance(ss, list) else (str(ss) if ss else None))
     c.estoque = it.get("estoque")
     c.category_id = it.get("category_id")
     c.listing_type_id = it.get("listing_type_id")

@@ -79,6 +79,9 @@ def garantir_colunas_extras():
         "agente_config": [
             ("teto_desconto_pct", "INTEGER"),
         ],
+        "ml_item_cache": [
+            ("sub_status", "VARCHAR"),
+        ],
     }
     try:
         with engine.begin() as conn:
