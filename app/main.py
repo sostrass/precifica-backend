@@ -4361,6 +4361,179 @@ def ml_agentes_resumo_semana(dias: int = Query(7, ge=1, le=90), user: User = Dep
             "por_agente": por_agente, "serie": serie}
 
 
+# =========================================================================== #
+# CENTRAL DE PRODUTOS (Mercado Livre) — painel: KPIs + lista filtrada.
+# Lê do cache local (MLItemCache) + join Bling (ProdutoCache), aplica a regra
+# de precificação (piso = menor preço cujo líquido cobre o Preço Bling).
+# =========================================================================== #
+def _liquido_ml_preco(cfg, preco):
+    """Líquido que sobra de um preço de venda no ML, pela faixa consistente da regra."""
+    if not preco or preco <= 0:
+        return None
+    canais = (cfg or {}).get("canais") or []
+    c = next((x for x in canais if (x.get("canal") or "").lower() == "mercadolivre"), None)
+    if not c:
+        return None
+    faixas = sorted(c.get("faixas") or [], key=lambda f: (f.get("ate") is None, f.get("ate") or 0))
+    faixa = next((f for f in faixas if f.get("ate") is None or preco <= float(f.get("ate") or 0)), None)
+    if not faixa and faixas:
+        faixa = faixas[-1]
+    if not faixa:
+        return None
+    imp = float(cfg.get("imposto", 0)); car = float(cfg.get("cartao", 0)); emb = float(cfg.get("embalagem", 0))
+    comissao = float(faixa.get("comissao", 0)); fixo = float(faixa.get("fixo", 0)); fixo_pct = float(faixa.get("fixo_pct", 0))
+    liquido = preco - preco * comissao / 100.0 - (fixo + preco * fixo_pct / 100.0) - preco * imp / 100.0 - preco * car / 100.0 - emb
+    return round(liquido, 2)
+
+
+_ML_STATUS_LABEL = {"active": "active", "paused": "paused", "closed": "closed",
+                    "under_review": "under_review", "inactive": "inactive", "payment_required": "payment_required"}
+
+
+def _produtos_painel(user_id, status=None, logistica=None, catalogo=None, saude_lt=None,
+                     divergente=None, promo=None, busca=None, sort="recentes",
+                     page=1, page_size=40):
+    from . import mercadolivre as ml
+    from .models import MLItemCache, ProdutoCache
+    cfg = precificacao.obter_config(user_id)
+    db = SessionLocal()
+    try:
+        itens = db.query(MLItemCache).filter(MLItemCache.user_id == user_id).all()
+        blings = db.query(ProdutoCache).filter(ProdutoCache.user_id == user_id).all()
+    finally:
+        db.close()
+    bling_por_sku = {}
+    for b in blings:
+        if b.sku:
+            bling_por_sku[b.sku.strip().upper()] = b
+
+    def _logi(lt):
+        lt = (lt or "").lower()
+        if lt == "fulfillment":
+            return "full"
+        if lt in ("self_service", "me2"):
+            return "flex"
+        return "normal"
+
+    enriquecidos = []
+    for it in itens:
+        sku = (it.sku or "").strip()
+        b = bling_por_sku.get(sku.upper()) if sku else None
+        preco_bling = float(b.preco) if (b and b.preco) else None       # líquido-alvo (Preço Bling)
+        saldo_bling = int(b.saldo) if (b and b.saldo is not None) else None
+        piso = precificacao.preco_minimo_para_liquido(cfg, "mercadolivre", preco_bling) if preco_bling else None
+        liquido = _liquido_ml_preco(cfg, it.preco) if it.preco else None
+        abaixo_regra = (liquido is not None and preco_bling is not None and liquido < preco_bling - 0.01)
+        estoque_ml = it.estoque if it.estoque is not None else None
+        estoque_div = (saldo_bling is not None and estoque_ml is not None and abs(saldo_bling - estoque_ml) > 0)
+        dados = it.dados or {}
+        catalog_flag = bool(dados.get("catalog_listing")) if isinstance(dados, dict) else False
+        saude_pct = round((it.saude or 0) * 100) if it.saude is not None else None
+        logi = _logi(it.logistic_type)
+        enriquecidos.append({
+            "item_id": it.item_id, "sku": sku or None, "titulo": it.titulo,
+            "preco": round(it.preco, 2) if it.preco else None,
+            "preco_original": round(it.preco_original, 2) if it.preco_original else None,
+            "status": it.status, "estoque": estoque_ml, "logistica": logi,
+            "listing_type_id": it.listing_type_id, "catalogo": catalog_flag,
+            "saude": saude_pct, "imagem": it.imagem, "permalink": it.permalink,
+            "em_promocao": bool(it.em_promocao),
+            "preco_bling": round(preco_bling, 2) if preco_bling else None,
+            "liquido": liquido, "piso": round(piso, 2) if piso else None,
+            "abaixo_regra": abaixo_regra, "tem_bling": b is not None,
+            "estoque_bling": saldo_bling, "estoque_divergente": estoque_div,
+            "sem_estoque": (estoque_ml == 0),
+        })
+
+    # ---- KPIs sobre o conjunto todo ----
+    def _cont(p):
+        return sum(1 for e in enriquecidos if p(e))
+    saudes = [e["saude"] for e in enriquecidos if e["saude"] is not None]
+    kpis = {
+        "total": len(enriquecidos),
+        "ativos": _cont(lambda e: e["status"] == "active"),
+        "pausados": _cont(lambda e: e["status"] == "paused"),
+        "fechados": _cont(lambda e: e["status"] == "closed"),
+        "em_revisao": _cont(lambda e: e["status"] == "under_review"),
+        "sem_estoque": _cont(lambda e: e["sem_estoque"]),
+        "full": _cont(lambda e: e["logistica"] == "full"),
+        "flex": _cont(lambda e: e["logistica"] == "flex"),
+        "catalogo": _cont(lambda e: e["catalogo"]),
+        "saude_media": round(sum(saudes) / len(saudes)) if saudes else None,
+        "saudaveis": _cont(lambda e: (e["saude"] or 0) >= 80),
+        "melhorar": _cont(lambda e: e["saude"] is not None and e["saude"] < 80),
+        "abaixo_regra": _cont(lambda e: e["abaixo_regra"]),
+        "sem_bling": _cont(lambda e: not e["tem_bling"]),
+        "preco_divergente": _cont(lambda e: e["abaixo_regra"]),
+        "estoque_divergente": _cont(lambda e: e["estoque_divergente"]),
+        "em_promocao": _cont(lambda e: e["em_promocao"]),
+    }
+
+    # ---- filtros ----
+    def _passa(e):
+        if status and status != "todos":
+            if status == "sem_estoque":
+                if not e["sem_estoque"]:
+                    return False
+            elif e["status"] != status:
+                return False
+        if logistica and e["logistica"] != logistica:
+            return False
+        if catalogo and not e["catalogo"]:
+            return False
+        if promo and not e["em_promocao"]:
+            return False
+        if saude_lt is not None and not (e["saude"] is not None and e["saude"] < saude_lt):
+            return False
+        if divergente and not (e["abaixo_regra"] or e["estoque_divergente"]):
+            return False
+        if busca:
+            q = busca.strip().lower()
+            alvo = f"{e['titulo'] or ''} {e['sku'] or ''} {e['item_id'] or ''}".lower()
+            if q not in alvo:
+                return False
+        return True
+
+    filtrados = [e for e in enriquecidos if _passa(e)]
+
+    # ---- ordenação ----
+    if sort == "saude":
+        filtrados.sort(key=lambda e: (e["saude"] is None, e["saude"] or 0))
+    elif sort == "preco":
+        filtrados.sort(key=lambda e: (e["preco"] or 0), reverse=True)
+    elif sort == "estoque":
+        filtrados.sort(key=lambda e: (e["estoque"] if e["estoque"] is not None else 1e9))
+    # 'recentes' mantém a ordem do cache (já vem por atualização)
+
+    total_filtrado = len(filtrados)
+    ini = max(0, (page - 1) * page_size)
+    pagina = filtrados[ini:ini + page_size]
+
+    return {"kpis": kpis, "itens": pagina, "total_filtrado": total_filtrado,
+            "page": page, "page_size": page_size,
+            "cache_vazio": len(enriquecidos) == 0}
+
+
+@app.get("/api/mercadolivre/produtos/painel")
+def ml_produtos_painel(
+    status: str = Query("todos"),
+    logistica: str = Query(""),
+    catalogo: bool = Query(False),
+    saude_lt: int = Query(0),
+    divergente: bool = Query(False),
+    promo: bool = Query(False),
+    busca: str = Query(""),
+    sort: str = Query("recentes"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(40, ge=1, le=200),
+    user: User = Depends(auth.get_current_user),
+):
+    return _produtos_painel(
+        user.id, status=status or None, logistica=logistica or None,
+        catalogo=catalogo or None, saude_lt=(saude_lt or None), divergente=divergente or None,
+        promo=promo or None, busca=busca or None, sort=sort, page=page, page_size=page_size)
+
+
 @app.get("/api/mercadolivre/agentes/execucoes")
 def ml_agentes_execucoes(limit: int = Query(10, ge=1, le=50), user: User = Depends(auth.get_current_user)):
     from .models import AgenteExecucao
