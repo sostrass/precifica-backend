@@ -47,6 +47,9 @@ def garantir_colunas_extras():
             ("cond_ativo", "BOOLEAN DEFAULT FALSE"),
             ("cond_gatilho_pct", "FLOAT DEFAULT 0"),
             ("cond_max", "INTEGER DEFAULT 3"),
+            ("janelas", "JSON"),
+            ("cond_estoque", "BOOLEAN DEFAULT FALSE"),
+            ("cond_surto", "BOOLEAN DEFAULT FALSE"),
         ],
         "shopee_boost_item": [
             ("auto", "BOOLEAN DEFAULT FALSE"),

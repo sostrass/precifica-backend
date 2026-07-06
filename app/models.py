@@ -310,6 +310,23 @@ class ShopeeBoostItem(Base):
     impulsos = Column(Integer, default=0)             # contador de quantas vezes
     auto = Column(Boolean, default=False)             # entrou pela auto-seleção (vs manual)
     condicional = Column(Boolean, default=False)      # fixado pelo Radar (concorrente furou preço)
+
+
+class ShopeeBoostLog(Base):
+    """Histórico DURÁVEL de cada boost (auto/manual/radar). Base para a atribuição de vendas:
+    cada linha é uma janela [inicio, fim] em que um produto ficou em destaque."""
+
+    __tablename__ = "shopee_boost_log"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    item_id = Column(String, nullable=False, index=True)
+    nome = Column(String, nullable=True)
+    tipo = Column(String, default="auto")                 # auto | manual | radar
+    inicio = Column(DateTime, default=datetime.utcnow, index=True)
+    fim = Column(DateTime, nullable=True)                 # inicio + 4h
+    vendas_atribuidas = Column(Integer, nullable=True)    # unidades vendidas na janela (atribuição)
+    atribuido_em = Column(DateTime, nullable=True)
     motivo = Column(String, nullable=True)            # por que está em boost condicional
     criado_em = Column(DateTime, default=datetime.utcnow)
 
@@ -333,6 +350,9 @@ class ShopeeBoostConfig(Base):
     cond_ativo = Column(Boolean, default=False)       # boost condicional pelo Radar
     cond_gatilho_pct = Column(Float, default=0.0)     # concorrente X% mais barato dispara (0 = qualquer)
     cond_max = Column(Integer, default=3)             # máx itens em boost condicional ao mesmo tempo
+    janelas = Column(JSON, nullable=True)             # [[ini,fim],...] janelas de pico (sobrepõe janela_inicio/fim)
+    cond_estoque = Column(Boolean, default=False)     # condicional: empurrar antes de esgotar (estoque baixo + giro alto)
+    cond_surto = Column(Boolean, default=False)       # condicional: surfar surto de vendas
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
 

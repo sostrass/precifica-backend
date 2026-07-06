@@ -19,6 +19,23 @@ _MSG_CHEIO = ("As 5 vagas de destaque da Shopee já estão ocupadas — inclui o
               "assim que houver vaga, o motor impulsiona sozinho.")
 
 
+def _log_boost(db, user_id, reg, inicio, fim):
+    """Grava uma janela de boost no histórico durável, sem duplicar a mesma janela em aberto."""
+    from .models import ShopeeBoostLog
+    try:
+        aberto = (db.query(ShopeeBoostLog)
+                  .filter(ShopeeBoostLog.user_id == user_id,
+                          ShopeeBoostLog.item_id == str(reg.item_id),
+                          ShopeeBoostLog.fim > inicio).first())
+        if aberto:
+            return
+        tipo = "radar" if reg.condicional else ("auto" if reg.auto else "manual")
+        db.add(ShopeeBoostLog(user_id=user_id, item_id=str(reg.item_id), nome=reg.nome,
+                              tipo=tipo, inicio=inicio, fim=fim))
+    except Exception:  # noqa: BLE001 — histórico nunca derruba o ciclo
+        pass
+
+
 def _boosted_ids(user_id: int):
     """IDs dos itens que a Shopee reporta em destaque AGORA (inclui os boosts manuais).
     Retorna lista de strings, ou None se não deu para ler (não bloqueia o ciclo)."""
@@ -51,12 +68,25 @@ def _config(db, user_id: int) -> ShopeeBoostConfig:
 
 
 def _na_janela(cfg: ShopeeBoostConfig) -> bool:
-    """Respeita a janela de horário (0/0 = sempre)."""
+    """Respeita a(s) janela(s) de horário em horário de Brasília. `janelas` (lista de [ini,fim])
+    tem prioridade; senão usa a janela única (0/0 = sempre)."""
+    h = (datetime.utcnow() - timedelta(hours=3)).hour  # Brasília (UTC-3)
+
+    def _bate(ini, fim):
+        return (ini <= h < fim) if ini <= fim else (h >= ini or h < fim)
+
+    janelas = getattr(cfg, "janelas", None)
+    if janelas and isinstance(janelas, list):
+        for j in janelas:
+            try:
+                if _bate(int(j[0]), int(j[1])):
+                    return True
+            except (TypeError, ValueError, IndexError):
+                continue
+        return False
     if not cfg.janela_inicio and not cfg.janela_fim:
         return True
-    h = datetime.utcnow().hour
-    ini, fim = cfg.janela_inicio, cfg.janela_fim
-    return (ini <= h < fim) if ini <= fim else (h >= ini or h < fim)
+    return _bate(cfg.janela_inicio, cfg.janela_fim)
 
 
 def _ordenar(db, user_id: int, itens: list, criterio: str) -> list:
@@ -98,6 +128,12 @@ def status(user_id: int) -> dict:
             "auto_selecao": bool(getattr(cfg, "auto_selecao", False)),
             "auto_estrategia": getattr(cfg, "auto_estrategia", "estoque_parado") or "estoque_parado",
             "auto_maximo": getattr(cfg, "auto_maximo", 30) or 30,
+            "janelas": getattr(cfg, "janelas", None) or [],
+            "cond_ativo": bool(getattr(cfg, "cond_ativo", False)),
+            "cond_gatilho_pct": getattr(cfg, "cond_gatilho_pct", 0) or 0,
+            "cond_max": getattr(cfg, "cond_max", 3) or 3,
+            "cond_estoque": bool(getattr(cfg, "cond_estoque", False)),
+            "cond_surto": bool(getattr(cfg, "cond_surto", False)),
             "qtd_auto": sum(1 for i in itens if getattr(i, "auto", False)),
             "qtd_manual": sum(1 for i in itens if not getattr(i, "auto", False)),
             "total": len(itens), "fixos": sum(1 for i in itens if i.fixo),
@@ -158,6 +194,7 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
                 reg = por_id.get(str(bid))
                 if reg and not (reg.boost_ate and reg.boost_ate > agora):
                     reg.boost_ate = agora + timedelta(hours=BOOST_HORAS)
+                    _log_boost(db, user_id, reg, agora, reg.boost_ate)
             if reais:
                 db.flush()
             ocupadas = len(reais)
@@ -187,6 +224,7 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
             e.ultimo_boost = agora
             e.boost_ate = fim
             e.impulsos = (e.impulsos or 0) + 1
+            _log_boost(db, user_id, e, agora, fim)
         db.commit()
         if notificar:
             try:

@@ -623,6 +623,14 @@ def shopee_boost_config(payload: dict = Body(...), user: User = Depends(auth.get
         if "auto_selecao" in payload: c.auto_selecao = bool(payload["auto_selecao"])
         if "auto_estrategia" in payload: c.auto_estrategia = payload["auto_estrategia"]
         if "auto_maximo" in payload: c.auto_maximo = max(5, min(int(payload["auto_maximo"]), 50))
+        if "janelas" in payload:
+            js = payload["janelas"]
+            c.janelas = [[int(j[0]), int(j[1])] for j in js if isinstance(j, (list, tuple)) and len(j) == 2] if js else None
+        if "cond_ativo" in payload: c.cond_ativo = bool(payload["cond_ativo"])
+        if "cond_gatilho_pct" in payload: c.cond_gatilho_pct = float(payload["cond_gatilho_pct"])
+        if "cond_max" in payload: c.cond_max = max(1, min(int(payload["cond_max"]), 5))
+        if "cond_estoque" in payload: c.cond_estoque = bool(payload["cond_estoque"])
+        if "cond_surto" in payload: c.cond_surto = bool(payload["cond_surto"])
         c.atualizado_em = datetime.utcnow()
         db.commit()
         return {"ok": True}
@@ -732,6 +740,49 @@ def shopee_boost_desempenho(user: User = Depends(auth.get_current_user)):
 
 # ============================ CENTRAL DE BOOST (painel enterprise) ============================
 _PICO_CACHE: dict = {}
+_LINHAS_CACHE: dict = {}
+_ELEG_CACHE: dict = {}
+
+
+def _boost_linhas_venda(user_id, dias=14, max_orders=500):
+    """Linhas de venda (item_id, qtd, create_time_ms) dos últimos `dias`. Coleta os order_sn
+    (barato) e detalha em lotes (para pegar create_time + itens). Cacheado 30min. Base
+    compartilhada do heatmap e da atribuição de boost."""
+    import time as _t
+    ch = _LINHAS_CACHE.get(user_id)
+    if ch and _t.time() - ch[0] < 1800:
+        return ch[1]
+    linhas = []
+    try:
+        sns, cursor, paginas = [], "", 0
+        while paginas < 8 and len(sns) < max_orders:
+            r = shopee.listar_pedidos(user_id, dias=dias, cursor=cursor, limite=100)
+            resp = (r.get("response") or {}) if isinstance(r, dict) else {}
+            for o in (resp.get("order_list") or []):
+                if o.get("order_sn"):
+                    sns.append(o["order_sn"])
+            cursor = resp.get("next_cursor") or ""
+            paginas += 1
+            if not resp.get("more") or not cursor:
+                break
+        sns = sns[:max_orders]
+        for i in range(0, len(sns), 50):
+            rd = shopee.detalhe_pedidos(user_id, sns[i:i + 50])
+            respd = (rd.get("response") or {}) if isinstance(rd, dict) else {}
+            for o in (respd.get("order_list") or []):
+                ct = o.get("create_time")
+                if not ct:
+                    continue
+                ctms = int(ct) * 1000
+                for it in (o.get("item_list") or []):
+                    iid = it.get("item_id")
+                    if iid:
+                        qty = it.get("model_quantity_purchased") or it.get("quantity_purchased") or 0
+                        linhas.append((str(iid), int(qty or 0), ctms))
+    except Exception:  # noqa: BLE001
+        pass
+    _LINHAS_CACHE[user_id] = (_t.time(), linhas)
+    return linhas
 
 
 def _boost_vagas(user_id, st, vendas):
@@ -830,19 +881,53 @@ def _boost_painel(user_id):
     proxima = min(rem) if (rem and ocupadas >= 5) else None
     fila = _boost_fila_enriquecida(st.get("fila") or [], vendas, ocupadas)
     try:
+        eleg = _boost_elegibilidade(user_id, [f.get("item_id") for f in fila])
+        for f in fila:
+            e = eleg.get(str(f.get("item_id"))) or {}
+            f["elegivel"] = e.get("elegivel", True)
+            f["motivo_ineleg"] = e.get("motivo")
+            if e.get("estoque") is not None:
+                f["estoque"] = e["estoque"]
+    except Exception:  # noqa: BLE001
+        pass
+    nao_elegiveis = sum(1 for f in fila if f.get("elegivel") is False)
+    # boost + promoção: marca quem já tem oferta ativa (exposição dobrada)
+    try:
+        ofertas = shopee.itens_em_campanha(user_id)
+    except Exception:  # noqa: BLE001
+        ofertas = set()
+    def _oferta(iid):
+        s = str(iid)
+        return bool(s.isdigit() and int(s) in ofertas)
+    for f in fila:
+        f["em_oferta"] = _oferta(f.get("item_id"))
+    for v in vagas:
+        if v.get("ocupada"):
+            v["em_oferta"] = _oferta(v.get("item_id"))
+    em_oferta_fila = sum(1 for f in fila if f.get("em_oferta"))
+    # sinais do condicional expandido (estoque/surto)
+    try:
+        sinais = _boost_sinais(user_id, fila)
+    except Exception:  # noqa: BLE001
+        sinais = []
+    try:
         radar = {"config": shopee_boost_auto.config(user_id)}
         radar.update(shopee_boost_auto.avaliar(user_id))
     except Exception as e:  # noqa: BLE001
         radar = {"config": {}, "erro": str(e), "ameacados": []}
+    radar["sinais"] = sinais
     return {
         "sincronizado": sincronizado,
         "config": {k: st.get(k) for k in ("ativo", "criterio", "janela_inicio", "janela_fim",
                                           "max_simultaneos", "auto_selecao", "auto_estrategia",
-                                          "auto_maximo", "qtd_auto", "qtd_manual", "total", "fixos")},
+                                          "auto_maximo", "qtd_auto", "qtd_manual", "total", "fixos",
+                                          "janelas", "cond_ativo", "cond_gatilho_pct", "cond_max",
+                                          "cond_estoque", "cond_surto")},
         "vagas": vagas,
         "kpis": {"vagas_ocupadas": ocupadas, "vagas_total": 5, "na_fila": len(st.get("fila") or []),
                  "proxima_vaga_ms": proxima, "impulsos_hoje": impulsos_hoje, "impulsos_max_dia": 30,
-                 "vendas_30d": sum(vendas.values()), "tem_vendas": bool(vendas)},
+                 "vendas_30d": sum(vendas.values()), "tem_vendas": bool(vendas),
+                 "nao_elegiveis": nao_elegiveis, "em_oferta": em_oferta_fila, "sinais": len(sinais)},
         "fila": fila,
         "campeoes": _boost_campeoes(vendas, st),
         "radar": radar,
@@ -850,7 +935,151 @@ def _boost_painel(user_id):
     }
 
 
-def _boost_pico(user_id, dias=30):
+def _boost_pico(user_id, dias=14):
+    """Heatmap: pedidos por hora do dia (0–23), dos últimos `dias`. Usa os create_time reais
+    das linhas de venda. Cacheado 1h. Sem dado => total 0 (estado honesto no painel)."""
+    import time as _t
+    from datetime import datetime, timezone, timedelta
+    ch = _PICO_CACHE.get(user_id)
+    if ch and _t.time() - ch[0] < 3600:
+        return ch[1]
+    horas = [0] * 24
+    tz = timezone(timedelta(hours=-3))  # horário de Brasília
+    vistos = set()
+    for iid, qty, ctms in _boost_linhas_venda(user_id, dias=dias):
+        chave = (ctms // 1000)  # 1 pedido pode ter várias linhas; conta a hora por evento de venda
+        horas[datetime.fromtimestamp(ctms / 1000, tz).hour] += 1
+    total = sum(horas)
+    out = {"horas": horas, "total": total, "dias": dias}
+    _PICO_CACHE[user_id] = (_t.time(), out)
+    return out
+
+
+def _boost_atribuir(user_id):
+    """Atribui vendas às janelas de boost dos últimos 14 dias: soma as unidades vendidas do
+    produto DENTRO de [inicio, fim] de cada boost. Grava em ShopeeBoostLog.vendas_atribuidas."""
+    from .models import ShopeeBoostLog
+    from datetime import datetime, timedelta, timezone
+    linhas = _boost_linhas_venda(user_id)
+    por_item = {}
+    for iid, qty, ctms in linhas:
+        por_item.setdefault(iid, []).append((ctms, qty))
+    with SessionLocal() as db:
+        limite = datetime.utcnow() - timedelta(days=14)
+        logs = (db.query(ShopeeBoostLog)
+                .filter(ShopeeBoostLog.user_id == user_id, ShopeeBoostLog.inicio >= limite).all())
+        for lg in logs:
+            vendas = por_item.get(str(lg.item_id))
+            if vendas is None:
+                continue  # sem cobertura de venda no período coletado
+            ini = int(lg.inicio.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            fimdt = lg.fim or (lg.inicio + timedelta(hours=4))
+            fim = int(fimdt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            lg.vendas_atribuidas = sum(q for (ctms, q) in vendas if ini <= ctms <= fim)
+            lg.atribuido_em = datetime.utcnow()
+        db.commit()
+
+
+def _boost_historico(user_id, limite=40):
+    from .models import ShopeeBoostLog
+    try:
+        _boost_atribuir(user_id)
+    except Exception:  # noqa: BLE001
+        pass
+    with SessionLocal() as db:
+        logs = (db.query(ShopeeBoostLog).filter(ShopeeBoostLog.user_id == user_id)
+                .order_by(ShopeeBoostLog.inicio.desc()).limit(limite).all())
+        eventos = [{"item_id": l.item_id, "nome": l.nome or ("#" + l.item_id), "tipo": l.tipo,
+                    "inicio": l.inicio.isoformat() if l.inicio else None,
+                    "fim": l.fim.isoformat() if l.fim else None,
+                    "vendas": l.vendas_atribuidas} for l in logs]
+    resumo = {}
+    for e in eventos:
+        r = resumo.setdefault(e["item_id"], {"item_id": e["item_id"], "nome": e["nome"],
+                                             "boosts": 0, "vendas": 0, "com_atrib": 0})
+        r["boosts"] += 1
+        if e["vendas"] is not None:
+            r["vendas"] += e["vendas"]; r["com_atrib"] += 1
+    lista = sorted(resumo.values(), key=lambda x: x["vendas"], reverse=True)
+    for r in lista:
+        r["por_boost"] = round(r["vendas"] / r["com_atrib"], 1) if r["com_atrib"] else None
+    atrib = [e for e in eventos if e["vendas"] is not None]
+    total_v = sum(e["vendas"] for e in atrib)
+    return {"eventos": eventos, "resumo": lista,
+            "kpis": {"total_boosts": len(eventos), "total_vendas_atrib": total_v,
+                     "vendas_por_boost": round(total_v / len(atrib), 1) if atrib else None,
+                     "boosts_atribuidos": len(atrib), "produtos": len(lista)}}
+
+
+def _boost_elegibilidade(user_id, item_ids):
+    """Elegibilidade real de cada anúncio para boost: precisa estar ativo (NORMAL) e com estoque.
+    Usa get_item_base_info em lote (≤50), cacheado 10min. Sem info => assume elegível."""
+    import time as _t
+    ids = [str(i) for i in item_ids if i][:100]
+    ch = _ELEG_CACHE.get(user_id)
+    if ch and _t.time() - ch[0] < 600:
+        base = ch[1]
+    else:
+        base = {}
+        try:
+            for i in range(0, len(ids), 50):
+                r = shopee.info_itens(user_id, [int(x) for x in ids[i:i + 50]])
+                for x in ((r.get("response") or {}).get("item_list") or []):
+                    base[str(x.get("item_id"))] = {
+                        "status": x.get("item_status"),
+                        "estoque": (x.get("stock_info_v2") or {}).get("summary_info", {}).get("total_available_stock"),
+                    }
+        except Exception:  # noqa: BLE001
+            base = {}
+        _ELEG_CACHE[user_id] = (_t.time(), base)
+    _MOTIVO = {"BANNED": "banido", "DELETED": "excluído", "UNLIST": "inativo",
+               "REVIEWING": "em revisão", "SELLER_DELETE": "excluído", "SHOPEE_DELETE": "removido"}
+    out = {}
+    for iid in ids:
+        info = base.get(iid)
+        if not info:
+            out[iid] = {"elegivel": True, "motivo": None, "estoque": None}
+            continue
+        st = (info.get("status") or "").upper()
+        est = info.get("estoque")
+        if st and st != "NORMAL":
+            out[iid] = {"elegivel": False, "motivo": _MOTIVO.get(st, st.lower()), "estoque": est}
+        elif est is not None and est <= 0:
+            out[iid] = {"elegivel": False, "motivo": "sem estoque", "estoque": est}
+        else:
+            out[iid] = {"elegivel": True, "motivo": None, "estoque": est}
+    return out
+
+
+def _boost_sinais(user_id, fila):
+    """Sinais do boost condicional expandido, dos dados reais: 'prestes a esgotar' (estoque baixo
+    com giro) e 'surto de vendas' (aceleração dos últimos 3d vs. a base de 11d)."""
+    import time as _t
+    sinais = []
+    linhas = _boost_linhas_venda(user_id)
+    corte = _t.time() * 1000 - 3 * 86400000
+    rec, base = {}, {}
+    for iid, qty, ctms in linhas:
+        alvo = rec if ctms >= corte else base
+        alvo[iid] = alvo.get(iid, 0) + qty
+    for f in fila:
+        if f.get("elegivel") is False:
+            continue
+        iid = str(f.get("item_id"))
+        est = f.get("estoque")
+        giro = f.get("giro") or 0
+        if est is not None and giro > 0 and 0 < est <= giro * 3:
+            sinais.append({"item_id": iid, "nome": f.get("nome"), "tipo": "estoque",
+                           "detalhe": f"{est} un · ~{round(est / giro, 1)}d de estoque"})
+            continue
+        r3, b11 = rec.get(iid, 0) / 3.0, base.get(iid, 0) / 11.0
+        if r3 >= 1 and b11 > 0 and r3 >= 1.6 * b11:
+            sinais.append({"item_id": iid, "nome": f.get("nome"), "tipo": "surto",
+                           "detalhe": f"vendas {round(r3 / b11, 1)}x acima do normal"})
+    return sinais[:8]
+
+
+def _boost_pico_old(user_id, dias=30):
     """Heatmap de vendas por hora do dia (0–23), dos últimos `dias`. Usa o create_time dos
     pedidos (barato: só a lista, sem detalhe). Cacheado 1h. Sem dado suficiente => total 0."""
     import time as _t
@@ -896,6 +1125,12 @@ def shopee_boost_painel(user: User = Depends(auth.get_current_user)):
 def shopee_boost_pico(user: User = Depends(auth.get_current_user)):
     """Heatmap: vendas por hora do dia (últimos 30 dias). Cacheado 1h."""
     return _boost_pico(user.id)
+
+
+@app.get("/api/shopee/boost/historico")
+def shopee_boost_historico(user: User = Depends(auth.get_current_user)):
+    """Histórico durável de boosts + atribuição de vendas por janela (lift real por produto)."""
+    return _boost_historico(user.id)
 
 
 # ---- Avaliações ----
