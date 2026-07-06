@@ -14,6 +14,32 @@ from .models import ShopeeBoostItem, ShopeeBoostConfig, ProdutoCache
 BOOST_HORAS = 4
 MAX = 5
 
+_MSG_CHEIO = ("As 5 vagas de destaque da Shopee já estão ocupadas — inclui os boosts feitos "
+              "manualmente pelo painel da Shopee. Libere uma vaga ou aguarde o fim do período (4h); "
+              "assim que houver vaga, o motor impulsiona sozinho.")
+
+
+def _boosted_ids(user_id: int):
+    """IDs dos itens que a Shopee reporta em destaque AGORA (inclui os boosts manuais).
+    Retorna lista de strings, ou None se não deu para ler (não bloqueia o ciclo)."""
+    try:
+        r = shopee.itens_impulsionados(user_id)
+    except Exception:  # noqa: BLE001 — se não ler, o ciclo segue com o cálculo local
+        return None
+    resp = r.get("response") if isinstance(r, dict) else r
+    lista = []
+    if isinstance(resp, list):
+        lista = resp
+    elif isinstance(resp, dict):
+        lista = (resp.get("list") or resp.get("item_list") or resp.get("item")
+                 or resp.get("item_id_list") or [])
+    ids = []
+    for x in lista:
+        v = x.get("item_id") if isinstance(x, dict) else x
+        if v is not None:
+            ids.append(str(v))
+    return ids
+
 
 def _config(db, user_id: int) -> ShopeeBoostConfig:
     c = db.query(ShopeeBoostConfig).filter_by(user_id=user_id).first()
@@ -123,10 +149,23 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
             return {"acao": "ocioso"}
         agora = datetime.utcnow()
         itens = db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()
-        ativos = [i for i in itens if i.boost_ate and i.boost_ate > agora]
-        vagas = max(0, min(cfg.max_simultaneos, MAX) - len(ativos))
+        # reconcilia com o estado REAL da Shopee — boosts feitos manualmente também
+        # ocupam as 5 vagas de destaque da loja e não estavam registrados no nosso banco.
+        reais = _boosted_ids(user_id)
+        if reais is not None:
+            por_id = {str(i.item_id): i for i in itens}
+            for bid in reais:
+                reg = por_id.get(str(bid))
+                if reg and not (reg.boost_ate and reg.boost_ate > agora):
+                    reg.boost_ate = agora + timedelta(hours=BOOST_HORAS)
+            if reais:
+                db.flush()
+            ocupadas = len(reais)
+        else:
+            ocupadas = len([i for i in itens if i.boost_ate and i.boost_ate > agora])
+        vagas = max(0, min(cfg.max_simultaneos, MAX) - ocupadas)
         if vagas == 0:
-            return {"acao": "cheio", "ativos": len(ativos)}
+            return {"acao": "cheio", "ativos": ocupadas, "msg": _MSG_CHEIO}
         # fixos primeiro (que não estão ativos), depois fila por critério
         fixos = [i for i in itens if i.fixo and not (i.boost_ate and i.boost_ate > agora)]
         fila = [i for i in itens if not i.fixo and not (i.boost_ate and i.boost_ate > agora)]
@@ -139,7 +178,10 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
         try:
             shopee.impulsionar(user_id, ids)
         except shopee.ShopeeError as e:
-            return {"acao": "erro", "erro": str(e)}
+            m = str(e)
+            if "bump slot" in m.lower() or "slot limit" in m.lower():
+                return {"acao": "cheio", "ativos": MAX, "msg": _MSG_CHEIO}
+            return {"acao": "erro", "erro": m}
         fim = agora + timedelta(hours=BOOST_HORAS)
         for e in escolhidos:
             e.ultimo_boost = agora

@@ -730,6 +730,174 @@ def shopee_boost_desempenho(user: User = Depends(auth.get_current_user)):
     return {"dias": 30, "vendas": {str(k): int(v) for k, v in (vendas or {}).items()}}
 
 
+# ============================ CENTRAL DE BOOST (painel enterprise) ============================
+_PICO_CACHE: dict = {}
+
+
+def _boost_vagas(user_id, st, vendas):
+    """As 5 vagas ao vivo: lê o estado REAL da Shopee (get_boosted_list) e cruza com o nosso
+    banco para rotular auto/manual/radar e o tempo restante. Preenche até 5 (livres no fim)."""
+    from . import shopee_boost
+    from .models import ShopeeBoostItem
+    from datetime import datetime
+    agora = datetime.utcnow()
+    reais = shopee_boost._boosted_ids(user_id)  # ids em destaque agora, ou None se não leu
+    sincronizado = reais is not None
+    if reais is None:
+        reais = [str(x.get("item_id")) for x in (st.get("impulsionando") or [])]
+    with SessionLocal() as db:
+        regs = {str(i.item_id): i for i in db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()}
+    vagas, ordem = [], 0
+    for bid in reais[:5]:
+        r = regs.get(str(bid))
+        tipo, nome, impulsos, termina = "manual", "#" + str(bid), 0, None
+        if r:
+            tipo = "radar" if r.condicional else ("auto" if r.auto else "manual")
+            nome = r.nome if (r.nome and str(r.nome).lstrip("#") != str(r.item_id)) else ("#" + str(bid))
+            impulsos = r.impulsos or 0
+            if r.boost_ate and r.boost_ate > agora:
+                termina = int((r.boost_ate - agora).total_seconds() * 1000)
+        vagas.append({"ordem": ordem, "ocupada": True, "item_id": str(bid), "nome": nome,
+                      "tipo": tipo, "termina_ms": termina, "impulsos": impulsos,
+                      "vendas": int(vendas.get(str(bid), 0))})
+        ordem += 1
+    while len(vagas) < 5:
+        vagas.append({"ordem": ordem, "ocupada": False}); ordem += 1
+    return vagas, sincronizado
+
+
+def _abc_por_vendas(v):
+    if v >= 30:
+        return "A"
+    if v >= 8:
+        return "B"
+    return "C"
+
+
+def _boost_fila_enriquecida(fila, vendas, ocupadas):
+    """Enriquece cada item da fila com giro (vendas/30d), Curva ABC e em quantos ciclos de 4h entra."""
+    livres = max(0, 5 - ocupadas)
+    out = []
+    for idx, f in enumerate((fila or [])[:60]):
+        iid = str(f.get("item_id"))
+        v = int(vendas.get(iid, 0))
+        ciclos = 0 if idx < livres else ((idx - livres) // 5 + 1)
+        item = dict(f)
+        item.update({"vendas": v, "giro": round(v / 30.0, 1),
+                     "abc": _abc_por_vendas(v), "entra_ciclos": ciclos})
+        out.append(item)
+    return out
+
+
+def _boost_campeoes(vendas, st):
+    nomes = {}
+    for x in (st.get("impulsionando") or []) + (st.get("fila") or []):
+        nomes[str(x.get("item_id"))] = x.get("nome")
+    top = sorted(vendas.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    return [{"item_id": str(k), "nome": nomes.get(str(k)) or ("#" + str(k)), "vendas": int(v)}
+            for k, v in top if v > 0]
+
+
+def _boost_diario(user_id, limite=8):
+    from .models import Notificacao
+    try:
+        with SessionLocal() as db:
+            regs = (db.query(Notificacao)
+                    .filter(Notificacao.user_id == user_id, Notificacao.modulo == "boost")
+                    .order_by(Notificacao.id.desc()).limit(limite).all())
+            return [{"tipo": "ok" if r.ok else "warn", "titulo": r.titulo, "texto": r.texto or "",
+                     "quando": r.criado_em.isoformat() if r.criado_em else None} for r in regs]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _boost_painel(user_id):
+    from . import shopee_boost, shopee_boost_auto
+    from .models import ShopeeBoostItem
+    from datetime import datetime
+    st = shopee_boost.status(user_id)  # config + fila + impulsionando (só banco, rápido)
+    try:
+        vendas = {str(k): int(v) for k, v in (shopee.vendas_por_item(user_id, dias=30) or {}).items()}
+    except Exception:  # noqa: BLE001
+        vendas = {}
+    vagas, sincronizado = _boost_vagas(user_id, st, vendas)
+    ocupadas = sum(1 for v in vagas if v.get("ocupada"))
+    agora = datetime.utcnow()
+    with SessionLocal() as db:
+        itens = db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()
+        impulsos_hoje = sum(1 for i in itens if i.ultimo_boost and i.ultimo_boost.date() == agora.date())
+    rem = [v["termina_ms"] for v in vagas if v.get("ocupada") and v.get("termina_ms")]
+    proxima = min(rem) if (rem and ocupadas >= 5) else None
+    fila = _boost_fila_enriquecida(st.get("fila") or [], vendas, ocupadas)
+    try:
+        radar = {"config": shopee_boost_auto.config(user_id)}
+        radar.update(shopee_boost_auto.avaliar(user_id))
+    except Exception as e:  # noqa: BLE001
+        radar = {"config": {}, "erro": str(e), "ameacados": []}
+    return {
+        "sincronizado": sincronizado,
+        "config": {k: st.get(k) for k in ("ativo", "criterio", "janela_inicio", "janela_fim",
+                                          "max_simultaneos", "auto_selecao", "auto_estrategia",
+                                          "auto_maximo", "qtd_auto", "qtd_manual", "total", "fixos")},
+        "vagas": vagas,
+        "kpis": {"vagas_ocupadas": ocupadas, "vagas_total": 5, "na_fila": len(st.get("fila") or []),
+                 "proxima_vaga_ms": proxima, "impulsos_hoje": impulsos_hoje, "impulsos_max_dia": 30,
+                 "vendas_30d": sum(vendas.values()), "tem_vendas": bool(vendas)},
+        "fila": fila,
+        "campeoes": _boost_campeoes(vendas, st),
+        "radar": radar,
+        "diario": _boost_diario(user_id),
+    }
+
+
+def _boost_pico(user_id, dias=30):
+    """Heatmap de vendas por hora do dia (0–23), dos últimos `dias`. Usa o create_time dos
+    pedidos (barato: só a lista, sem detalhe). Cacheado 1h. Sem dado suficiente => total 0."""
+    import time as _t
+    from datetime import datetime, timezone, timedelta
+    ch = _PICO_CACHE.get(user_id)
+    if ch and _t.time() - ch[0] < 3600:
+        return ch[1]
+    horas = [0] * 24
+    total = 0
+    tz = timezone(timedelta(hours=-3))  # horário de Brasília
+    try:
+        cursor, paginas = "", 0
+        while paginas < 10:
+            r = shopee.listar_pedidos(user_id, dias=dias, cursor=cursor, limite=100)
+            resp = (r.get("response") or {}) if isinstance(r, dict) else {}
+            for o in (resp.get("order_list") or []):
+                ct = o.get("create_time")
+                if ct:
+                    horas[datetime.fromtimestamp(int(ct), tz).hour] += 1
+                    total += 1
+            cursor = resp.get("next_cursor") or ""
+            paginas += 1
+            if not resp.get("more") or not cursor:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    out = {"horas": horas, "total": total, "dias": dias}
+    _PICO_CACHE[user_id] = (_t.time(), out)
+    return out
+
+
+@app.get("/api/shopee/boost/painel")
+def shopee_boost_painel(user: User = Depends(auth.get_current_user)):
+    """Painel completo do impulsionamento: vagas ao vivo, KPIs, fila enriquecida, campeões,
+    Radar e diário — tudo em dado real (rápido; o heatmap fica em /boost/pico)."""
+    try:
+        return _boost_painel(user.id)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/boost/pico")
+def shopee_boost_pico(user: User = Depends(auth.get_current_user)):
+    """Heatmap: vendas por hora do dia (últimos 30 dias). Cacheado 1h."""
+    return _boost_pico(user.id)
+
+
 # ---- Avaliações ----
 @app.get("/api/shopee/avaliacoes")
 def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "", item_id: str = "",
@@ -4717,19 +4885,26 @@ def _produto_um(user_id, item_id):
     dados = it.dados or {}
     # fotos: o cache guarda só a capa; busca ao vivo todas as imagens (best-effort)
     fotos = [it.imagem] if it.imagem else []
+    category_id = it.category_id
+    atributos_atuais = []
     try:
         from . import mercadolivre as ml
         live = ml.obter_item(item_id, user_id=user_id)
         lf = [f for f in (live.get("fotos") or []) if f]
         if lf:
             fotos = lf
+        category_id = live.get("category_id") or category_id
+        atributos_atuais = [{"id": a.get("id"), "value_id": a.get("value_id"),
+                             "value_name": a.get("value_name")}
+                            for a in (live.get("atributos") or []) if isinstance(a, dict) and a.get("id")]
     except Exception:  # noqa: BLE001 — sem foto ao vivo não pode derrubar o cockpit
         pass
     return {
         "item_id": it.item_id, "sku": it.sku, "titulo": it.titulo,
         "preco": round(it.preco, 2) if it.preco else None,
         "status": it.status, "estoque": it.estoque, "logistica": logi,
-        "listing_type_id": it.listing_type_id,
+        "listing_type_id": it.listing_type_id, "category_id": category_id,
+        "atributos": atributos_atuais,
         "catalogo": bool(dados.get("catalog_listing")) if isinstance(dados, dict) else False,
         "saude": round((it.saude or 0) * 100) if it.saude is not None else None,
         "imagem": it.imagem, "fotos": fotos, "permalink": it.permalink, "em_promocao": bool(it.em_promocao),
@@ -4765,6 +4940,28 @@ def ml_produto_um(item_id: str, user: User = Depends(auth.get_current_user)):
     if not r:
         raise HTTPException(status_code=404, detail="Anúncio não encontrado no cache. Sincronize o catálogo.")
     return r
+
+
+@app.post("/api/mercadolivre/produtos/{item_id}/atributos")
+def ml_produto_atributos(item_id: str, payload: dict = Body(...),
+                         user: User = Depends(auth.get_current_user)):
+    """Atualiza a ficha técnica (atributos) do anúncio no ML (PUT /items {attributes})."""
+    lista = (payload or {}).get("atributos") or []
+    itens = []
+    for a in lista:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        entrada = {"id": a["id"]}
+        if a.get("value_id"):
+            entrada["value_id"] = a["value_id"]
+        if a.get("value_name"):
+            entrada["value_name"] = a["value_name"]
+        if len(entrada) > 1:
+            itens.append(entrada)
+    if not itens:
+        raise HTTPException(status_code=422, detail="Nenhum atributo com valor para enviar.")
+    _ml_run(lambda ml: ml.atualizar_atributos(item_id, itens, user.id))
+    return {"ok": True, "item_id": item_id, "enviados": len(itens)}
 
 
 @app.post("/api/mercadolivre/produtos/{item_id}/editar")
@@ -4972,25 +5169,53 @@ def ml_categoria_prever(titulo: str = Query(...), user: User = Depends(auth.get_
     return {"sugestoes": _ml_run(lambda ml: ml.prever_categoria(titulo, user.id))}
 
 
+_ATTR_IMPORTANTES = {
+    "BRAND", "MODEL", "GTIN", "EAN", "UPC", "MATERIAL", "COLOR", "MAIN_COLOR",
+    "SECONDARY_COLOR", "SIZE", "LENGTH", "WIDTH", "HEIGHT", "DEPTH", "DIAMETER",
+    "WEIGHT", "NET_WEIGHT", "LINE", "MPN", "UNITS_PER_PACKAGE", "ITEMS_PER_PACK",
+    "AGE_GROUP", "GENDER", "FORMAT", "CAPACITY", "VOLUME", "QUANTITY",
+}
+
+
 def _atributos_uteis(bruto):
-    """Reduz os atributos da categoria ao que a UI usa (id, nome, obrigatório, valores)."""
-    out = []
+    """Cura os atributos da categoria: descarta o que é do sistema (hidden/read_only/fixed)
+    e marca os relevantes (obrigatórios + campos que o vendedor de fato usa)."""
+    obrig, rec = [], []
     for a in (bruto or []):
         if not isinstance(a, dict) or not a.get("id"):
             continue
+        aid = a.get("id")
         tags = a.get("tags") or {}
+        # fora: atributos de sistema, não editáveis ou ocultos no painel do vendedor
+        if tags.get("hidden") or tags.get("read_only") or tags.get("fixed"):
+            continue
         vtype = a.get("value_type") or "string"
         valores = [{"id": v.get("id"), "nome": v.get("name")}
                    for v in (a.get("values") or []) if isinstance(v, dict)][:60]
-        out.append({
-            "id": a.get("id"), "nome": a.get("name"),
-            "obrigatorio": bool(tags.get("required") or tags.get("catalog_required")),
+        obrigatorio = bool(tags.get("required") or tags.get("catalog_required")
+                           or tags.get("catalog_listing_required"))
+        unidades = [u.get("name") for u in (a.get("allowed_units") or []) if isinstance(u, dict)]
+        default_unit = a.get("default_unit")
+        if not default_unit and unidades:
+            default_unit = unidades[0]
+        relevancia = a.get("relevance")
+        if relevancia is None:
+            relevancia = 1 if aid in _ATTR_IMPORTANTES else 90
+        relevante = obrigatorio or aid in _ATTR_IMPORTANTES or (isinstance(relevancia, int) and relevancia <= 2)
+        item = {
+            "id": aid, "nome": a.get("name"), "obrigatorio": obrigatorio,
             "tipo": vtype, "valores": valores,
             "permite_livre": vtype in ("string", "number", "number_unit") or not valores,
-        })
-    # obrigatórios primeiro
-    out.sort(key=lambda x: (not x["obrigatorio"], x["nome"] or ""))
-    return out
+            "unidades": unidades, "unidade": default_unit,
+            "variacao": bool(tags.get("allow_variations") or tags.get("variation_attribute")),
+            "gtin": aid in ("GTIN", "EAN", "UPC"),
+            "relevancia": relevancia, "relevante": bool(relevante),
+        }
+        (obrig if obrigatorio else rec).append(item)
+    # obrigatórios primeiro; recomendados por relevância (útil antes do cauda-longa)
+    obrig.sort(key=lambda x: (x["relevancia"], x["nome"] or ""))
+    rec.sort(key=lambda x: (not x["relevante"], x["relevancia"], x["nome"] or ""))
+    return obrig + rec
 
 
 @app.get("/api/mercadolivre/categorias/{category_id}/atributos")
@@ -4998,7 +5223,9 @@ def ml_categoria_atributos(category_id: str, user: User = Depends(auth.get_curre
     bruto = _ml_run(lambda ml: ml.atributos_categoria(category_id, user.id))
     uteis = _atributos_uteis(bruto)
     return {"category_id": category_id, "atributos": uteis,
-            "obrigatorios": sum(1 for a in uteis if a["obrigatorio"]), "total": len(uteis)}
+            "obrigatorios": sum(1 for a in uteis if a["obrigatorio"]),
+            "relevantes": sum(1 for a in uteis if a["relevante"] and not a["obrigatorio"]),
+            "total": len(uteis)}
 
 
 @app.post("/api/mercadolivre/categorias/{category_id}/atributos/ia")
@@ -5050,7 +5277,8 @@ def ml_categoria_atributos_ia(category_id: str, payload: dict = Body(...),
 
 
 def _montar_item_body(titulo, category_id, preco, quantidade, listing_type_id="gold_special",
-                      condicao="new", pictures=None, atributos=None, sku=None, descricao=None):
+                      condicao="new", pictures=None, atributos=None, sku=None, descricao=None,
+                      variations=None):
     body = {
         "title": (titulo or "").strip()[:60],
         "category_id": category_id,
@@ -5076,6 +5304,25 @@ def _montar_item_body(titulo, category_id, preco, quantidade, listing_type_id="g
         attrs.append({"id": "SELLER_SKU", "value_name": str(sku)})
     if attrs:
         body["attributes"] = attrs
+    # variações: cada uma com sua combinação de atributo + estoque (preço opcional por variação)
+    vlist = []
+    for v in (variations or []):
+        comb = v.get("attribute_combinations") or []
+        aq = v.get("available_quantity")
+        comb_ok = [c for c in comb if isinstance(c, dict) and c.get("id") and (c.get("value_id") or c.get("value_name"))]
+        if not comb_ok or aq is None:
+            continue
+        entrada = {"attribute_combinations": comb_ok, "available_quantity": int(aq)}
+        if v.get("price"):
+            entrada["price"] = round(float(v["price"]), 2)
+        if v.get("seller_custom_field"):
+            entrada["seller_custom_field"] = str(v["seller_custom_field"])
+        if v.get("picture_ids"):
+            entrada["picture_ids"] = v["picture_ids"]
+        vlist.append(entrada)
+    if vlist:
+        body["variations"] = vlist
+        body.pop("available_quantity", None)  # o estoque passa a ser por variação
     return body
 
 
@@ -5109,13 +5356,18 @@ def ml_produto_validar(payload: dict = Body(...), user: User = Depends(auth.get_
     category_id = (payload or {}).get("category_id")
     preco = (payload or {}).get("preco")
     quantidade = (payload or {}).get("quantidade")
+    variations = (payload or {}).get("variations") or []
+    if variations:
+        soma = sum(int(v.get("available_quantity") or 0) for v in variations if isinstance(v, dict))
+        if soma > 0:
+            quantidade = soma
     if not titulo or not category_id or preco is None or quantidade is None:
         raise HTTPException(status_code=422, detail="Informe título, categoria, preço e quantidade.")
     body = _montar_item_body(
         titulo, category_id, preco, quantidade,
         listing_type_id=payload.get("listing_type_id"), condicao=payload.get("condicao"),
         pictures=payload.get("pictures"), atributos=payload.get("atributos"),
-        sku=payload.get("sku"), descricao=payload.get("descricao"))
+        sku=payload.get("sku"), descricao=payload.get("descricao"), variations=variations)
     res = _ml_run(lambda ml: ml.validar_item(body, user.id))
     return {**res, "body": body}
 
@@ -5130,6 +5382,12 @@ def ml_produto_publicar(payload: dict = Body(...), user: User = Depends(auth.get
     preco = (payload or {}).get("preco")
     quantidade = (payload or {}).get("quantidade")
     sku = (payload or {}).get("sku")
+    variations = (payload or {}).get("variations") or []
+    # com variações, o estoque é a soma das variações
+    if variations:
+        soma = sum(int(v.get("available_quantity") or 0) for v in variations if isinstance(v, dict))
+        if soma > 0:
+            quantidade = soma
     if not titulo or not category_id or preco is None or quantidade is None:
         raise HTTPException(status_code=422, detail="Informe título, categoria, preço e quantidade.")
     try:
@@ -5141,7 +5399,7 @@ def ml_produto_publicar(payload: dict = Body(...), user: User = Depends(auth.get
         titulo, category_id, preco, quantidade,
         listing_type_id=payload.get("listing_type_id"), condicao=payload.get("condicao"),
         pictures=payload.get("pictures"), atributos=payload.get("atributos"),
-        sku=sku, descricao=payload.get("descricao"))
+        sku=sku, descricao=payload.get("descricao"), variations=variations)
     criado = _ml_run(lambda ml: ml.publicar_item(body, user.id))
     item_id = criado.get("id") if isinstance(criado, dict) else None
     # descrição (endpoint separado no ML)
