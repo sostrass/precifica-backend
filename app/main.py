@@ -1254,6 +1254,17 @@ def shopee_avaliacoes(status: str = "UNANSWERED", cursor: str = "", item_id: str
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/api/shopee/reputacao/painel")
+def shopee_reputacao_painel(forcar: int = 0, user: User = Depends(auth.get_current_user)):
+    """Central de Reputação: KPIs, distribuição, tendência, radar de compradores,
+    saúde da conta, config e atividade do copiloto — em uma chamada."""
+    from . import shopee_reputacao
+    try:
+        return shopee_reputacao.painel(user.id, forcar=bool(forcar))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/api/shopee/avaliacoes/responder")
 def shopee_avaliacoes_responder(payload: dict = Body(...),
                                 user: User = Depends(auth.get_current_user)):
