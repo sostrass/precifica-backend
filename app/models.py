@@ -377,6 +377,15 @@ class ShopeeReviewConfig(Base):
     auto_estrelas = Column(JSON, default=lambda: [4, 5])  # quais notas o agente responde sozinho
     auto_pausa_seg = Column(Integer, default=5)        # pausa entre respostas (anti-flood na API)
     auto_max_ciclo = Column(Integer, default=10)       # máx. de respostas por ciclo do agendador
+    emoji_intensidade = Column(String, default="leve")  # nenhum | leve | animado
+    instrucoes_elogio = Column(String, default="")     # estratégia da IA p/ 4-5★
+    instrucoes_morna = Column(String, default="")      # estratégia da IA p/ 3★
+    instrucoes_critica = Column(String, default="")    # estratégia da IA p/ 1-2★
+    frases_casa = Column(JSON, default=lambda: [])     # frases que a IA PODE usar (da casa)
+    frases_proibidas = Column(JSON, default=lambda: [])  # frases que a IA JAMAIS diz (bloqueio duro)
+    cupom_ativo = Column(Boolean, default=False)       # citar cupom de recompra nas respostas
+    cupom_codigo = Column(String, default="")          # ex.: VOLTA5
+    cupom_quando = Column(String, default="vips")      # vips | todas5 | nunca
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
 

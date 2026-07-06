@@ -76,6 +76,15 @@ def garantir_colunas_extras():
         "shopee_review_config": [
             ("auto_pausa_seg", "INTEGER DEFAULT 5"),
             ("auto_max_ciclo", "INTEGER DEFAULT 10"),
+            ("emoji_intensidade", "VARCHAR DEFAULT 'leve'"),
+            ("instrucoes_elogio", "VARCHAR DEFAULT ''"),
+            ("instrucoes_morna", "VARCHAR DEFAULT ''"),
+            ("instrucoes_critica", "VARCHAR DEFAULT ''"),
+            ("frases_casa", "JSON"),
+            ("frases_proibidas", "JSON"),
+            ("cupom_ativo", "BOOLEAN DEFAULT FALSE"),
+            ("cupom_codigo", "VARCHAR DEFAULT ''"),
+            ("cupom_quando", "VARCHAR DEFAULT 'vips'"),
         ],
         "shopee_venda_snapshot": [
             ("pedidos_6h", "INTEGER DEFAULT 0"),

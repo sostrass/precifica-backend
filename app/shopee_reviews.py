@@ -153,6 +153,15 @@ def _serializar(c: ShopeeReviewConfig) -> dict:
         "auto_estrelas": list(c.auto_estrelas or [4, 5]),
         "auto_pausa_seg": c.auto_pausa_seg if c.auto_pausa_seg is not None else 5,
         "auto_max_ciclo": c.auto_max_ciclo if c.auto_max_ciclo is not None else 10,
+        "emoji_intensidade": getattr(c, "emoji_intensidade", None) or "leve",
+        "instrucoes_elogio": getattr(c, "instrucoes_elogio", None) or "",
+        "instrucoes_morna": getattr(c, "instrucoes_morna", None) or "",
+        "instrucoes_critica": getattr(c, "instrucoes_critica", None) or "",
+        "frases_casa": list(getattr(c, "frases_casa", None) or []),
+        "frases_proibidas": list(getattr(c, "frases_proibidas", None) or []),
+        "cupom_ativo": bool(getattr(c, "cupom_ativo", False)),
+        "cupom_codigo": getattr(c, "cupom_codigo", None) or "",
+        "cupom_quando": getattr(c, "cupom_quando", None) or "vips",
     }
 
 
@@ -203,6 +212,20 @@ def salvar_config(user_id: int, payload: dict) -> dict:
                 c.auto_max_ciclo = max(1, min(int(payload["auto_max_ciclo"]), 100))
             except Exception:  # noqa: BLE001
                 pass
+        if "emoji_intensidade" in payload and payload["emoji_intensidade"] in ("nenhum", "leve", "animado"):
+            c.emoji_intensidade = payload["emoji_intensidade"]
+        for campo in ("instrucoes_elogio", "instrucoes_morna", "instrucoes_critica"):
+            if campo in payload:
+                setattr(c, campo, str(payload[campo])[:600])
+        for campo in ("frases_casa", "frases_proibidas"):
+            if campo in payload and isinstance(payload[campo], list):
+                setattr(c, campo, [str(x)[:120] for x in payload[campo] if str(x).strip()][:20])
+        if "cupom_ativo" in payload:
+            c.cupom_ativo = bool(payload["cupom_ativo"])
+        if "cupom_codigo" in payload:
+            c.cupom_codigo = str(payload["cupom_codigo"])[:40]
+        if "cupom_quando" in payload and payload["cupom_quando"] in ("vips", "todas5", "nunca"):
+            c.cupom_quando = payload["cupom_quando"]
         c.atualizado_em = datetime.utcnow()
         db.commit()
         return _serializar(c)
@@ -213,7 +236,7 @@ def salvar_config(user_id: int, payload: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Prompt no padrão da loja
 # --------------------------------------------------------------------------- #
-def montar_prompt(cfg, nota, comentario, produto=None, nome=None, tom=None) -> str:
+def montar_prompt(cfg, nota, comentario, produto=None, nome=None, tom=None, vip=False) -> str:
     tom_desc = TONS.get(tom or cfg.tom or "caloroso", TONS["caloroso"])
     coment = (comentario or "").strip() or "(o cliente não escreveu texto, deu só a nota)"
     nota = int(nota or 5)
@@ -240,16 +263,59 @@ def montar_prompt(cfg, nota, comentario, produto=None, nome=None, tom=None) -> s
         regras.append("Pode cumprimentar pelo primeiro nome do cliente.")
     elif not cfg.usar_nome:
         regras.append("Não use o nome do cliente.")
-    regras.append("Pode usar 1 ou 2 emojis leves, se combinar." if cfg.usar_emoji
-                  else "Não use nenhum emoji.")
+    # intensidade de emoji
+    intens = getattr(cfg, "emoji_intensidade", None) or "leve"
+    if not cfg.usar_emoji or intens == "nenhum":
+        regras.append("Não use nenhum emoji.")
+    elif intens == "animado":
+        regras.append("Pode usar 2 a 3 emojis para dar um tom bem animado e caloroso.")
+    else:
+        regras.append("Use no máximo 1 emoji leve, só se combinar.")
 
-    if nota <= 3:
-        regras.append("A nota é baixa: peça desculpas com sinceridade, demonstre que se importa "
-                      "de verdade e que vai resolver. Nunca seja defensivo nem culpe o cliente.")
+    # estratégia por faixa de nota (instruções específicas da loja por nota)
+    if nota <= 2:
+        faixa = (getattr(cfg, "instrucoes_critica", None) or "").strip()
+        regras.append("A nota é uma CRÍTICA: peça desculpas com sinceridade, assuma a resolução "
+                      "(reposição/troca) e mostre que se importa de verdade. Nunca seja defensivo, "
+                      "nunca culpe o cliente e nunca discuta em público.")
+        if faixa:
+            regras.append(f"Estratégia da loja para críticas: {faixa}")
         if cfg.oferecer_chat:
             regras.append("Convide o cliente a chamar no chat da Shopee para resolver rápido.")
+    elif nota == 3:
+        faixa = (getattr(cfg, "instrucoes_morna", None) or "").strip()
+        regras.append("A nota é MORNA (3★): agradeça o retorno, pergunte com leveza o que faltou "
+                      "para ser 5★ e mostre que a opinião muda a loja de verdade.")
+        if faixa:
+            regras.append(f"Estratégia da loja para notas mornas: {faixa}")
+        if cfg.oferecer_chat:
+            regras.append("Se fizer sentido, ofereça resolver pelo chat da Shopee.")
     else:
-        regras.append("A nota é boa: agradeça com calor e convide a conferir os lançamentos / voltar a comprar.")
+        faixa = (getattr(cfg, "instrucoes_elogio", None) or "").strip()
+        regras.append("A nota é um ELOGIO: agradeça com calor, celebre o projeto da cliente "
+                      "(bijuteria/artesanato) e convide a voltar / conferir os lançamentos.")
+        if faixa:
+            regras.append(f"Estratégia da loja para elogios: {faixa}")
+
+    # guard-rails: frases da casa (pode usar) e frases proibidas (bloqueio duro)
+    casa = [str(x).strip() for x in (getattr(cfg, "frases_casa", None) or []) if str(x).strip()]
+    if casa:
+        regras.append("Você pode usar naturalmente, quando couber (sem forçar), frases da casa como: "
+                      + "; ".join(f'"{f}"' for f in casa[:8]) + ".")
+    proib = [str(x).strip() for x in (getattr(cfg, "frases_proibidas", None) or []) if str(x).strip()]
+    if proib:
+        regras.append("JAMAIS diga nada parecido com (proibido): "
+                      + "; ".join(f'"{f}"' for f in proib[:8]) + ".")
+
+    # cupom de recompra (nunca em críticas, pra não parecer suborno)
+    cupom_ativo = bool(getattr(cfg, "cupom_ativo", False))
+    cupom_cod = (getattr(cfg, "cupom_codigo", None) or "").strip()
+    cupom_quando = getattr(cfg, "cupom_quando", None) or "vips"
+    if cupom_ativo and cupom_cod and cupom_quando != "nunca" and nota >= 4:
+        cita = (cupom_quando == "todas5" and nota == 5) or (cupom_quando == "vips" and vip)
+        if cita:
+            regras.append(f'Ofereça com naturalidade o cupom de recompra "{cupom_cod}" como um mimo '
+                          "para a próxima compra — nunca soe como suborno, é só um carinho.")
 
     if cfg.saudacao:
         regras.append(f'Comece a resposta com uma saudação no estilo: "{cfg.saudacao.strip()}".')
@@ -266,13 +332,13 @@ def montar_prompt(cfg, nota, comentario, produto=None, nome=None, tom=None) -> s
 # --------------------------------------------------------------------------- #
 # Sugerir (rascunho, sem enviar) e enviar
 # --------------------------------------------------------------------------- #
-def sugerir(user_id: int, nota, comentario, produto=None, nome=None, tom=None) -> str:
+def sugerir(user_id: int, nota, comentario, produto=None, nome=None, tom=None, vip=False) -> str:
     db = SessionLocal()
     try:
         cfg = _config(db, user_id)
     finally:
         db.close()
-    prompt = montar_prompt(cfg, nota, comentario, produto, nome, tom)
+    prompt = montar_prompt(cfg, nota, comentario, produto, nome, tom, vip=vip)
     texto = (ai._gerar_texto(user_id, prompt) or "").strip().strip('"')
     return texto
 

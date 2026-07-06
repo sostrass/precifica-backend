@@ -1388,7 +1388,8 @@ def shopee_review_sugerir(payload: dict = Body(...), user: User = Depends(auth.g
     try:
         texto = shopee_reviews.sugerir(
             user.id, payload.get("nota", 5), payload.get("comentario", ""),
-            payload.get("produto"), payload.get("nome"), payload.get("tom"))
+            payload.get("produto"), payload.get("nome"), payload.get("tom"),
+            vip=bool(payload.get("vip", False)))
         return {"texto": texto}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"IA falhou: {e}")
