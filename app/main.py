@@ -706,6 +706,31 @@ def shopee_boost_fixar(item_id: str, payload: dict = Body(default={}),
         db.close()
 
 
+@app.post("/api/shopee/boost/reordenar")
+def shopee_boost_reordenar(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Reordena a fila: recebe a ordem desejada de item_ids (topo primeiro) e grava prioridades
+    decrescentes. Ativa o critério 'prioridade' para a ordem manual valer no rodízio."""
+    ordem = [str(x) for x in (payload.get("ordem") or []) if x]
+    if not ordem:
+        raise HTTPException(status_code=422, detail="Ordem vazia.")
+    db = SessionLocal()
+    try:
+        from .models import ShopeeBoostItem, ShopeeBoostConfig
+        n = len(ordem)
+        for i, iid in enumerate(ordem):
+            reg = db.query(ShopeeBoostItem).filter_by(user_id=user.id, item_id=iid).first()
+            if reg:
+                reg.prioridade = (n - i) * 10  # topo = maior prioridade
+        cfg = db.query(ShopeeBoostConfig).filter_by(user_id=user.id).first()
+        if not cfg:
+            cfg = ShopeeBoostConfig(user_id=user.id); db.add(cfg)
+        cfg.criterio = "prioridade"
+        db.commit()
+        return {"ok": True, "criterio": "prioridade"}
+    finally:
+        db.close()
+
+
 @app.post("/api/shopee/boost/rodar")
 def shopee_boost_rodar(user: User = Depends(auth.get_current_user)):
     """Roda um ciclo de boost agora (manual). O agendador faz isso sozinho."""
@@ -880,17 +905,37 @@ def _boost_painel(user_id):
     rem = [v["termina_ms"] for v in vagas if v.get("ocupada") and v.get("termina_ms")]
     proxima = min(rem) if (rem and ocupadas >= 5) else None
     fila = _boost_fila_enriquecida(st.get("fila") or [], vendas, ocupadas)
+    # info em lote (elegibilidade + imagem + sku + preço) para fila E vagas — 1 fetch cacheado
+    ids_union = list({str(f.get("item_id")) for f in fila}
+                     | {str(v.get("item_id")) for v in vagas if v.get("ocupada")})
+    info = {}
     try:
-        eleg = _boost_elegibilidade(user_id, [f.get("item_id") for f in fila])
-        for f in fila:
-            e = eleg.get(str(f.get("item_id"))) or {}
-            f["elegivel"] = e.get("elegivel", True)
-            f["motivo_ineleg"] = e.get("motivo")
-            if e.get("estoque") is not None:
-                f["estoque"] = e["estoque"]
+        info = _boost_elegibilidade(user_id, ids_union)
     except Exception:  # noqa: BLE001
-        pass
+        info = {}
+    precos = {}
+    try:
+        precos = _boost_precos(user_id, info)
+    except Exception:  # noqa: BLE001
+        precos = {}
+    for f in fila:
+        e = info.get(str(f.get("item_id"))) or {}
+        f["elegivel"] = e.get("elegivel", True)
+        f["motivo_ineleg"] = e.get("motivo")
+        f["imagem"] = e.get("imagem")
+        if e.get("estoque") is not None:
+            f["estoque"] = e["estoque"]
+        pr = precos.get(str(f.get("item_id")))
+        if pr:
+            f["preco"] = pr.get("preco")
+            f["preco_sugerido"] = pr.get("sugerido")
+            f["preco_ok"] = pr.get("ok")
+            f["preco_status"] = pr.get("status")
+    for v in vagas:
+        if v.get("ocupada"):
+            v["imagem"] = (info.get(str(v.get("item_id"))) or {}).get("imagem")
     nao_elegiveis = sum(1 for f in fila if f.get("elegivel") is False)
+    preco_alerta = sum(1 for f in fila if f.get("preco_status") == "abaixo")
     # boost + promoção: marca quem já tem oferta ativa (exposição dobrada)
     try:
         ofertas = shopee.itens_em_campanha(user_id)
@@ -927,7 +972,8 @@ def _boost_painel(user_id):
         "kpis": {"vagas_ocupadas": ocupadas, "vagas_total": 5, "na_fila": len(st.get("fila") or []),
                  "proxima_vaga_ms": proxima, "impulsos_hoje": impulsos_hoje, "impulsos_max_dia": 30,
                  "vendas_30d": sum(vendas.values()), "tem_vendas": bool(vendas),
-                 "nao_elegiveis": nao_elegiveis, "em_oferta": em_oferta_fila, "sinais": len(sinais)},
+                 "nao_elegiveis": nao_elegiveis, "em_oferta": em_oferta_fila, "sinais": len(sinais),
+                 "preco_alerta": preco_alerta},
         "fila": fila,
         "campeoes": _boost_campeoes(vendas, st),
         "radar": radar,
@@ -1005,7 +1051,34 @@ def _boost_historico(user_id, limite=40):
         r["por_boost"] = round(r["vendas"] / r["com_atrib"], 1) if r["com_atrib"] else None
     atrib = [e for e in eventos if e["vendas"] is not None]
     total_v = sum(e["vendas"] for e in atrib)
-    return {"eventos": eventos, "resumo": lista,
+    # série diária: vendas totais vs. vendas durante destaque (últimos 14 dias, horário de Brasília)
+    serie = []
+    try:
+        import time as _t
+        from datetime import datetime, timezone, timedelta
+        BR = timezone(timedelta(hours=-3))
+        linhas = _boost_linhas_venda(user_id)
+        with SessionLocal() as db:
+            janelas = [(str(l.item_id),
+                        l.inicio.replace(tzinfo=timezone.utc).timestamp() * 1000,
+                        (l.fim.replace(tzinfo=timezone.utc).timestamp() * 1000) if l.fim else _t.time() * 1000)
+                       for l in db.query(ShopeeBoostLog).filter(ShopeeBoostLog.user_id == user_id).all() if l.inicio]
+        agora = _t.time() * 1000
+        dias = {}
+        for d in range(13, -1, -1):
+            k = datetime.fromtimestamp((agora - d * 86400000) / 1000, tz=BR).strftime("%d/%m")
+            dias[k] = {"d": k, "total": 0, "boost": 0}
+        for iid, qty, ctms in linhas:
+            k = datetime.fromtimestamp(ctms / 1000, tz=BR).strftime("%d/%m")
+            if k not in dias:
+                continue
+            dias[k]["total"] += qty
+            if any(str(iid) == jid and a <= ctms <= b for jid, a, b in janelas):
+                dias[k]["boost"] += qty
+        serie = list(dias.values())
+    except Exception:  # noqa: BLE001
+        serie = []
+    return {"eventos": eventos, "resumo": lista, "serie": serie,
             "kpis": {"total_boosts": len(eventos), "total_vendas_atrib": total_v,
                      "vendas_por_boost": round(total_v / len(atrib), 1) if atrib else None,
                      "boosts_atribuidos": len(atrib), "produtos": len(lista)}}
@@ -1025,9 +1098,14 @@ def _boost_elegibilidade(user_id, item_ids):
             for i in range(0, len(ids), 50):
                 r = shopee.info_itens(user_id, [int(x) for x in ids[i:i + 50]])
                 for x in ((r.get("response") or {}).get("item_list") or []):
+                    imgs = (x.get("image") or {}).get("image_url_list") or []
+                    precos = x.get("price_info") or []
                     base[str(x.get("item_id"))] = {
                         "status": x.get("item_status"),
                         "estoque": (x.get("stock_info_v2") or {}).get("summary_info", {}).get("total_available_stock"),
+                        "imagem": imgs[0] if imgs else None,
+                        "sku": x.get("item_sku"),
+                        "preco": (precos[0].get("current_price") if precos else None),
                     }
         except Exception:  # noqa: BLE001
             base = {}
@@ -1038,16 +1116,17 @@ def _boost_elegibilidade(user_id, item_ids):
     for iid in ids:
         info = base.get(iid)
         if not info:
-            out[iid] = {"elegivel": True, "motivo": None, "estoque": None}
+            out[iid] = {"elegivel": True, "motivo": None, "estoque": None, "imagem": None, "sku": None, "preco": None}
             continue
         st = (info.get("status") or "").upper()
         est = info.get("estoque")
+        extra = {"estoque": est, "imagem": info.get("imagem"), "sku": info.get("sku"), "preco": info.get("preco")}
         if st and st != "NORMAL":
-            out[iid] = {"elegivel": False, "motivo": _MOTIVO.get(st, st.lower()), "estoque": est}
+            out[iid] = {"elegivel": False, "motivo": _MOTIVO.get(st, st.lower()), **extra}
         elif est is not None and est <= 0:
-            out[iid] = {"elegivel": False, "motivo": "sem estoque", "estoque": est}
+            out[iid] = {"elegivel": False, "motivo": "sem estoque", **extra}
         else:
-            out[iid] = {"elegivel": True, "motivo": None, "estoque": est}
+            out[iid] = {"elegivel": True, "motivo": None, **extra}
     return out
 
 
@@ -1077,6 +1156,38 @@ def _boost_sinais(user_id, fila):
             sinais.append({"item_id": iid, "nome": f.get("nome"), "tipo": "surto",
                            "detalhe": f"vendas {round(r3 / b11, 1)}x acima do normal"})
     return sinais[:8]
+
+
+def _boost_precos(user_id, info):
+    """Cruza o preço ATUAL de cada item na Shopee com o preço-sugerido da régua (modelo
+    BASE-VENDA): o preço Bling é o líquido-alvo e a régua dá o preço de LISTA na Shopee que o
+    preserva. ok = preço atual bate com o sugerido; senão 'abaixo' (furando a margem) ou 'acima'."""
+    try:
+        from . import catalogo, precificacao
+        cfg_prec = precificacao.obter_config(user_id)
+        cat = {p["sku"]: p for p in catalogo.todos(user_id) if p.get("sku")}
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for iid, d in (info or {}).items():
+        sku, preco = d.get("sku"), d.get("preco")
+        base = cat.get(sku) if sku else None
+        if not base or preco is None:
+            continue
+        bling = float(base.get("preco") or 0)  # líquido-alvo (preço Bling)
+        if bling <= 0:
+            continue
+        try:
+            sug = precificacao.avaliar_com_cfg(cfg_prec, 0, bling, "shopee").get("preco_sugerido")
+        except Exception:  # noqa: BLE001
+            sug = None
+        if not sug:
+            continue
+        preco = float(preco)
+        status = "abaixo" if preco < sug * 0.99 else ("acima" if preco > sug * 1.08 else "ok")
+        out[iid] = {"ok": status == "ok", "status": status, "sugerido": round(float(sug), 2),
+                    "preco": round(preco, 2), "bling": round(bling, 2)}
+    return out
 
 
 def _boost_pico_old(user_id, dias=30):
