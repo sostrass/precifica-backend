@@ -19,21 +19,38 @@ _MSG_CHEIO = ("As 5 vagas de destaque da Shopee já estão ocupadas — inclui o
               "assim que houver vaga, o motor impulsiona sozinho.")
 
 
-def _log_boost(db, user_id, reg, inicio, fim):
-    """Grava uma janela de boost no histórico durável, sem duplicar a mesma janela em aberto."""
+def _tipo(reg):
+    return "radar" if getattr(reg, "condicional", False) else ("auto" if reg.auto else "manual")
+
+
+def _log_boost(user_id, item_id, nome, tipo, inicio, fim):
+    """Grava uma janela de boost no histórico durável em SESSÃO PRÓPRIA e isolada.
+    Qualquer falha aqui (ex.: schema antigo em produção) faz rollback só da sessão do log —
+    NUNCA toca a transação principal do ciclo (que já foi commitada antes de chamar isto)."""
     from .models import ShopeeBoostLog
+    ldb = SessionLocal()
     try:
-        aberto = (db.query(ShopeeBoostLog)
+        aberto = (ldb.query(ShopeeBoostLog)
                   .filter(ShopeeBoostLog.user_id == user_id,
-                          ShopeeBoostLog.item_id == str(reg.item_id),
+                          ShopeeBoostLog.item_id == str(item_id),
                           ShopeeBoostLog.fim > inicio).first())
-        if aberto:
-            return
-        tipo = "radar" if reg.condicional else ("auto" if reg.auto else "manual")
-        db.add(ShopeeBoostLog(user_id=user_id, item_id=str(reg.item_id), nome=reg.nome,
-                              tipo=tipo, inicio=inicio, fim=fim))
+        if not aberto:
+            ldb.add(ShopeeBoostLog(user_id=user_id, item_id=str(item_id), nome=nome,
+                                   tipo=tipo, inicio=inicio, fim=fim))
+            ldb.commit()
     except Exception:  # noqa: BLE001 — histórico nunca derruba o ciclo
-        pass
+        try:
+            ldb.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        ldb.close()
+
+
+def _flush_logs(user_id, logs):
+    """Escreve a fila de janelas de boost coletadas no ciclo, cada uma em sessão isolada."""
+    for (item_id, nome, tipo, inicio, fim) in logs:
+        _log_boost(user_id, item_id, nome, tipo, inicio, fim)
 
 
 def _boosted_ids(user_id: int):
@@ -115,8 +132,9 @@ def status(user_id: int) -> dict:
         itens = db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()
         agora = datetime.utcnow()
         ativos = [i for i in itens if i.boost_ate and i.boost_ate > agora]
-        fila = [i for i in itens if not (i.boost_ate and i.boost_ate > agora) and not i.fixo]
+        fila = [i for i in itens if not (i.boost_ate and i.boost_ate > agora)]
         fila = _ordenar(db, user_id, fila, cfg.criterio)
+        fila.sort(key=lambda i: (0 if i.fixo else 1))  # fixos primeiro na exibição
 
         def _nome(i):
             return i.nome if (i.nome and str(i.nome).lstrip("#") != str(i.item_id)) else f"#{i.item_id}"
@@ -145,6 +163,7 @@ def status(user_id: int) -> dict:
             } for i in ativos],
             "fila": [{
                 "item_id": i.item_id, "nome": _nome(i), "prioridade": i.prioridade, "auto": getattr(i, "auto", False),
+                "fixo": i.fixo, "condicional": getattr(i, "condicional", False),
                 "ultimo_boost": i.ultimo_boost.isoformat() if i.ultimo_boost else None,
                 "impulsos": i.impulsos,
             } for i in fila],
@@ -179,6 +198,7 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
     Chamado periodicamente pelo agendador em background. `notificar=False` quando chamado
     de dentro do boost condicional (que emite a própria notificação, evitando duplicar)."""
     db = SessionLocal()
+    logs = []  # (item_id, nome, tipo, inicio, fim) — gravados após o commit, em sessão isolada
     try:
         cfg = _config(db, user_id)
         if not cfg.ativo or not _na_janela(cfg):
@@ -194,14 +214,14 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
                 reg = por_id.get(str(bid))
                 if reg and not (reg.boost_ate and reg.boost_ate > agora):
                     reg.boost_ate = agora + timedelta(hours=BOOST_HORAS)
-                    _log_boost(db, user_id, reg, agora, reg.boost_ate)
-            if reais:
-                db.flush()
+                    logs.append((reg.item_id, reg.nome, _tipo(reg), agora, reg.boost_ate))
+            db.commit()  # persiste a reconciliação (isolada do histórico)
             ocupadas = len(reais)
         else:
             ocupadas = len([i for i in itens if i.boost_ate and i.boost_ate > agora])
         vagas = max(0, min(cfg.max_simultaneos, MAX) - ocupadas)
         if vagas == 0:
+            _flush_logs(user_id, logs)
             return {"acao": "cheio", "ativos": ocupadas, "msg": _MSG_CHEIO}
         # fixos primeiro (que não estão ativos), depois fila por critério
         fixos = [i for i in itens if i.fixo and not (i.boost_ate and i.boost_ate > agora)]
@@ -209,6 +229,7 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
         fila = _ordenar(db, user_id, fila, cfg.criterio)
         escolhidos = (fixos + fila)[:vagas]
         if not escolhidos:
+            _flush_logs(user_id, logs)
             return {"acao": "sem_candidatos"}
         ids = [e.item_id for e in escolhidos]
         nomes = [e.nome for e in escolhidos]
@@ -217,6 +238,7 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
         except shopee.ShopeeError as e:
             m = str(e)
             if "bump slot" in m.lower() or "slot limit" in m.lower():
+                _flush_logs(user_id, logs)
                 return {"acao": "cheio", "ativos": MAX, "msg": _MSG_CHEIO}
             return {"acao": "erro", "erro": m}
         fim = agora + timedelta(hours=BOOST_HORAS)
@@ -224,8 +246,9 @@ def ciclo(user_id: int, notificar: bool = True) -> dict:
             e.ultimo_boost = agora
             e.boost_ate = fim
             e.impulsos = (e.impulsos or 0) + 1
-            _log_boost(db, user_id, e, agora, fim)
+            logs.append((e.item_id, e.nome, _tipo(e), agora, fim))
         db.commit()
+        _flush_logs(user_id, logs)
         if notificar:
             try:
                 from . import notificacoes as notif

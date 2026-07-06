@@ -765,6 +765,7 @@ def shopee_boost_desempenho(user: User = Depends(auth.get_current_user)):
 
 # ============================ CENTRAL DE BOOST (painel enterprise) ============================
 _PICO_CACHE: dict = {}
+BOOST_VAGA_HORAS = 4  # estimativa de duração p/ vaga em destaque sem boost_ate conhecido (reconciliação)
 _LINHAS_CACHE: dict = {}
 _ELEG_CACHE: dict = {}
 
@@ -815,28 +816,38 @@ def _boost_vagas(user_id, st, vendas):
     banco para rotular auto/manual/radar e o tempo restante. Preenche até 5 (livres no fim)."""
     from . import shopee_boost
     from .models import ShopeeBoostItem
-    from datetime import datetime
+    from datetime import datetime, timedelta
     agora = datetime.utcnow()
     reais = shopee_boost._boosted_ids(user_id)  # ids em destaque agora, ou None se não leu
     sincronizado = reais is not None
     if reais is None:
         reais = [str(x.get("item_id")) for x in (st.get("impulsionando") or [])]
+    vagas, ordem = [], 0
     with SessionLocal() as db:
         regs = {str(i.item_id): i for i in db.query(ShopeeBoostItem).filter_by(user_id=user_id).all()}
-    vagas, ordem = [], 0
-    for bid in reais[:5]:
-        r = regs.get(str(bid))
-        tipo, nome, impulsos, termina = "manual", "#" + str(bid), 0, None
-        if r:
-            tipo = "radar" if r.condicional else ("auto" if r.auto else "manual")
-            nome = r.nome if (r.nome and str(r.nome).lstrip("#") != str(r.item_id)) else ("#" + str(bid))
-            impulsos = r.impulsos or 0
-            if r.boost_ate and r.boost_ate > agora:
+        mudou = False
+        for bid in reais[:5]:
+            r = regs.get(str(bid))
+            tipo, nome, impulsos, termina = "manual", "#" + str(bid), 0, None
+            if r:
+                # reconciliação leve: item em destaque agora sem boost_ate ganha estimativa de 4h
+                # (some o "—"); só grava quando falta, então não fica reiniciando o relógio.
+                if not (r.boost_ate and r.boost_ate > agora):
+                    r.boost_ate = agora + timedelta(hours=BOOST_VAGA_HORAS)
+                    mudou = True
+                tipo = "radar" if r.condicional else ("auto" if r.auto else "manual")
+                nome = r.nome if (r.nome and str(r.nome).lstrip("#") != str(r.item_id)) else ("#" + str(bid))
+                impulsos = r.impulsos or 0
                 termina = int((r.boost_ate - agora).total_seconds() * 1000)
-        vagas.append({"ordem": ordem, "ocupada": True, "item_id": str(bid), "nome": nome,
-                      "tipo": tipo, "termina_ms": termina, "impulsos": impulsos,
-                      "vendas": int(vendas.get(str(bid), 0))})
-        ordem += 1
+            vagas.append({"ordem": ordem, "ocupada": True, "item_id": str(bid), "nome": nome,
+                          "tipo": tipo, "termina_ms": termina, "impulsos": impulsos,
+                          "vendas": int(vendas.get(str(bid), 0))})
+            ordem += 1
+        if mudou:
+            try:
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
     while len(vagas) < 5:
         vagas.append({"ordem": ordem, "ocupada": False}); ordem += 1
     return vagas, sincronizado
@@ -1263,6 +1274,60 @@ def shopee_reputacao_painel(forcar: int = 0, user: User = Depends(auth.get_curre
         return shopee_reputacao.painel(user.id, forcar=bool(forcar))
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/reputacao/temas")
+def shopee_reputacao_temas(forcar: int = 0, user: User = Depends(auth.get_current_user)):
+    """Temas dos comentários lidos por IA (positivo/negativo + citações). Cacheado ~6h."""
+    from . import shopee_reputacao
+    try:
+        return shopee_reputacao.temas_ia(user.id, forcar=bool(forcar))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/reputacao/comprador/{usuario}")
+def shopee_reputacao_comprador(usuario: str, user: User = Depends(auth.get_current_user)):
+    """Dossiê de um comprador: pedidos, avaliações deixadas e linha do tempo."""
+    from . import shopee_reputacao
+    try:
+        return shopee_reputacao.dossie(user.id, usuario)
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/shopee/reputacao/temas")
+def shopee_reputacao_temas(forcar: int = 0, user: User = Depends(auth.get_current_user)):
+    """Análise de temas/sentimento dos comentários pela IA (cacheado 1h)."""
+    from . import shopee_reputacao
+    return shopee_reputacao.temas(user.id, forcar=bool(forcar))
+
+
+@app.post("/api/shopee/reputacao/responder_massa")
+def shopee_reputacao_responder_massa(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """Gera (IA) e envia respostas para uma lista de avaliações de uma vez. Body:
+    {itens:[{comment_id, nota, comentario, produto?, nome?}]}. Retorna por item o resultado."""
+    itens = payload.get("itens") or []
+    if not itens:
+        raise HTTPException(status_code=422, detail="Nenhuma avaliação selecionada.")
+    resultados = []
+    for it in itens[:100]:
+        cid = it.get("comment_id")
+        try:
+            texto = it.get("texto") or shopee_reviews.sugerir(
+                user.id, it.get("nota", 5), it.get("comentario", ""),
+                it.get("produto"), it.get("nome"))
+            shopee.responder_avaliacao(user.id, cid, texto)
+            try:
+                shopee_reviews._registrar_log(user.id, cid, it.get("nota", 5),
+                                              it.get("nome"), it.get("produto"), texto, modo="massa")
+            except Exception:  # noqa: BLE001
+                pass
+            resultados.append({"comment_id": cid, "ok": True})
+        except Exception as e:  # noqa: BLE001
+            resultados.append({"comment_id": cid, "ok": False, "erro": str(e)})
+    ok = sum(1 for r in resultados if r["ok"])
+    return {"enviadas": ok, "falhas": len(resultados) - ok, "resultados": resultados}
 
 
 @app.post("/api/shopee/avaliacoes/responder")
