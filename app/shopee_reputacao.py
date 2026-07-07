@@ -206,6 +206,80 @@ def _insights(user_id: int, avaliacoes: list, produtos: list, compradores: dict)
     return out[:4]
 
 
+# --------------------------------------------------------------------------- #
+# O que o cliente avalia — sub-notas derivadas do que os clientes escreveram
+# --------------------------------------------------------------------------- #
+_KW_ENTREGA = ("entrega", "atraso", "atras", "chegou", "chegar", "prazo", "correio", "demor",
+               "spx", "envio", "frete", "rápid", "rapid", "logíst", "logist", "postad", "transport")
+_KW_ATEND = ("atend", "respond", "vendedor", "vendedora", "suporte", "educ", "atencios",
+             "mensag", "dúvida", "duvida", "resolv", "prestativ", "gentil")
+_KW_ATRASO = ("atraso", "atras", "demor", "atrasad", "tardou", "muito tempo")
+
+
+def _o_que_avalia(avaliacoes: list) -> dict:
+    """Sub-notas por dimensão derivadas dos comentários reais: qualidade (nota geral),
+    entrega/logística e atendimento (média das avaliações que MENCIONAM cada tema), com
+    tendência recente e contagem de menções a atraso. Honesto: é o que o cliente escreveu."""
+    agora = time.time()
+    d30 = agora - 30 * 86400
+
+    def menciona(c, kws):
+        t = (c.get("comment") or "").lower()
+        return any(k in t for k in kws)
+
+    def dim(pred, todas=False):
+        recs = [c for c in avaliacoes if todas or pred(c)]
+        rs = [c.get("rating_star") or 0 for c in recs]
+        if not rs:
+            return {"media": None, "n": 0, "tendencia": None}
+        media = round(sum(rs) / len(rs), 2)
+        rec = [c.get("rating_star") or 0 for c in recs if (c.get("create_time") or 0) >= d30]
+        old = [c.get("rating_star") or 0 for c in recs if (c.get("create_time") or 0) < d30]
+        tend = round(sum(rec) / len(rec) - sum(old) / len(old), 2) if (rec and old) else None
+        return {"media": media, "n": len(rs), "tendencia": tend}
+
+    qual = dim(None, todas=True)
+    ent = dim(lambda c: menciona(c, _KW_ENTREGA))
+    at = dim(lambda c: menciona(c, _KW_ATEND))
+    atraso = sum(1 for c in avaliacoes if menciona(c, _KW_ATRASO) and (c.get("rating_star") or 5) <= 3)
+    atraso_30 = sum(1 for c in avaliacoes if menciona(c, _KW_ATRASO)
+                    and (c.get("rating_star") or 5) <= 3 and (c.get("create_time") or 0) >= d30)
+    return {
+        "dimensoes": [
+            {"chave": "qualidade", "rotulo": "Qualidade do produto", **qual},
+            {"chave": "atendimento", "rotulo": "Atendimento do vendedor", **at},
+            {"chave": "entrega", "rotulo": "Entrega / logística", **ent},
+        ],
+        "atraso_mencoes": atraso,
+        "atraso_mencoes_30d": atraso_30,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Vitrine de prova social — melhores avaliações 5★ curadas p/ virar conteúdo
+# --------------------------------------------------------------------------- #
+def _vitrine(user_id: int, avaliacoes: list, limite: int = 8) -> list:
+    cand = [c for c in avaliacoes if (c.get("rating_star") or 0) >= 5 and (c.get("comment") or "").strip()]
+    cand.sort(key=lambda c: (1 if _tem_midia(c) else 0, len(c.get("comment") or "")), reverse=True)
+    cand = cand[:limite]
+    ids = list({c.get("item_id") for c in cand if c.get("item_id")})
+    try:
+        meta = shopee.nomes_itens(user_id, ids[:50])
+    except Exception:  # noqa: BLE001
+        meta = {}
+    out = []
+    for c in cand:
+        m = meta.get(c.get("item_id")) or {}
+        imgs = ((c.get("media") or {}).get("image_url_list") or [])
+        vids = ((c.get("media") or {}).get("video_url_list") or [])
+        out.append({"comment_id": c.get("comment_id"), "produto": m.get("nome") or ("#" + str(c.get("item_id"))),
+                    "produto_imagem": m.get("imagem"), "comentario": (c.get("comment") or "").strip(),
+                    "buyer": c.get("buyer_username") or "cliente", "nota": c.get("rating_star") or 5,
+                    "tem_video": bool(vids), "imagem": imgs[0] if imgs else None,
+                    "quando": (c.get("create_time") or 0) * 1000})
+    return out
+
+
 def _reputacao_produtos(user_id: int, avaliacoes: list, limite: int = 40) -> list:
     """Nota média, volume, % de críticas e tendência por produto (item_id), cruzado com
     a fila do Boost e as ofertas ativas. Enriquece nome/imagem via nomes_itens."""
@@ -412,6 +486,15 @@ def painel(user_id: int, forcar: bool = False) -> dict:
     criticas_abertas = sum(1 for c in avals
                            if (c.get("rating_star") or 5) <= 2 and not _respondida(c))
 
+    # SLA da Shopee: 30 dias para responder — mira a avaliação sem resposta mais antiga
+    abertas = [c for c in avals if not _respondida(c)]
+    sla_dias = None
+    sla_mais_antiga = None
+    if abertas:
+        antiga_ts = min((c.get("create_time") or agora) for c in abertas)
+        sla_mais_antiga = int((agora - antiga_ts) / 86400)
+        sla_dias = max(0, 30 - sla_mais_antiga)
+
     # tendência: média diária das novas avaliações, 14 dias (BR)
     dias = {}
     for d in range(13, -1, -1):
@@ -477,12 +560,16 @@ def painel(user_id: int, forcar: bool = False) -> dict:
             "novas_30d": n30,
             "por_dia": por_dia,
             "criticas_abertas": criticas_abertas,
+            "sla_dias_restantes": sla_dias,
+            "sla_mais_antiga_dias": sla_mais_antiga,
         },
         "distribuicao": [{"estrelas": s, "qtd": dist[s]} for s in (5, 4, 3, 2, 1)],
         "tendencia": tendencia,
         "meta": meta,
+        "o_que_avalia": _o_que_avalia(avals),
         "compradores": compradores,
         "produtos": produtos,
+        "vitrine": _vitrine(user_id, avals),
         "linha_tempo": _linha_do_tempo(user_id, avals),
         "insights": _insights(user_id, avals, produtos, compradores),
         "saude": _saude_conta(user_id),

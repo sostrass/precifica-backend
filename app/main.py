@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_impressao, shopee_promo_auto, shopee_reviews, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_impressao, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
@@ -1433,6 +1433,26 @@ def shopee_review_contar(background_tasks: BackgroundTasks, forcar: int = 1,
     forcar=0 usa o cache (~10min) se houver; forcar=1 recalcula. Resultado em /atividade."""
     background_tasks.add_task(shopee_reviews.contar_avaliacoes, user.id, 60, bool(forcar))
     return {"acao": "contando", "mensagem": "Contando suas avaliações em segundo plano…"}
+
+
+# ----------------------- Central de Promoções (painel MAX) ----------------- #
+@app.get("/api/shopee/promo/painel")
+def shopee_promo_painel_get(forcar: bool = False, user: User = Depends(auth.get_current_user)):
+    try:
+        return shopee_promo_painel.painel(user.id, forcar=forcar)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Falha ao montar painel: {e}")
+
+
+@app.get("/api/shopee/promo/trava")
+def shopee_promo_trava(user: User = Depends(auth.get_current_user)):
+    """IDs dos itens que JÁ estão em campanha de desconto (ativa/agendada) — a trava
+    anti-duplicação. O seletor manual usa para desabilitar esses produtos."""
+    try:
+        ids = sorted(int(i) for i in shopee.itens_em_campanha(user.id))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"ids": ids, "total": len(ids)}
 
 
 # ----------------------- Motor de promoções automáticas ------------------- #

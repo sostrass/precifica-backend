@@ -435,6 +435,16 @@ def propor(user_id: int) -> dict:
     if not propostas:
         return {"acao": "vazio", "propostas": [], "diagnostico": diag,
                 "msg": _motivo_funil(diag, cfgv)}
+    # enriquece com foto do anúncio (uma chamada em lote, cacheada)
+    try:
+        ids = [int(p["item_id"]) for p in propostas if str(p.get("item_id") or "").isdigit()]
+        meta = shopee.nomes_itens(user_id, ids) if ids else {}
+        for p in propostas:
+            m = meta.get(int(p["item_id"])) if str(p.get("item_id") or "").isdigit() else None
+            if m:
+                p["imagem"] = m.get("imagem")
+    except Exception:  # noqa: BLE001
+        pass
     return {"acao": "ok", "propostas": propostas, "config": snap, "diagnostico": diag}
 
 
