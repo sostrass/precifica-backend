@@ -1540,7 +1540,8 @@ def shopee_promo_queda(user: User = Depends(auth.get_current_user)):
 
 @app.get("/api/shopee/promo/historico")
 def shopee_promo_historico(user: User = Depends(auth.get_current_user)):
-    return {"itens": shopee_promo_auto.historico(user.id)}
+    return {"itens": shopee_promo_auto.historico(user.id, limite=40),
+            "resumo": shopee_promo_auto.resumo(user.id)}
 
 
 # ---- Pedidos & financeiro ----

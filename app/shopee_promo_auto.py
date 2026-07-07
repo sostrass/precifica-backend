@@ -102,6 +102,23 @@ def _faixa_shopee(cfg_prec: dict, preco: float):
     return faixas[-1] if faixas else None
 
 
+def _preco_lista_shopee(cfg_prec: dict, base_venda: float):
+    """Preço de LISTA na Shopee a partir do líquido-alvo (Preço Bling = base_venda),
+    calculado pela precificação (modelo BASE-VENDA). É o preço que o cliente vê e sobre o
+    qual o desconto incide — NÃO o Preço Bling cru. Idêntico ao 'pra_netar' do Catálogo."""
+    if not base_venda or base_venda <= 0:
+        return None
+    canais = cfg_prec.get("canais") or []
+    canal = next((c for c in canais if (c.get("canal") or "").lower() == "shopee"), None)
+    if not canal or not canal.get("faixas"):
+        return None
+    r = precificacao.precificar_venda_canal(
+        float(base_venda), canal["faixas"],
+        float(cfg_prec.get("imposto", 0)), float(cfg_prec.get("cartao", 0)),
+        float(cfg_prec.get("embalagem", 0)))
+    return r.get("preco") if r else None
+
+
 def margem_no_preco(cfg_prec: dict, preco: float, custo: float):
     """Margem líquida (% sobre o preço de lista) ao vender por `preco` na Shopee."""
     preco = float(preco or 0)
@@ -193,8 +210,9 @@ def _funil(user_id: int, cfg):
         if estoque < max(1, est_min):
             continue
         diag["passaram_estoque"] += 1
-        preco = float(base.get("preco") or 0)
+        base_venda = float(base.get("preco") or 0)   # Preço Bling = líquido-alvo (base da precificação)
         custo = float(base.get("custo") or 0)
+        preco = _preco_lista_shopee(cfg_prec, base_venda) or 0.0   # preço de LISTA configurado na precificação
         if preco <= 0:
             continue
         margem_cheia = margem_no_preco(cfg_prec, preco, custo)
@@ -215,6 +233,7 @@ def _funil(user_id: int, cfg):
         out.append({
             "item_id": str(it.get("item_id")), "nome": it.get("item_name") or sku, "sku": sku,
             "estoque": estoque, "preco_atual": round(preco, 2), "preco_promo": preco_promo,
+            "preco_base": round(base_venda, 2),
             "desconto_pct": d, "margem_promo": round(margem_no_preco(cfg_prec, preco_promo, custo), 1),
             "margem_cheia": round(margem_cheia, 1), "vendidos": vendidos,
         })
@@ -757,3 +776,44 @@ def historico(user_id: int, limite: int = 20) -> list:
                  "criado_em": r.criado_em.isoformat() if r.criado_em else None} for r in regs]
     finally:
         db.close()
+
+
+def resumo(user_id: int, dias: int = 30) -> dict:
+    """Resumo real do diário (auditoria) para o cabeçalho do painel: totais,
+    distribuição por tipo/gatilho e série diária dos últimos 14 dias."""
+    from datetime import timedelta
+    db = SessionLocal()
+    try:
+        desde = datetime.utcnow() - timedelta(days=dias)
+        regs = (db.query(ShopeePromoLog)
+                .filter(ShopeePromoLog.user_id == user_id, ShopeePromoLog.criado_em >= desde)
+                .order_by(ShopeePromoLog.criado_em.desc()).all())
+    finally:
+        db.close()
+    por_tipo, por_motivo, por_dia = {}, {}, {}
+    itens_total, descs = 0, []
+    for r in regs:
+        t = r.tipo or "outro"
+        m = r.motivo or "manual"
+        por_tipo[t] = por_tipo.get(t, 0) + 1
+        por_motivo[m] = por_motivo.get(m, 0) + 1
+        itens_total += (r.qtd_itens or 0)
+        if r.desconto_pct:
+            descs.append(r.desconto_pct)
+        if r.criado_em:
+            d = r.criado_em.strftime("%Y-%m-%d")
+            por_dia[d] = por_dia.get(d, 0) + 1
+    hoje = datetime.utcnow().date()
+    serie = [{"dia": (hoje - timedelta(days=i)).strftime("%Y-%m-%d"),
+              "qtd": por_dia.get((hoje - timedelta(days=i)).strftime("%Y-%m-%d"), 0)}
+             for i in range(13, -1, -1)]
+    return {
+        "total": len(regs),
+        "itens_total": itens_total,
+        "desconto_medio": round(sum(descs) / len(descs)) if descs else None,
+        "por_tipo": por_tipo,
+        "por_motivo": por_motivo,
+        "serie_14d": serie,
+        "ultima": regs[0].criado_em.isoformat() if regs and regs[0].criado_em else None,
+        "janela_dias": dias,
+    }
