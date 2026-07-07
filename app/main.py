@@ -1544,6 +1544,93 @@ def shopee_promo_historico(user: User = Depends(auth.get_current_user)):
             "resumo": shopee_promo_auto.resumo(user.id)}
 
 
+@app.post("/api/shopee/promo/diag")
+def shopee_promo_diag(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
+    """DIAGNÓSTICO TEMPORÁRIO. Cria um desconto de teste com um produto real, adiciona o item,
+    captura a RESPOSTA CRUA da Shopee ao adicionar (é o que precisamos ver para acertar o
+    parsing), reconsulta a promoção para conferir se o item entrou de fato, e encerra o teste.
+    Não deixa nada ativo. Só usa funções do shopee.py; não altera o wrapper."""
+    import time as _t
+    passos = []
+    def log(passo, dado):
+        passos.append({"passo": passo, "dado": dado})
+    try:
+        item_id = int(payload["item_id"])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Informe um item_id da Shopee.")
+    dpct = int(payload.get("desconto_pct", 10))
+
+    # 1) preço real do item-base (para anúncios simples) + variações
+    preco = 0.0
+    try:
+        nm = (shopee.nomes_itens(user.id, [item_id]) or {}).get(item_id, {}) or {}
+        preco = float(nm.get("preco") or 0)
+        log("item_base", {"item_id": item_id, "nome": nm.get("nome"),
+                          "preco_item_base": preco, "estoque": nm.get("estoque")})
+    except Exception as e:
+        log("erro_item_base", str(e))
+    try:
+        ml = shopee.modelos_item(user.id, item_id)
+        log("modelos_do_anuncio", [{"model_id": m.get("model_id"),
+                                    "preco_modelo": shopee._preco_modelo(m)} for m in (ml or [])])
+    except Exception as e:
+        log("erro_modelos", str(e))
+
+    # 2) item_list exatamente como o fluxo real monta
+    try:
+        item_list = shopee.itens_desconto_por_pct(user.id, [{"item_id": item_id, "desconto_pct": dpct, "preco": preco}])
+    except Exception as e:
+        item_list = []
+        log("erro_montar_item_list", str(e))
+    log("item_list_ENVIADO", item_list)
+
+    # 3) cria desconto de teste
+    inicio = int(_t.time()) + 900
+    fim = inicio + 3 * 86400
+    did = None
+    try:
+        r = shopee._chamar(user.id, "/api/v2/discount/add_discount", metodo="POST",
+                           extra={"discount_name": f"DIAGNOSTICO {int(_t.time())} (apagar)",
+                                  "start_time": inicio, "end_time": fim})
+        log("resp_add_discount", r)
+        did = (r.get("response") or {}).get("discount_id")
+    except Exception as e:
+        log("erro_add_discount", str(e))
+
+    # 4) adiciona o item e captura a RESPOSTA CRUA
+    if did and item_list:
+        try:
+            ri = shopee._chamar(user.id, "/api/v2/discount/add_discount_item", metodo="POST",
+                               extra={"discount_id": did, "item_list": item_list})
+            log("resp_add_discount_item_CRUA", ri)
+        except Exception as e:
+            log("erro_add_discount_item", str(e))
+        # 5) reconsulta: o item entrou de fato?
+        try:
+            rg = shopee._chamar(user.id, "/api/v2/discount/get_discount", metodo="GET",
+                               extra={"discount_id": did, "page_no": 1, "page_size": 50})
+            resp_g = rg.get("response") or {}
+            log("get_discount_apos", {"item_count": len(resp_g.get("item_list") or []),
+                                      "item_list": resp_g.get("item_list"), "cru": rg})
+        except Exception as e:
+            log("erro_get_discount", str(e))
+        # 6) encerra o teste (não deixar nada ativo)
+        try:
+            shopee._chamar(user.id, "/api/v2/discount/end_discount", metodo="POST",
+                           extra={"discount_id": did})
+            log("teste_encerrado", {"discount_id": did})
+        except Exception as e:
+            log("erro_encerrar_teste", {"discount_id": did, "erro": str(e)})
+    elif did and not item_list:
+        log("aviso", "item_list veio vazio — o builder não produziu itens (ver passos acima)")
+        try:
+            shopee._chamar(user.id, "/api/v2/discount/end_discount", metodo="POST", extra={"discount_id": did})
+            log("teste_encerrado", {"discount_id": did})
+        except Exception:
+            pass
+    return {"passos": passos}
+
+
 # ---- Pedidos & financeiro ----
 @app.get("/api/shopee/pedidos")
 def shopee_pedidos(dias: int = 7, cursor: str = "", user: User = Depends(auth.get_current_user)):
@@ -1946,9 +2033,13 @@ def shopee_flash(tipo: int = 1, user: User = Depends(auth.get_current_user)):
 
 @app.post("/api/shopee/flash")
 def shopee_criar_flash(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
-    """Body: {timeslot_id, itens:[{item_id, purchase_limit, models:[...]}]}."""
+    """Body: {timeslot_id, itens:[{item_id, purchase_limit, models:[...]}]} OU
+    {timeslot_id, itens:[{item_id, desconto_pct, preco_promo, estoque}]} (monta o preço por variação)."""
     try:
-        return shopee.criar_flash(user.id, int(payload["timeslot_id"]), payload.get("itens", []))
+        itens = payload.get("itens", [])
+        if itens and not (itens[0] or {}).get("models") and any(i.get("desconto_pct") for i in itens):
+            itens = shopee_promo_auto._flash_itens(user.id, itens, int(payload.get("reserva", 0)))
+        return shopee.criar_flash(user.id, int(payload["timeslot_id"]), itens)
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Informe timeslot_id e itens.")
     except shopee.ShopeeError as e:

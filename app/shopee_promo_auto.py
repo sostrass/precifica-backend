@@ -210,9 +210,13 @@ def _funil(user_id: int, cfg):
         if estoque < max(1, est_min):
             continue
         diag["passaram_estoque"] += 1
-        base_venda = float(base.get("preco") or 0)   # Preço Bling = líquido-alvo (base da precificação)
+        base_venda = float(base.get("preco") or 0)   # Preço Bling = líquido-alvo (referência do lojista)
         custo = float(base.get("custo") or 0)
-        preco = _preco_lista_shopee(cfg_prec, base_venda) or 0.0   # preço de LISTA configurado na precificação
+        # Preço sobre o qual o desconto incide = preço REAL do anúncio na Shopee (o que ela valida).
+        # Se a Shopee não trouxe o preço, cai para o preço de lista calculado pela precificação.
+        preco = float(it.get("price") or 0)
+        if preco <= 0:
+            preco = _preco_lista_shopee(cfg_prec, base_venda) or 0.0
         if preco <= 0:
             continue
         margem_cheia = margem_no_preco(cfg_prec, preco, custo)
@@ -486,6 +490,41 @@ def _registrar_log(user_id, tipo, ref_id, nome, qtd, desconto, motivo):
         db.close()
 
 
+def _flash_itens(user_id: int, propostas: list, reserva: int) -> list:
+    """Monta os itens de Flash Sale com preço promocional POR VARIAÇÃO (modelo), sempre
+    ABAIXO do preço vigente de cada modelo — a Shopee rejeita promo >= preço atual, e um
+    preço único para todas as variações fazia o flash ser criado SEM itens.
+    Quando o produto tem variações, envia `models` pronto; sem variação, cai para item simples."""
+    out = []
+    for p in propostas:
+        item_id = int(p["item_id"])
+        d = float(p.get("desconto_pct") or 0) / 100.0
+        try:
+            ml = shopee.modelos_item(user_id, item_id)
+        except shopee.ShopeeError:
+            ml = []
+        models = []
+        for m in ml:
+            preco_m = shopee._preco_modelo(m)
+            if preco_m <= 0:
+                continue
+            promo = round(preco_m * (1 - d), 2)
+            if promo >= preco_m:                       # garante abaixo do preço vigente da variação
+                promo = round(preco_m - 0.01, 2)
+            if promo <= 0:
+                continue
+            est = (m.get("stock_info_v2") or {}).get("summary_info", {}) or m.get("stock_info", {}) or {}
+            estoque = int(est.get("total_available_stock") or est.get("current_stock") or p.get("estoque") or 0)
+            models.append({"model_id": m.get("model_id"), "input_promo_price": promo,
+                           "stock": max(1, estoque - int(reserva or 0))})
+        if models:
+            out.append({"item_id": item_id, "purchase_limit": 0, "models": models})
+        else:
+            out.append({"item_id": item_id, "preco": p.get("preco_promo"),
+                        "stock": max(1, int(p.get("estoque") or 0) - int(reserva or 0))})
+    return out
+
+
 def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str = "manual") -> dict:
     """Cria as promoções a partir das propostas. tipo: desconto | flash | ambos (default = config)."""
     db = SessionLocal()
@@ -544,8 +583,7 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
                 slot = primeiro.get("timeslot_id") if isinstance(primeiro, dict) else primeiro
             if slot:
                 reserva = snap["reserva_estoque"]
-                itens_flash = [{"item_id": p["item_id"], "preco": p["preco_promo"],
-                                "stock": max(1, p["estoque"] - reserva)} for p in propostas]
+                itens_flash = _flash_itens(user_id, propostas, reserva)
                 r = shopee.criar_flash(user_id, slot, itens_flash)
                 fid = (r.get("response") or {}).get("flash_sale_id")
                 if fid:
