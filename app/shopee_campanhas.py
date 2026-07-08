@@ -48,16 +48,29 @@ HORA = 3600
 
 
 def slots_oficiais(user_id: int, dias: int = 14) -> dict:
-    """Aberturas (slots) oficiais de Flash Sale da loja. Usa a rota CORRETA da API
-    (/shop_flash_sale/get_time_slot_id) — a rota antiga no wrapper não existe e
-    devolvia vazio, por isso o painel nunca via os horários do Seller Center."""
-    agora = int(time.time())
-    r = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_time_slot_id",
-                       extra={"start_time": agora, "end_time": agora + max(1, dias) * DIA})
-    lista = (r.get("response") or []) if isinstance(r.get("response"), list) else \
-        ((r.get("response") or {}).get("time_slot_list") or (r.get("response") or {}).get("timeslot_list") or [])
-    log.info("CAMPANHA[flash] slots oficiais %dd: %d abertura(s)", dias, len(lista))
-    return {"response": {"timeslot_list": lista}, "request_id": r.get("request_id")}
+    """Aberturas (slots) oficiais de Flash Sale da loja, na rota correta da API
+    (/shop_flash_sale/get_time_slot_id). A Shopee exige start_time >= o relógio DELES;
+    como há latência/decalque, pedimos com margem de futuro e, se ainda reclamar,
+    aumentamos a margem progressivamente (2min → 15min → 1h)."""
+    ultimo_erro = None
+    for margem in (120, 900, 3600):
+        agora = int(time.time())
+        try:
+            r = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_time_slot_id",
+                               extra={"start_time": agora + margem,
+                                      "end_time": agora + margem + max(1, dias) * DIA})
+            lista = (r.get("response") or []) if isinstance(r.get("response"), list) else \
+                ((r.get("response") or {}).get("time_slot_list") or (r.get("response") or {}).get("timeslot_list") or [])
+            log.info("CAMPANHA[flash] slots oficiais %dd (margem %ds): %d abertura(s)", dias, margem, len(lista))
+            return {"response": {"timeslot_list": lista}, "request_id": r.get("request_id")}
+        except shopee.ShopeeError as e:
+            texto = str(e).lower()
+            if "start_time" in texto or "param" in texto:
+                log.warning("CAMPANHA[flash] slots: Shopee rejeitou margem %ds (%s) — tentando maior", margem, e)
+                ultimo_erro = e
+                continue
+            raise
+    raise ultimo_erro or shopee.ShopeeError("A Shopee rejeitou a consulta de horários.")
 
 
 # ------------------------------------------------------------------ helpers --
