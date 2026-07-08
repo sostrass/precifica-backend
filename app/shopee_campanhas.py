@@ -1,0 +1,363 @@
+"""
+Motor de construção de campanhas Shopee — Descontos, Cupons, Bundle, Add-on e Flash Sale.
+
+Construído a partir dos critérios OFICIAIS da Shopee (OpenAPI v2 + Seller Education):
+
+DESCONTO (discount)
+  - Duração máxima 180 dias; início no futuro.
+  - Preço promocional < preço corrente, POR VARIAÇÃO (model_list) quando houver.
+  - Máx ~1000 itens por campanha. Item já em outro desconto no período é recusado.
+
+CUPOM (voucher)
+  - reward_type=2 (percentual) EXIGE `max_price` (teto do desconto em R$) — sem ele a
+    Shopee recusa/zera o benefício. reward_type=1 usa `discount_amount`.
+  - Início no futuro; duração máxima ~90 dias (3 meses). Código alfanumérico.
+
+BUNDLE (bundle_deal)
+  - Duração máxima 180 dias; início >= ~1h no futuro.
+  - TODOS os itens do combo precisam compartilhar canal de logística com o primeiro.
+  - Item não pode estar em OUTRO bundle no mesmo período, nem ser "main" de add-on.
+
+ADD-ON (add_on_deal)
+  - Início no futuro; fim >= início+1h; fim <= início+3 meses.
+  - Preço do adicional DEVE ser < preço corrente do produto (menor variação).
+  - Main não pode estar em bundle no período nem ser main de outro add-on;
+    adicionais não podem estar em flash/shocking sale. Mains e adicionais devem
+    compartilhar >= 1 canal de logística. Máx 1000 mains / 100 adicionais.
+
+FLASH SALE (shop_flash_sale)
+  - Somente em slot oficial liberado pela loja; preço por variação < corrente;
+    estoque promocional >= 1. Item em add-on (como adicional) é recusado.
+
+Este módulo PRESERVA os gatilhos e parâmetros do motor automático (shopee_promo_auto):
+ele só assume a etapa de CONSTRUÇÃO+ENVIO+VERIFICAÇÃO. Toda criação é verificada por
+reconsulta (quantos itens realmente entraram) e TUDO é logado no stdout (Railway).
+"""
+from __future__ import annotations
+
+import logging
+import re
+import time
+
+from . import shopee
+
+log = logging.getLogger("precifica.campanhas")
+
+DIA = 86400
+HORA = 3600
+
+
+# ------------------------------------------------------------------ helpers --
+def _menor_preco_corrente(user_id: int, item_id: int) -> float:
+    """Menor preço vigente do anúncio (entre as variações; ou o item-base)."""
+    try:
+        ml = shopee.modelos_item(user_id, int(item_id))
+    except shopee.ShopeeError:
+        ml = []
+    precos = [shopee._preco_modelo(m) for m in (ml or [])]
+    precos = [p for p in precos if p and p > 0]
+    if precos:
+        return min(precos)
+    try:
+        nm = (shopee.nomes_itens(user_id, [int(item_id)]) or {}).get(int(item_id), {}) or {}
+        return float(nm.get("preco") or 0)
+    except shopee.ShopeeError:
+        return 0.0
+
+
+def _logisticas(user_id: int, item_ids: list) -> dict:
+    """Canais de logística HABILITADOS por item (get_item_base_info.logistic_info)."""
+    out = {}
+    ids = [int(i) for i in item_ids if i]
+    for i in range(0, len(ids), 50):
+        lote = ids[i:i + 50]
+        try:
+            r = shopee._chamar(user_id, "/api/v2/product/get_item_base_info",
+                               extra={"item_id_list": ",".join(str(x) for x in lote)})
+            for it in (r.get("response") or {}).get("item_list") or []:
+                canais = {li.get("logistic_id") for li in (it.get("logistic_info") or [])
+                          if li.get("enabled")}
+                out[int(it.get("item_id"))] = canais
+        except shopee.ShopeeError as e:
+            log.warning("CAMPANHA logisticas: falha ao consultar lote %s: %s", lote, e)
+    return out
+
+
+def _validar_janela(tipo: str, inicio: int, fim: int) -> str | None:
+    """Valida a janela contra as regras oficiais. Retorna a mensagem do problema ou None."""
+    agora = int(time.time())
+    if inicio <= agora:
+        return "o início precisa ser no futuro"
+    if fim <= inicio:
+        return "o fim precisa ser depois do início"
+    dur = fim - inicio
+    if tipo in ("desconto", "bundle") and dur > 180 * DIA:
+        return "duração máxima de 180 dias"
+    if tipo in ("cupom", "addon") and dur > 92 * DIA:
+        return "duração máxima de 3 meses"
+    if tipo == "addon" and dur < HORA:
+        return "o fim precisa ser pelo menos 1h depois do início"
+    return None
+
+
+def _resultado(tipo: str, pid, itens_ok: int, recusados: list, aviso: str | None = None) -> dict:
+    r = {"ok": bool(pid), "tipo": tipo, "id": pid,
+         "itens_adicionados": itens_ok, "itens_recusados": recusados}
+    if aviso:
+        r["aviso"] = aviso
+    if recusados:
+        r["aviso"] = (r.get("aviso") or "") + (" | " if r.get("aviso") else "") + \
+            f"{len(recusados)} item(ns) recusado(s): " + \
+            "; ".join(f"#{x['item_id']} — {x['motivo']}" for x in recusados[:5])
+    return r
+
+
+# ------------------------------------------------------------------ CUPOM ----
+def criar_cupom_verificado(user_id: int, payload: dict) -> dict:
+    """Cria cupom com as regras oficiais (max_price no percentual) e confirma na Shopee."""
+    nome = (payload.get("nome") or "Cupom").strip()[:40]
+    codigo = re.sub(r"[^A-Za-z0-9]", "", str(payload.get("codigo") or ""))[:16]
+    inicio, fim = int(payload["inicio"]), int(payload["fim"])
+    tipo_desc = int(payload.get("tipo_desconto") or 2)   # 1=R$, 2=%
+    valor = float(payload.get("valor") or 0)
+    minc = float(payload.get("compra_minima") or 0)
+    quota = int(payload.get("quantidade") or 100)
+    escopo = int(payload.get("escopo") or 1)
+
+    prob = _validar_janela("cupom", inicio, fim)
+    if prob:
+        raise shopee.ShopeeError(f"Janela inválida: {prob}.")
+    if not codigo or len(codigo) < 3:
+        raise shopee.ShopeeError("Código do cupom: use 3 a 16 letras/números.")
+    if tipo_desc == 2 and not (1 <= valor <= 99):
+        raise shopee.ShopeeError("Percentual do cupom deve estar entre 1% e 99%.")
+
+    # REGRA OFICIAL: percentual exige teto do desconto (max_price)
+    teto = payload.get("teto_desconto")
+    if tipo_desc == 2:
+        if not teto or float(teto) <= 0:
+            teto = round(max(5.0, (minc if minc > 0 else 100.0) * valor / 100.0), 2)
+            log.info("CAMPANHA[cupom] teto do desconto ausente — aplicando derivado R$ %.2f", teto)
+        teto = float(teto)
+
+    extra = {"voucher_name": nome, "voucher_code": codigo,
+             "start_time": inicio, "end_time": fim,
+             "voucher_type": 1 if escopo == 1 else 2,
+             "reward_type": tipo_desc,
+             "min_basket_price": minc, "usage_quantity": quota}
+    if tipo_desc == 2:
+        extra["percentage"] = int(valor)
+        extra["max_price"] = teto
+    else:
+        extra["discount_amount"] = valor
+    if escopo == 2 and payload.get("item_ids"):
+        extra["item_id_list"] = [int(i) for i in payload["item_ids"]][:50]
+
+    log.info("CAMPANHA[cupom] criando '%s' code=%s %s%s min=%.2f quota=%d",
+             nome, codigo, valor, "%" if tipo_desc == 2 else " R$", minc, quota)
+    r = shopee._chamar(user_id, "/api/v2/voucher/add_voucher", metodo="POST", extra=extra)
+    vid = (r.get("response") or {}).get("voucher_id")
+    if not vid:
+        log.warning("CAMPANHA[cupom] Shopee não retornou voucher_id | resp=%s", r)
+        raise shopee.ShopeeError(f"A Shopee não criou o cupom: {r.get('message') or r.get('error') or 'sem detalhe'}")
+    log.info("CAMPANHA[cupom] criado voucher_id=%s", vid)
+    return {"ok": True, "tipo": "cupom", "id": vid, "voucher_id": vid,
+            "itens_adicionados": None, "itens_recusados": [],
+            "teto_desconto": extra.get("max_price")}
+
+
+# ---------------------------------------------------------------- DESCONTO ---
+def criar_desconto_verificado(user_id: int, nome: str, inicio: int, fim: int, itens: list) -> dict:
+    """Cria desconto (preço por variação via wrapper) e VERIFICA quantos itens entraram."""
+    prob = _validar_janela("desconto", inicio, fim)
+    if prob:
+        raise shopee.ShopeeError(f"Janela inválida: {prob}.")
+    enviados = [int(i.get("item_id")) for i in itens if i.get("item_id")]
+    log.info("CAMPANHA[desconto] criando '%s' com %d itens", nome, len(enviados))
+    r = shopee.criar_desconto(user_id, nome, inicio, fim, itens)
+    did = r.get("discount_id") or (r.get("response") or {}).get("discount_id")
+    ok, dentro = 0, set()
+    if did:
+        try:
+            det = shopee.detalhe_desconto(user_id, did)
+            dentro = {int(x["item_id"]) for x in det.get("itens") or []}
+            ok = len(dentro)
+        except shopee.ShopeeError as e:
+            log.warning("CAMPANHA[desconto] verificação falhou: %s", e)
+            ok = int(r.get("itens_adicionados") or 0)
+    recusados = [{"item_id": i, "motivo": "recusado pela Shopee (preço >= vigente, sem estoque ou já em campanha)"}
+                 for i in enviados if i not in dentro] if dentro or ok == 0 else []
+    if recusados:
+        log.warning("CAMPANHA[desconto] id=%s: %d de %d itens ENTRARAM; recusados=%s",
+                    did, ok, len(enviados), [x["item_id"] for x in recusados])
+    else:
+        log.info("CAMPANHA[desconto] id=%s: %d de %d itens confirmados", did, ok, len(enviados))
+    out = _resultado("desconto", did, ok, recusados)
+    out["discount_id"] = did
+    return out
+
+
+# ------------------------------------------------------------------ BUNDLE ---
+def criar_bundle_verificado(user_id: int, payload: dict) -> dict:
+    """Cria bundle com pré-validação oficial (logística comum, janela) e verificação real."""
+    nome = (payload.get("nome") or "Combo").strip()[:40]
+    inicio, fim = int(payload["inicio"]), int(payload["fim"])
+    rule = int(payload.get("rule_type") or 2)
+    valor = float(payload.get("valor") or 10)
+    min_itens = int(payload.get("min_itens") or 2)
+    ids = [int(i) for i in (payload.get("item_ids") or []) if i]
+
+    prob = _validar_janela("bundle", inicio, fim)
+    if prob:
+        raise shopee.ShopeeError(f"Janela inválida: {prob}.")
+    if len(ids) < 1:
+        raise shopee.ShopeeError("Escolha ao menos 1 produto para o combo (o ideal são 2+).")
+
+    # REGRA OFICIAL: logística comum com o primeiro item
+    recusados = []
+    if len(ids) > 1:
+        canais = _logisticas(user_id, ids)
+        base = canais.get(ids[0], set())
+        aceitos = [ids[0]]
+        for i in ids[1:]:
+            if base and canais.get(i) and not (base & canais[i]):
+                recusados.append({"item_id": i, "motivo": "logística diferente do 1º item (regra do bundle)"})
+            else:
+                aceitos.append(i)
+        ids = aceitos
+    log.info("CAMPANHA[bundle] criando '%s' rule=%s valor=%s min=%s itens=%s pré-recusados=%d",
+             nome, rule, valor, min_itens, ids, len(recusados))
+
+    r = shopee.criar_bundle(user_id, nome, inicio, fim, rule, valor, min_itens, ids)
+    bid = r.get("bundle_deal_id") or (r.get("response") or {}).get("bundle_deal_id")
+    ok, dentro = 0, set()
+    if bid:
+        try:
+            det = shopee.detalhe_bundle(user_id, bid)
+            dentro = {int(x["item_id"]) for x in det.get("itens") or []}
+            ok = len(dentro)
+        except shopee.ShopeeError as e:
+            log.warning("CAMPANHA[bundle] verificação falhou: %s", e)
+    for i in ids:
+        if dentro and i not in dentro:
+            recusados.append({"item_id": i, "motivo": "recusado pela Shopee (já em outro combo/add-on no período, esgotado ou inativo)"})
+    if ok < min_itens:
+        log.warning("CAMPANHA[bundle] id=%s tem %d item(ns) — combo 'compre %d' precisa de itens suficientes para o cliente montar", bid, ok, min_itens)
+    if recusados:
+        log.warning("CAMPANHA[bundle] id=%s: %d itens ENTRARAM; recusados=%s", bid, ok, [x["item_id"] for x in recusados])
+    else:
+        log.info("CAMPANHA[bundle] id=%s: %d itens confirmados", bid, ok)
+    out = _resultado("bundle", bid, ok, recusados)
+    out["bundle_deal_id"] = bid
+    return out
+
+
+# ------------------------------------------------------------------ ADD-ON ---
+def criar_addon_verificado(user_id: int, payload: dict) -> dict:
+    """Cria add-on com pré-validação oficial (preço do adicional < corrente; logística;
+    janela 1h–3meses) e verificação real de principais e adicionais."""
+    nome = (payload.get("nome") or "Add-on").strip()[:40]
+    inicio, fim = int(payload["inicio"]), int(payload["fim"])
+    ptype = int(payload.get("promotion_type") or 0)
+    principais = [int(i) for i in (payload.get("principais") or []) if i]
+    adicionais_in = payload.get("adicionais") or []
+
+    prob = _validar_janela("addon", inicio, fim)
+    if prob:
+        raise shopee.ShopeeError(f"Janela inválida: {prob}.")
+    if not principais:
+        raise shopee.ShopeeError("Escolha ao menos 1 produto principal.")
+    if not adicionais_in:
+        raise shopee.ShopeeError("Escolha ao menos 1 adicional/brinde.")
+
+    # REGRA OFICIAL: preço do adicional < preço corrente (menor variação)
+    recusados, adicionais = [], []
+    for a in adicionais_in[:100]:
+        iid = int(a.get("item_id"))
+        preco_env = float(a.get("add_on_deal_price") or 0)
+        corrente = _menor_preco_corrente(user_id, iid)
+        if ptype == 1:
+            adicionais.append({"item_id": iid, "add_on_deal_price": 0})
+            continue
+        if corrente > 0 and preco_env >= corrente:
+            novo = round(corrente * 0.95, 2)
+            log.info("CAMPANHA[addon] adicional #%s: preço %.2f >= corrente %.2f — ajustado para %.2f",
+                     iid, preco_env, corrente, novo)
+            preco_env = novo
+        if preco_env <= 0:
+            recusados.append({"item_id": iid, "motivo": "sem preço válido para o adicional"})
+            continue
+        adicionais.append({"item_id": iid, "add_on_deal_price": preco_env})
+    if not adicionais:
+        raise shopee.ShopeeError("Nenhum adicional com preço válido (precisa ser menor que o preço vigente).")
+
+    # REGRA OFICIAL: logística comum entre mains e com adicionais
+    canais = _logisticas(user_id, principais + [a["item_id"] for a in adicionais])
+    base = canais.get(principais[0], set())
+    principais_ok = [principais[0]]
+    for i in principais[1:1000]:
+        if base and canais.get(i) and not (base & canais[i]):
+            recusados.append({"item_id": i, "motivo": "logística diferente do 1º principal (regra do add-on)"})
+        else:
+            principais_ok.append(i)
+
+    log.info("CAMPANHA[addon] criando '%s' tipo=%s principais=%s adicionais=%s pré-recusados=%d",
+             nome, ptype, principais_ok, [a["item_id"] for a in adicionais], len(recusados))
+    r = shopee.criar_addon(user_id, nome, inicio, fim, principais_ok, adicionais, ptype)
+    aid = r.get("add_on_deal_id") or (r.get("response") or {}).get("add_on_deal_id")
+    p_ok = s_ok = 0
+    if aid:
+        try:
+            det = shopee.detalhe_addon(user_id, aid)
+            dentro_p = {int(x["item_id"]) for x in det.get("principais") or []}
+            dentro_s = {int(x["item_id"]) for x in det.get("adicionais") or []}
+            p_ok, s_ok = len(dentro_p), len(dentro_s)
+            for i in principais_ok:
+                if i not in dentro_p:
+                    recusados.append({"item_id": i, "motivo": "principal recusado (em bundle/outro add-on no período, esgotado ou inativo)"})
+            for a in adicionais:
+                if a["item_id"] not in dentro_s:
+                    recusados.append({"item_id": a["item_id"], "motivo": "adicional recusado (preço, flash sale no período, esgotado ou inativo)"})
+        except shopee.ShopeeError as e:
+            log.warning("CAMPANHA[addon] verificação falhou: %s", e)
+    if recusados:
+        log.warning("CAMPANHA[addon] id=%s: %d principais + %d adicionais ENTRARAM; recusados=%s",
+                    aid, p_ok, s_ok, [x["item_id"] for x in recusados])
+    else:
+        log.info("CAMPANHA[addon] id=%s: %d principais + %d adicionais confirmados", aid, p_ok, s_ok)
+    out = _resultado("addon", aid, p_ok + s_ok, recusados)
+    out.update({"add_on_deal_id": aid, "principais_ok": p_ok, "adicionais_ok": s_ok})
+    return out
+
+
+# ------------------------------------------------------------------ FLASH ----
+def criar_flash_verificado(user_id: int, timeslot_id: int, itens: list, reserva: int = 0) -> dict:
+    """Cria Flash Sale no slot oficial com preço POR VARIAÇÃO e verifica os itens que entraram."""
+    if not timeslot_id:
+        raise shopee.ShopeeError("Escolha um horário (slot) oficial da Shopee.")
+    # monta preço por variação quando vier desconto_pct (mesmo helper do motor)
+    from . import shopee_promo_auto as motor
+    if itens and not (itens[0] or {}).get("models") and any(i.get("desconto_pct") for i in itens):
+        itens = motor._flash_itens(user_id, itens, int(reserva or 0))
+    enviados = [int(i.get("item_id")) for i in itens if i.get("item_id")]
+    log.info("CAMPANHA[flash] criando no slot %s com %d itens", timeslot_id, len(enviados))
+    r = shopee.criar_flash(user_id, int(timeslot_id), itens)
+    fid = (r.get("response") or {}).get("flash_sale_id") or r.get("flash_sale_id")
+    ok, dentro = 0, set()
+    if fid:
+        try:
+            det = shopee.detalhe_flash(user_id, fid)
+            dentro = {int(x["item_id"]) for x in det.get("itens") or []}
+            ok = len(dentro)
+        except shopee.ShopeeError as e:
+            log.warning("CAMPANHA[flash] verificação falhou: %s", e)
+    recusados = [{"item_id": i, "motivo": "recusado pela Shopee (preço/estoque fora do critério do slot, ou item em add-on no período)"}
+                 for i in enviados if dentro and i not in dentro]
+    if recusados:
+        log.warning("CAMPANHA[flash] id=%s: %d de %d itens ENTRARAM; recusados=%s",
+                    fid, ok, len(enviados), [x["item_id"] for x in recusados])
+    else:
+        log.info("CAMPANHA[flash] id=%s: %d de %d itens confirmados", fid, ok, len(enviados))
+    out = _resultado("flash", fid, ok, recusados)
+    out["flash_sale_id"] = fid
+    return out

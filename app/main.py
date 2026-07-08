@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, observ, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_impressao, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, observ, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_campanhas, shopee_impressao, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
@@ -1873,11 +1873,7 @@ def shopee_cupons(status: str = "ongoing", user: User = Depends(auth.get_current
 def shopee_criar_cupom(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Body: {nome, codigo, inicio, fim, tipo_desconto(1=valor,2=%), valor, compra_minima, quantidade, escopo?}."""
     try:
-        return shopee.criar_cupom(user.id, payload["nome"], payload["codigo"],
-                                  int(payload["inicio"]), int(payload["fim"]),
-                                  int(payload["tipo_desconto"]), float(payload["valor"]),
-                                  float(payload.get("compra_minima", 0)),
-                                  int(payload["quantidade"]), int(payload.get("escopo", 1)))
+        return shopee_campanhas.criar_cupom_verificado(user.id, payload)
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Faltam campos do cupom.")
     except shopee.ShopeeError as e:
@@ -1993,16 +1989,13 @@ def shopee_bundles(status: str = "ongoing", user: User = Depends(auth.get_curren
 def shopee_criar_bundle(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Body: {nome, inicio, fim, rule_type(1=preço fixo,2=%,3=valor), valor, min_itens, item_ids:[]}."""
     try:
-        ids = payload.get("item_ids", [])
-        res = shopee.criar_bundle(user.id, payload["nome"], int(payload["inicio"]),
-                                  int(payload["fim"]), int(payload["rule_type"]),
-                                  float(payload["valor"]), int(payload.get("min_itens", 2)), ids)
-        if ids and not res.get("itens_adicionados"):
-            motivo = (res.get("item_erros") or ["nenhum produto entrou no combo"])
-            motivo = motivo[0] if isinstance(motivo[0], str) else str(motivo[0])
+        res = shopee_campanhas.criar_bundle_verificado(user.id, payload)
+        res["response"] = {"bundle_deal_id": res.get("bundle_deal_id")}
+        if payload.get("item_ids") and not res.get("itens_adicionados"):
+            motivo = (res.get("itens_recusados") or [{}])
+            motivo = (motivo[0] or {}).get("motivo", "nenhum produto entrou no combo")
             raise HTTPException(status_code=502,
-                detail=f"O combo foi criado, mas SEM produtos: {motivo}. "
-                       "Bundles exigem produtos elegíveis e regra válida (ex.: mínimo 2 itens).")
+                detail=f"O combo foi criado, mas SEM produtos: {motivo}")
         return res
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Faltam campos do bundle.")
@@ -2031,15 +2024,13 @@ def shopee_addons(status: str = "ongoing", user: User = Depends(auth.get_current
 def shopee_criar_addon(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """Body: {nome, inicio, fim, principais:[item_id], adicionais:[{item_id, add_on_deal_price}]}."""
     try:
-        principais = payload.get("principais", [])
-        res = shopee.criar_addon(user.id, payload["nome"], int(payload["inicio"]),
-                                 int(payload["fim"]), principais,
-                                 payload.get("adicionais", []), int(payload.get("promotion_type", 0)))
-        if principais and not res.get("principais_ok"):
-            motivo = (res.get("item_erros") or ["o produto principal não pôde ser adicionado"])[0]
+        res = shopee_campanhas.criar_addon_verificado(user.id, payload)
+        res["response"] = {"add_on_deal_id": res.get("add_on_deal_id")}
+        if payload.get("principais") and not res.get("principais_ok"):
+            motivo = (res.get("itens_recusados") or [{}])
+            motivo = (motivo[0] or {}).get("motivo", "o produto principal não pôde ser adicionado")
             raise HTTPException(status_code=502,
-                detail=f"O add-on foi criado, mas sem o produto principal: {motivo}. "
-                       "Verifique se o anúncio principal está ativo e elegível.")
+                detail=f"O add-on foi criado, mas sem o produto principal: {motivo}")
         return res
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Faltam campos do add-on.")
@@ -2077,10 +2068,9 @@ def shopee_criar_flash(payload: dict = Body(...), user: User = Depends(auth.get_
     """Body: {timeslot_id, itens:[{item_id, purchase_limit, models:[...]}]} OU
     {timeslot_id, itens:[{item_id, desconto_pct, preco_promo, estoque}]} (monta o preço por variação)."""
     try:
-        itens = payload.get("itens", [])
-        if itens and not (itens[0] or {}).get("models") and any(i.get("desconto_pct") for i in itens):
-            itens = shopee_promo_auto._flash_itens(user.id, itens, int(payload.get("reserva", 0)))
-        return shopee.criar_flash(user.id, int(payload["timeslot_id"]), itens)
+        return shopee_campanhas.criar_flash_verificado(
+            user.id, int(payload["timeslot_id"]), payload.get("itens", []),
+            int(payload.get("reserva", 0)))
     except (KeyError, ValueError):
         raise HTTPException(status_code=422, detail="Informe timeslot_id e itens.")
     except shopee.ShopeeError as e:

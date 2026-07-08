@@ -550,20 +550,20 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
                 {"item_id": p["item_id"], "desconto_pct": p["desconto_pct"], "preco": p["preco_atual"]}
                 for p in propostas])
             nome = f"Auto · {datetime.now().strftime('%d/%m %H:%M')}"
-            r = shopee.criar_desconto(user_id, nome, inicio, fim, itens)
-            did = (r.get("response") or {}).get("discount_id")
-            entraram = r.get("itens_adicionados", len(itens))
-            enviados = r.get("enviados", len(itens))
+            from . import shopee_campanhas
+            r = shopee_campanhas.criar_desconto_verificado(user_id, nome, inicio, fim, itens)
+            did = r.get("discount_id")
+            entraram = r.get("itens_adicionados") or 0
+            enviados = len(itens)
             _registrar_log(user_id, "desconto", did, nome, entraram, d_medio, motivo)
             criadas.append({"tipo": "desconto", "id": did, "itens": entraram, "nome": nome,
                             "enviados": enviados})
-            itens_erros = r.get("item_erros") or []
             if did and not entraram:
-                motivo_top = itens_erros[0] if itens_erros else "a Shopee não detalhou o motivo"
+                rec = r.get("itens_recusados") or [{}]
                 erros.append(f"desconto: a campanha foi criada mas nenhum dos {enviados} produto(s) entrou. "
-                             f"Motivo: {motivo_top}")
-            for ie in itens_erros[:4]:
-                erros.append(f"desconto/item — {ie}")
+                             f"Motivo: {(rec[0] or {}).get('motivo', 'a Shopee não detalhou')}")
+            elif r.get("aviso"):
+                erros.append(f"desconto: {r['aviso']}")
         except shopee.ShopeeError as e:
             erros.append(f"desconto: {e}")
 
@@ -584,11 +584,18 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
             if slot:
                 reserva = snap["reserva_estoque"]
                 itens_flash = _flash_itens(user_id, propostas, reserva)
-                r = shopee.criar_flash(user_id, slot, itens_flash)
-                fid = (r.get("response") or {}).get("flash_sale_id")
-                if fid:
-                    _registrar_log(user_id, "flash", fid, "Flash auto", len(itens_flash), d_medio, motivo)
-                    criadas.append({"tipo": "flash", "id": fid, "itens": len(itens_flash)})
+                from . import shopee_campanhas
+                r = shopee_campanhas.criar_flash_verificado(user_id, slot, itens_flash, reserva)
+                fid = r.get("flash_sale_id")
+                entraram_f = r.get("itens_adicionados") or 0
+                if fid and entraram_f:
+                    _registrar_log(user_id, "flash", fid, "Flash auto", entraram_f, d_medio, motivo)
+                    criadas.append({"tipo": "flash", "id": fid, "itens": entraram_f})
+                    if r.get("aviso"):
+                        erros.append(f"flash: {r['aviso']}")
+                elif fid:
+                    rec = r.get("itens_recusados") or [{}]
+                    erros.append(f"flash: criada mas sem produtos — {(rec[0] or {}).get('motivo', 'a Shopee não detalhou')}")
                 else:
                     erros.append("flash: a Shopee não criou a oferta relâmpago (a loja pode não estar "
                                  "elegível a Flash Sale própria, ou o slot expirou).")
