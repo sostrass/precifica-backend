@@ -331,6 +331,81 @@ def criar_addon_verificado(user_id: int, payload: dict) -> dict:
 
 
 # ------------------------------------------------------------------ FLASH ----
+def habilitar_flash_itens(user_id: int, flash_sale_id: int) -> dict:
+    """HABILITA os itens de uma Flash Sale existente (eles nascem desabilitados no slot,
+    como no Seller Center) e depois ativa a própria oferta. Retorna contagens reais."""
+    fid = int(flash_sale_id)
+    habilitados, falhas = 0, []
+    # 1) ler os itens/modelos aceitos na oferta
+    try:
+        ri = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_shop_flash_sale_items",
+                            extra={"flash_sale_id": fid, "offset": 0, "limit": 100})
+        resp = ri.get("response") or {}
+        modelos = resp.get("models") or []
+        item_info = resp.get("item_info") or []
+    except shopee.ShopeeError as e:
+        log.warning("CAMPANHA[flash] id=%s não consegui ler os itens p/ habilitar: %s", fid, e)
+        modelos, item_info = [], []
+    # 2) montar o update com status=1 por modelo (mantendo preço/estoque aceitos)
+    por_item = {}
+    for m in modelos:
+        iid = int(m.get("item_id") or 0)
+        por_item.setdefault(iid, []).append({
+            "model_id": int(m.get("model_id") or 0),
+            "status": 1,
+            "input_promo_price": m.get("input_promotion_price") or m.get("input_promo_price") or m.get("promotion_price_with_tax"),
+            "stock": m.get("campaign_stock") or m.get("stock") or 1,
+        })
+    if not por_item and item_info:  # itens sem variação podem vir só em item_info
+        for it in item_info:
+            por_item[int(it.get("item_id") or 0)] = []
+    itens_upd = []
+    limites = {int(i.get("item_id") or 0): int(i.get("purchase_limit") or 0) for i in item_info}
+    for iid, models in por_item.items():
+        ent = {"item_id": iid, "purchase_limit": limites.get(iid, 0)}
+        if models:
+            ent["models"] = [{k: v for k, v in m.items() if v is not None} for m in models]
+        itens_upd.append(ent)
+    if itens_upd:
+        try:
+            ru = shopee._chamar(user_id, "/api/v2/shop_flash_sale/update_shop_flash_sale_items",
+                                metodo="POST", extra={"flash_sale_id": fid, "items": itens_upd})
+            rresp = ru.get("response") or {}
+            fitems = rresp.get("failed_items") or []
+            for f in fitems:
+                if isinstance(f, dict):
+                    falhas.append({"item_id": f.get("item_id"),
+                                   "motivo": f.get("fail_message") or f.get("err_msg") or f.get("unqualified_condition") or "não habilitado"})
+            log.info("CAMPANHA[flash] id=%s habilitação de itens enviada (%d itens, %d falhas)",
+                     fid, len(itens_upd), len(fitems))
+        except shopee.ShopeeError as e:
+            log.warning("CAMPANHA[flash] id=%s falha ao habilitar itens: %s", fid, e)
+    # 3) ativar a oferta em si
+    ativada = False
+    try:
+        ru = shopee._chamar(user_id, "/api/v2/shop_flash_sale/update_shop_flash_sale",
+                            metodo="POST", extra={"flash_sale_id": fid, "status": 1})
+        ativada = not ru.get("error")
+        log.info("CAMPANHA[flash] id=%s oferta ATIVADA (status=1)", fid)
+    except shopee.ShopeeError as e:
+        log.warning("CAMPANHA[flash] id=%s falha ao ativar a oferta: %s", fid, e)
+    # 4) verificação final
+    item_count = enabled = None
+    try:
+        rg = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_shop_flash_sale",
+                            extra={"flash_sale_id": fid})
+        resp = rg.get("response") or {}
+        item_count = resp.get("item_count")
+        enabled = resp.get("enabled_item_count")
+        habilitados = int(enabled or 0)
+        log.info("CAMPANHA[flash] id=%s verificação: item_count=%s enabled_item_count=%s status=%s",
+                 fid, item_count, enabled, resp.get("status"))
+    except shopee.ShopeeError as e:
+        log.warning("CAMPANHA[flash] id=%s verificação falhou: %s", fid, e)
+    return {"ok": True, "flash_sale_id": fid, "ativada": ativada,
+            "itens": item_count, "habilitados": habilitados, "falhas": falhas}
+
+
 def criar_flash_verificado(user_id: int, timeslot_id: int, itens: list, reserva: int = 0) -> dict:
     """Cria Flash Sale no slot oficial, com os CRITÉRIOS NATIVOS do slot aplicados
     (estoque de campanha 1~1000, desconto 1~99%, máx 50 itens habilitados), preço POR
@@ -366,29 +441,16 @@ def criar_flash_verificado(user_id: int, timeslot_id: int, itens: list, reserva:
         log.warning("CAMPANHA[flash] Shopee não retornou flash_sale_id | resp=%s", r)
         raise shopee.ShopeeError("A Shopee não criou a Oferta Relâmpago (loja pode não estar elegível ou o slot expirou).")
 
-    # REGRA OFICIAL: a flash sale nasce DESABILITADA — ativar agora (status=1)
-    ativada = False
-    try:
-        ru = shopee._chamar(user_id, "/api/v2/shop_flash_sale/update_shop_flash_sale",
-                            metodo="POST", extra={"flash_sale_id": int(fid), "status": 1})
-        st = (ru.get("response") or {}).get("status")
-        ativada = (st == 1) or not ru.get("error")
-        log.info("CAMPANHA[flash] id=%s ATIVADA (update status=1, resp status=%s)", fid, st)
-    except shopee.ShopeeError as e:
-        log.warning("CAMPANHA[flash] id=%s falha ao ATIVAR (fica desabilitada no painel!): %s", fid, e)
+    # REGRA OFICIAL (duas camadas): habilitar os ITENS (nascem desabilitados no slot)
+    # e depois ATIVAR a oferta (status=1)
+    hab = habilitar_flash_itens(user_id, int(fid))
+    ativada = bool(hab.get("ativada"))
+    habilitados = hab.get("habilitados")
+    for f in hab.get("falhas") or []:
+        recusados.append(f)
 
-    # verificação real: itens + habilitados
-    ok, habilitados = 0, None
-    try:
-        rg = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_shop_flash_sale",
-                            extra={"flash_sale_id": int(fid)})
-        resp = rg.get("response") or {}
-        ok = int(resp.get("item_count") or 0)
-        habilitados = resp.get("enabled_item_count")
-        log.info("CAMPANHA[flash] id=%s verificação: item_count=%s enabled_item_count=%s status=%s",
-                 fid, ok, habilitados, resp.get("status"))
-    except shopee.ShopeeError as e:
-        log.warning("CAMPANHA[flash] verificação falhou: %s", e)
+    ok = int(hab.get("itens") or 0)
+    if ok == 0:
         try:
             det = shopee.detalhe_flash(user_id, fid)
             ok = len(det.get("itens") or [])

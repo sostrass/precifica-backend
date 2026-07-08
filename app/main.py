@@ -2048,9 +2048,18 @@ def shopee_encerrar_addon(addon_id: str, user: User = Depends(auth.get_current_u
 
 # ---- Flash Sale ----
 @app.get("/api/shopee/flash/slots")
-def shopee_flash_slots(dias: int = 7, user: User = Depends(auth.get_current_user)):
+def shopee_flash_slots(dias: int = 14, user: User = Depends(auth.get_current_user)):
     try:
         return shopee.flash_slots(user.id, dias=min(max(dias, 1), 30))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/shopee/flash/{flash_sale_id}/habilitar")
+def shopee_flash_habilitar(flash_sale_id: int, user: User = Depends(auth.get_current_user)):
+    """Habilita os itens de uma Flash Sale existente e ativa a oferta (duas camadas)."""
+    try:
+        return shopee_campanhas.habilitar_flash_itens(user.id, flash_sale_id)
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
