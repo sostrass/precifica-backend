@@ -72,6 +72,7 @@ def garantir_colunas_extras():
         "shopee_promo_config": [
             ("base_comparacao", "VARCHAR DEFAULT 'dia'"),
             ("dias_analise", "INTEGER DEFAULT 30"),
+            ("extras", "TEXT"),
         ],
         "shopee_review_config": [
             ("auto_pausa_seg", "INTEGER DEFAULT 5"),
