@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_impressao, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, observ, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_impressao, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
@@ -149,6 +149,8 @@ async def _agendador_promo():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    observ.configurar_logs()
+    observ.instrumentar()
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -204,10 +206,16 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _observabilidade(request: Request, call_next):
+    return await observ.middleware(request, call_next)
+
+
 @app.exception_handler(Exception)
 async def _erro_global(request: Request, exc: Exception):
     """Qualquer erro inesperado volta como JSON legível COM cabeçalho CORS, em vez do
     net::ERR_FAILED opaco que o navegador mostra quando um 500 vem sem CORS."""
+    observ.log_excecao(request, exc)
     origem = request.headers.get("origin")
     headers = {"Access-Control-Allow-Origin": origem or "*",
                "Access-Control-Allow-Credentials": "true"}
@@ -1546,89 +1554,111 @@ def shopee_promo_historico(user: User = Depends(auth.get_current_user)):
 
 @app.post("/api/shopee/promo/diag")
 def shopee_promo_diag(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
-    """DIAGNÓSTICO TEMPORÁRIO. Cria um desconto de teste com um produto real, adiciona o item,
-    captura a RESPOSTA CRUA da Shopee ao adicionar (é o que precisamos ver para acertar o
-    parsing), reconsulta a promoção para conferir se o item entrou de fato, e encerra o teste.
-    Não deixa nada ativo. Só usa funções do shopee.py; não altera o wrapper."""
+    """DIAGNÓSTICO TEMPORÁRIO multi-tipo (desconto|bundle|addon). Cria uma promoção de teste,
+    adiciona itens reais, captura a RESPOSTA CRUA da Shopee ao adicionar (o que precisamos ver),
+    reconsulta para conferir se entrou de fato, e tenta encerrar/apagar o teste. Não altera o wrapper."""
     import time as _t
     passos = []
     def log(passo, dado):
         passos.append({"passo": passo, "dado": dado})
+    def chamar(path, extra, metodo="POST", rot=None):
+        try:
+            r = shopee._chamar(user.id, path, metodo=metodo, extra=extra)
+            if rot:
+                log(rot, r)
+            return r
+        except Exception as e:
+            if rot:
+                log(rot + "_ERRO", str(e))
+            return {"_erro": str(e)}
+
+    tipo = (payload.get("tipo") or "desconto").lower()
+    dpct = int(payload.get("desconto_pct", 10))
     try:
         item_id = int(payload["item_id"])
     except (KeyError, ValueError, TypeError):
         raise HTTPException(status_code=422, detail="Informe um item_id da Shopee.")
-    dpct = int(payload.get("desconto_pct", 10))
 
-    # 1) preço real do item-base (para anúncios simples) + variações
-    preco = 0.0
-    try:
-        nm = (shopee.nomes_itens(user.id, [item_id]) or {}).get(item_id, {}) or {}
-        preco = float(nm.get("preco") or 0)
-        log("item_base", {"item_id": item_id, "nome": nm.get("nome"),
-                          "preco_item_base": preco, "estoque": nm.get("estoque")})
-    except Exception as e:
-        log("erro_item_base", str(e))
-    try:
-        ml = shopee.modelos_item(user.id, item_id)
-        log("modelos_do_anuncio", [{"model_id": m.get("model_id"),
-                                    "preco_modelo": shopee._preco_modelo(m)} for m in (ml or [])])
-    except Exception as e:
-        log("erro_modelos", str(e))
-
-    # 2) item_list exatamente como o fluxo real monta
-    try:
-        item_list = shopee.itens_desconto_por_pct(user.id, [{"item_id": item_id, "desconto_pct": dpct, "preco": preco}])
-    except Exception as e:
-        item_list = []
-        log("erro_montar_item_list", str(e))
-    log("item_list_ENVIADO", item_list)
-
-    # 3) cria desconto de teste
-    inicio = int(_t.time()) + 900
-    fim = inicio + 3 * 86400
-    did = None
-    try:
-        r = shopee._chamar(user.id, "/api/v2/discount/add_discount", metodo="POST",
-                           extra={"discount_name": f"DIAGNOSTICO {int(_t.time())} (apagar)",
-                                  "start_time": inicio, "end_time": fim})
-        log("resp_add_discount", r)
-        did = (r.get("response") or {}).get("discount_id")
-    except Exception as e:
-        log("erro_add_discount", str(e))
-
-    # 4) adiciona o item e captura a RESPOSTA CRUA
-    if did and item_list:
+    # dados reais do item selecionado (+ um segundo item da loja, p/ bundle/add-on)
+    def preco_item(iid):
         try:
-            ri = shopee._chamar(user.id, "/api/v2/discount/add_discount_item", metodo="POST",
-                               extra={"discount_id": did, "item_list": item_list})
-            log("resp_add_discount_item_CRUA", ri)
-        except Exception as e:
-            log("erro_add_discount_item", str(e))
-        # 5) reconsulta: o item entrou de fato?
-        try:
-            rg = shopee._chamar(user.id, "/api/v2/discount/get_discount", metodo="GET",
-                               extra={"discount_id": did, "page_no": 1, "page_size": 50})
-            resp_g = rg.get("response") or {}
-            log("get_discount_apos", {"item_count": len(resp_g.get("item_list") or []),
-                                      "item_list": resp_g.get("item_list"), "cru": rg})
-        except Exception as e:
-            log("erro_get_discount", str(e))
-        # 6) encerra o teste (não deixar nada ativo)
-        try:
-            shopee._chamar(user.id, "/api/v2/discount/end_discount", metodo="POST",
-                           extra={"discount_id": did})
-            log("teste_encerrado", {"discount_id": did})
-        except Exception as e:
-            log("erro_encerrar_teste", {"discount_id": did, "erro": str(e)})
-    elif did and not item_list:
-        log("aviso", "item_list veio vazio — o builder não produziu itens (ver passos acima)")
-        try:
-            shopee._chamar(user.id, "/api/v2/discount/end_discount", metodo="POST", extra={"discount_id": did})
-            log("teste_encerrado", {"discount_id": did})
+            nm = (shopee.nomes_itens(user.id, [iid]) or {}).get(iid, {}) or {}
+            return float(nm.get("preco") or 0), nm.get("nome")
         except Exception:
-            pass
-    return {"passos": passos}
+            return 0.0, None
+    p1, nome1 = preco_item(item_id)
+    log("item_selecionado", {"item_id": item_id, "nome": nome1, "preco": p1})
+    item_id2 = None
+    if tipo in ("bundle", "addon"):
+        try:
+            r = shopee.listar_itens(user.id, offset=0, limite=8)
+            outros = [int(x["item_id"]) for x in (r.get("response") or {}).get("item") or []
+                      if int(x.get("item_id") or 0) != item_id]
+            item_id2 = outros[0] if outros else None
+        except Exception as e:
+            log("erro_buscar_segundo_item", str(e))
+        p2, nome2 = preco_item(item_id2) if item_id2 else (0.0, None)
+        log("segundo_item", {"item_id": item_id2, "nome": nome2, "preco": p2})
+
+    ini = int(_t.time()) + 3900
+    fim = ini + 3 * 86400
+
+    if tipo == "desconto":
+        item_list = shopee.itens_desconto_por_pct(user.id, [{"item_id": item_id, "desconto_pct": dpct, "preco": p1}])
+        log("item_list_ENVIADO", item_list)
+        r = chamar("/api/v2/discount/add_discount", {"discount_name": f"DIAG {int(_t.time())}", "start_time": ini, "end_time": fim}, rot="resp_add_discount")
+        did = (r.get("response") or {}).get("discount_id")
+        if did and item_list:
+            chamar("/api/v2/discount/add_discount_item", {"discount_id": did, "item_list": item_list}, rot="resp_add_discount_item_CRUA")
+            rg = chamar("/api/v2/discount/get_discount", {"discount_id": did, "page_no": 1, "page_size": 50}, metodo="GET")
+            it = (rg.get("response") or {}).get("item_list") or []
+            log("get_discount_item_count", len(it))
+            chamar("/api/v2/discount/delete_discount", {"discount_id": did}, rot="limpeza_delete")
+
+    elif tipo == "bundle":
+        ids = [i for i in [item_id, item_id2] if i]
+        r = chamar("/api/v2/bundle_deal/add_bundle_deal", {"name": f"DIAG {int(_t.time())}", "start_time": ini, "end_time": fim,
+                   "bundle_deal_rule": {"rule_type": 2, "discount_value": 10, "min_amount": 2, "max_amount": 0}}, rot="resp_add_bundle")
+        bid = (r.get("response") or {}).get("bundle_deal_id")
+        log("bundle_deal_id", bid)
+        if bid and ids:
+            # variação A: item_list só com item_id
+            chamar("/api/v2/bundle_deal/add_bundle_deal_item", {"bundle_deal_id": bid,
+                   "item_list": [{"item_id": i} for i in ids]}, rot="resp_add_bundle_item_A_soItemId")
+            # variação B: item_list com status:1 (para comparar)
+            chamar("/api/v2/bundle_deal/add_bundle_deal_item", {"bundle_deal_id": bid,
+                   "item_list": [{"item_id": i, "status": 1} for i in ids]}, rot="resp_add_bundle_item_B_comStatus")
+            rg = chamar("/api/v2/bundle_deal/get_bundle_deal_item", {"bundle_deal_id": bid}, metodo="GET", rot="get_bundle_item")
+            chamar("/api/v2/bundle_deal/delete_bundle_deal", {"bundle_deal_id": bid}, rot="limpeza_delete")
+
+    elif tipo == "addon":
+        r = chamar("/api/v2/add_on_deal/add_add_on_deal", {"add_on_deal_name": f"DIAG {int(_t.time())}",
+                   "start_time": ini, "end_time": fim, "promotion_type": 0}, rot="resp_add_addon")
+        aid = (r.get("response") or {}).get("add_on_deal_id")
+        log("add_on_deal_id", aid)
+        if aid:
+            chamar("/api/v2/add_on_deal/add_add_on_deal_main_item", {"add_on_deal_id": aid,
+                   "main_item_list": [{"item_id": item_id, "status": 1}]}, rot="resp_add_addon_MAIN_CRUA")
+            if item_id2:
+                p2, _ = preco_item(item_id2)
+                sub_price = round(max(0.5, (p2 or 10) * 0.8), 2)
+                log("sub_add_on_deal_price_ENVIADO", {"item_id": item_id2, "preco_base": p2, "add_on_deal_price": sub_price})
+                chamar("/api/v2/add_on_deal/add_add_on_deal_sub_item", {"add_on_deal_id": aid,
+                       "sub_item_list": [{"item_id": item_id2, "add_on_deal_price": sub_price, "status": 1}]}, rot="resp_add_addon_SUB_CRUA")
+            chamar("/api/v2/add_on_deal/get_add_on_deal", {"add_on_deal_id": aid}, metodo="GET", rot="get_addon")
+            chamar("/api/v2/add_on_deal/delete_add_on_deal", {"add_on_deal_id": aid}, rot="limpeza_delete")
+    else:
+        raise HTTPException(status_code=422, detail="tipo inválido (use desconto, bundle ou addon).")
+
+    return {"tipo": tipo, "passos": passos}
+
+
+@app.get("/api/admin/logs")
+def admin_logs(n: int = 200, nivel: str | None = None,
+               user: User = Depends(auth.get_current_user)):
+    """Últimos registros de log em memória (espelho do que vai para o Railway)."""
+    return {"logs": observ.logs_recentes(n=min(n, 800), nivel=nivel),
+            "total_buffer": len(observ._BUFFER)}
 
 
 # ---- Pedidos & financeiro ----
