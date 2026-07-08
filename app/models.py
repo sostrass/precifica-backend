@@ -1,7 +1,7 @@
 from datetime import datetime, date
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Date, Float, Boolean, ForeignKey, UniqueConstraint, JSON
+    Column, Integer, String, Text, DateTime, Date, Float, Boolean, ForeignKey, UniqueConstraint, JSON
 )
 
 from .db import Base
@@ -413,6 +413,7 @@ class ShopeePromoConfig(Base):
     duracao_dias = Column(Integer, default=3)           # duração da campanha de desconto
     intervalo_dias = Column(Integer, default=7)         # no gatilho agendado
     queda_limiar = Column(Integer, default=30)          # % de queda de pedidos que dispara
+    extras = Column(Text, nullable=True)                # JSON: latências do flash + agentes por vendas
     ultimo_ciclo = Column(DateTime, nullable=True)
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 

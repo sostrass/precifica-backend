@@ -14,6 +14,7 @@ Trava de segurança central: NUNCA descontar abaixo do piso de margem configurad
 """
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta
 
@@ -47,6 +48,7 @@ def _serializar(c: ShopeePromoConfig) -> dict:
         "duracao_dias": c.duracao_dias or 3, "intervalo_dias": c.intervalo_dias or 7,
         "queda_limiar": c.queda_limiar or 30,
         "dias_analise": int(getattr(c, "dias_analise", None) or 30),
+        "extras": _extras(c),
         "ultimo_ciclo": c.ultimo_ciclo.isoformat() if c.ultimo_ciclo else None,
     }
 
@@ -57,6 +59,29 @@ def obter_config(user_id: int) -> dict:
         return _serializar(_config(db, user_id))
     finally:
         db.close()
+
+
+EXTRAS_PADRAO = {
+    # latências do Relâmpago automático
+    "flash_desconto": 20,      # % aplicado nas ofertas relâmpago do motor
+    "flash_estoque": 1,        # estoque de campanha por produto (1~1000)
+    "flash_horario": "qualquer",  # qualquer | manha | tarde | noite
+    "flash_dias": 7,           # procura aberturas até N dias à frente
+    # agentes por vendas (estudam os pedidos reais da loja)
+    "cupom_auto": False, "cupom_desconto": 10, "cupom_quota": 100,
+    "bundle_auto": False, "bundle_desconto": 10,
+    "addon_auto": False, "addon_desconto": 15,
+}
+
+
+def _extras(c) -> dict:
+    try:
+        atual = json.loads(c.extras) if getattr(c, "extras", None) else {}
+    except Exception:  # noqa: BLE001
+        atual = {}
+    out = dict(EXTRAS_PADRAO)
+    out.update({k: v for k, v in (atual or {}).items() if k in EXTRAS_PADRAO})
+    return out
 
 
 def salvar_config(user_id: int, p: dict) -> dict:
@@ -78,6 +103,20 @@ def salvar_config(user_id: int, p: dict) -> dict:
         if "intervalo_dias" in p: c.intervalo_dias = max(1, min(int(p["intervalo_dias"]), 60))
         if "queda_limiar" in p: c.queda_limiar = max(5, min(int(p["queda_limiar"]), 90))
         if "dias_analise" in p: c.dias_analise = max(7, min(int(p["dias_analise"]), 120))
+        if isinstance(p.get("extras"), dict):
+            ex = _extras(c)
+            e = p["extras"]
+            if "flash_desconto" in e: ex["flash_desconto"] = max(1, min(int(e["flash_desconto"]), 99))
+            if "flash_estoque" in e: ex["flash_estoque"] = max(1, min(int(e["flash_estoque"]), 1000))
+            if e.get("flash_horario") in ("qualquer", "manha", "tarde", "noite"): ex["flash_horario"] = e["flash_horario"]
+            if "flash_dias" in e: ex["flash_dias"] = max(1, min(int(e["flash_dias"]), 14))
+            for b in ("cupom_auto", "bundle_auto", "addon_auto"):
+                if b in e: ex[b] = bool(e[b])
+            if "cupom_desconto" in e: ex["cupom_desconto"] = max(1, min(int(e["cupom_desconto"]), 50))
+            if "cupom_quota" in e: ex["cupom_quota"] = max(10, min(int(e["cupom_quota"]), 1000))
+            if "bundle_desconto" in e: ex["bundle_desconto"] = max(1, min(int(e["bundle_desconto"]), 50))
+            if "addon_desconto" in e: ex["addon_desconto"] = max(1, min(int(e["addon_desconto"]), 70))
+            c.extras = json.dumps(ex, ensure_ascii=False)
         c.atualizado_em = datetime.utcnow()
         db.commit()
         return _serializar(c)
@@ -569,22 +608,40 @@ def aplicar(user_id: int, propostas: list, tipo: str | None = None, motivo: str 
 
     if tipo in ("flash", "ambos"):
         try:
-            slots = shopee.flash_slots(user_id, dias=2)
-            resp_s = slots.get("response")
-            if isinstance(resp_s, dict):
-                lista = resp_s.get("timeslot_list") or []
-            elif isinstance(resp_s, list):
-                lista = resp_s
-            else:
-                lista = []
+            from . import shopee_campanhas
+            ex = snap.get("extras") or {}
+            f_dias = int(ex.get("flash_dias") or 7)
+            f_hor = ex.get("flash_horario") or "qualquer"
+            f_desc = int(ex.get("flash_desconto") or 0)
+            f_estq = max(1, min(1000, int(ex.get("flash_estoque") or 1)))
+            slots = shopee_campanhas.slots_oficiais(user_id, dias=f_dias)
+            lista = (slots.get("response") or {}).get("timeslot_list") or []
+            FAIXAS = {"manha": (6, 12), "tarde": (12, 18), "noite": (18, 24)}
+
+            def _hora_brt(ts):
+                return int(((int(ts or 0) - 3 * 3600) % 86400) // 3600)
+            candidatos = lista
+            if f_hor in FAIXAS and lista:
+                a, b = FAIXAS[f_hor]
+                filtrados = [s for s in lista if a <= _hora_brt(s.get("start_time")) < b]
+                candidatos = filtrados or lista  # sem abertura na faixa → usa a mais próxima
             slot = None
-            if lista:
-                primeiro = lista[0]
+            if candidatos:
+                primeiro = sorted(candidatos, key=lambda s: s.get("start_time") or 0)[0]
                 slot = primeiro.get("timeslot_id") if isinstance(primeiro, dict) else primeiro
             if slot:
                 reserva = snap["reserva_estoque"]
+                if f_desc:
+                    for p_ in propostas:
+                        p_["desconto_pct"] = f_desc
+                        if p_.get("preco"):
+                            p_["preco_promo"] = round(float(p_["preco"]) * (1 - f_desc / 100.0), 2)
                 itens_flash = _flash_itens(user_id, propostas, reserva)
-                from . import shopee_campanhas
+                for it_ in itens_flash:  # estoque de campanha por produto (latência do motor)
+                    for m_ in it_.get("models") or []:
+                        m_["stock"] = max(1, min(f_estq, int(m_.get("stock") or 1)))
+                    if "stock" in it_ and not it_.get("models"):
+                        it_["stock"] = max(1, min(f_estq, int(it_.get("stock") or 1)))
                 r = shopee_campanhas.criar_flash_verificado(user_id, slot, itens_flash, reserva)
                 fid = r.get("flash_sale_id")
                 entraram_f = r.get("itens_adicionados") or 0

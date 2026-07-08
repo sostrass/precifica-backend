@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, observ, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_campanhas, shopee_impressao, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
+from . import ai, agentes, auth, bling, catalogo, decisao, kpis, nfe, observ, precificacao, pricing, qualidade, radar, scraper, shopee, shopee_boost, shopee_boost_auto, shopee_campanhas, shopee_impressao, shopee_promo_agentes, shopee_promo_auto, shopee_promo_painel, shopee_reviews, webhooks
 from .config import settings
 from .db import run_migrations, SessionLocal, Base, engine, garantir_colunas_extras
 from .models import NfeConfig, User, WebhookEvento
@@ -123,6 +123,12 @@ async def _agendador_promo():
                     await loop.run_in_executor(None, shopee_promo_auto.snapshot_vendas, uid)
             for uid in autos:  # auto_ciclo respeita o intervalo internamente
                 await loop.run_in_executor(None, shopee_promo_auto.auto_ciclo, uid)
+            if ticks % 12 == 0:  # agentes por vendas (~a cada 6h; cooldown semanal interno)
+                for uid in autos:
+                    try:
+                        await loop.run_in_executor(None, shopee_promo_agentes.ciclo, uid)
+                    except Exception:  # noqa: BLE001
+                        pass
             # --- Agentes do Mercado Livre em modo automático (piso-safe, teto, respeita intervalo) ---
             try:
                 from .models import AgenteConfig
