@@ -332,32 +332,79 @@ def criar_addon_verificado(user_id: int, payload: dict) -> dict:
 
 # ------------------------------------------------------------------ FLASH ----
 def criar_flash_verificado(user_id: int, timeslot_id: int, itens: list, reserva: int = 0) -> dict:
-    """Cria Flash Sale no slot oficial com preço POR VARIAÇÃO e verifica os itens que entraram."""
+    """Cria Flash Sale no slot oficial, com os CRITÉRIOS NATIVOS do slot aplicados
+    (estoque de campanha 1~1000, desconto 1~99%, máx 50 itens habilitados), preço POR
+    VARIAÇÃO, e — regra oficial que faltava — ATIVA a oferta ao final
+    (update_shop_flash_sale status=1: ela nasce desabilitada). Verifica por
+    enabled_item_count/item_count e lê failed_items."""
     if not timeslot_id:
         raise shopee.ShopeeError("Escolha um horário (slot) oficial da Shopee.")
-    # monta preço por variação quando vier desconto_pct (mesmo helper do motor)
     from . import shopee_promo_auto as motor
     if itens and not (itens[0] or {}).get("models") and any(i.get("desconto_pct") for i in itens):
         itens = motor._flash_itens(user_id, itens, int(reserva or 0))
+
+    # CRITÉRIOS DO SLOT (painel oficial): estoque de campanha 1~1000; desconto 1~99%; máx 50 itens
+    itens = itens[:50]
+    for it in itens:
+        it["purchase_limit"] = int(it.get("purchase_limit") or 0)
+        for m in it.get("models") or []:
+            m["stock"] = max(1, min(1000, int(m.get("stock") or 1)))
+        if "stock" in it and not it.get("models"):
+            it["stock"] = max(1, min(1000, int(it.get("stock") or 1)))
     enviados = [int(i.get("item_id")) for i in itens if i.get("item_id")]
-    log.info("CAMPANHA[flash] criando no slot %s com %d itens", timeslot_id, len(enviados))
+    log.info("CAMPANHA[flash] criando no slot %s com %d itens (critérios do slot aplicados)",
+             timeslot_id, len(enviados))
     r = shopee.criar_flash(user_id, int(timeslot_id), itens)
     fid = (r.get("response") or {}).get("flash_sale_id") or r.get("flash_sale_id")
-    ok, dentro = 0, set()
-    if fid:
+    falhas = (r.get("response") or {}).get("failed_items") or r.get("failed_items") or []
+    recusados = []
+    for f in falhas:
+        if isinstance(f, dict):
+            recusados.append({"item_id": f.get("item_id"),
+                              "motivo": f.get("fail_message") or f.get("err_msg") or f.get("fail_error") or "recusado pela Shopee"})
+    if not fid:
+        log.warning("CAMPANHA[flash] Shopee não retornou flash_sale_id | resp=%s", r)
+        raise shopee.ShopeeError("A Shopee não criou a Oferta Relâmpago (loja pode não estar elegível ou o slot expirou).")
+
+    # REGRA OFICIAL: a flash sale nasce DESABILITADA — ativar agora (status=1)
+    ativada = False
+    try:
+        ru = shopee._chamar(user_id, "/api/v2/shop_flash_sale/update_shop_flash_sale",
+                            metodo="POST", extra={"flash_sale_id": int(fid), "status": 1})
+        st = (ru.get("response") or {}).get("status")
+        ativada = (st == 1) or not ru.get("error")
+        log.info("CAMPANHA[flash] id=%s ATIVADA (update status=1, resp status=%s)", fid, st)
+    except shopee.ShopeeError as e:
+        log.warning("CAMPANHA[flash] id=%s falha ao ATIVAR (fica desabilitada no painel!): %s", fid, e)
+
+    # verificação real: itens + habilitados
+    ok, habilitados = 0, None
+    try:
+        rg = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_shop_flash_sale",
+                            extra={"flash_sale_id": int(fid)})
+        resp = rg.get("response") or {}
+        ok = int(resp.get("item_count") or 0)
+        habilitados = resp.get("enabled_item_count")
+        log.info("CAMPANHA[flash] id=%s verificação: item_count=%s enabled_item_count=%s status=%s",
+                 fid, ok, habilitados, resp.get("status"))
+    except shopee.ShopeeError as e:
+        log.warning("CAMPANHA[flash] verificação falhou: %s", e)
         try:
             det = shopee.detalhe_flash(user_id, fid)
-            dentro = {int(x["item_id"]) for x in det.get("itens") or []}
-            ok = len(dentro)
-        except shopee.ShopeeError as e:
-            log.warning("CAMPANHA[flash] verificação falhou: %s", e)
-    recusados = [{"item_id": i, "motivo": "recusado pela Shopee (preço/estoque fora do critério do slot, ou item em add-on no período)"}
-                 for i in enviados if dentro and i not in dentro]
+            ok = len(det.get("itens") or [])
+        except shopee.ShopeeError:
+            pass
+    if ok == 0 and not recusados:
+        recusados = [{"item_id": i, "motivo": "recusado pela Shopee (fora dos critérios do slot: estoque 1~1000, desconto 1~99%, ou item em outra promoção)"}
+                     for i in enviados]
     if recusados:
         log.warning("CAMPANHA[flash] id=%s: %d de %d itens ENTRARAM; recusados=%s",
-                    fid, ok, len(enviados), [x["item_id"] for x in recusados])
-    else:
-        log.info("CAMPANHA[flash] id=%s: %d de %d itens confirmados", fid, ok, len(enviados))
+                    fid, ok, len(enviados), [(x.get("item_id"), x.get("motivo")) for x in recusados[:5]])
     out = _resultado("flash", fid, ok, recusados)
     out["flash_sale_id"] = fid
+    out["ativada"] = ativada
+    out["habilitados"] = habilitados
+    if not ativada:
+        out["aviso"] = (out.get("aviso") or "") + (" | " if out.get("aviso") else "") + \
+            "a oferta foi criada mas NÃO pôde ser ativada — ative no Seller Center"
     return out
