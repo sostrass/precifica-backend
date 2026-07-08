@@ -149,8 +149,11 @@ async def _agendador_promo():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    observ.configurar_logs()
-    observ.instrumentar()
+    try:
+        observ.configurar_logs()
+        observ.instrumentar()
+    except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
+        pass
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -189,6 +192,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="BlingAI Manager — Backend", version="0.2.0", lifespan=lifespan)
+
+# Ativa a observabilidade já no import, além do lifespan — assim os logs aparecem no
+# Railway mesmo que algo no startup engasgue. Nunca fatal.
+try:
+    observ.configurar_logs()
+    observ.instrumentar()
+except Exception:  # noqa: BLE001
+    pass
 
 
 def _brl(v) -> str:

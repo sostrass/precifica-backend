@@ -48,22 +48,40 @@ class _BufferHandler(logging.Handler):
 
 
 def configurar_logs() -> None:
-    """Configura o logging raiz para stdout (capturado pelo Railway)."""
-    nivel = os.environ.get("LOG_LEVEL", "INFO").upper()
-    raiz = logging.getLogger()
-    raiz.setLevel(nivel)
-    # remove handlers antigos para não duplicar linhas
-    for h in list(raiz.handlers):
-        raiz.removeHandler(h)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(name)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-    saida = logging.StreamHandler(sys.stdout)
-    saida.setFormatter(fmt)
-    raiz.addHandler(saida)
-    raiz.addHandler(_BufferHandler())
-    # bibliotecas barulhentas em nível mais alto
-    for ruido in ("httpx", "urllib3", "uvicorn.access"):
-        logging.getLogger(ruido).setLevel(logging.WARNING)
-    log.info("observabilidade ativa | nivel=%s", nivel)
+    """Configura o logging raiz para stdout (capturado pelo Railway). À prova de falha:
+    qualquer problema aqui não pode derrubar o app."""
+    try:
+        # stdout sem buffer de bloco, para o Railway mostrar as linhas na hora
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:  # noqa: BLE001
+            pass
+        nivel = os.environ.get("LOG_LEVEL", "INFO").upper()
+        if nivel not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            nivel = "INFO"
+        raiz = logging.getLogger()
+        raiz.setLevel(nivel)
+        # remove só os nossos handlers antigos (evita duplicar em reload) — preserva o resto
+        for h in list(raiz.handlers):
+            if getattr(h, "_precifica", False):
+                raiz.removeHandler(h)
+        fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(name)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+        saida = logging.StreamHandler(sys.stdout)
+        saida.setFormatter(fmt)
+        saida._precifica = True  # type: ignore[attr-defined]
+        raiz.addHandler(saida)
+        buf = _BufferHandler()
+        buf._precifica = True  # type: ignore[attr-defined]
+        raiz.addHandler(buf)
+        for ruido in ("httpx", "urllib3", "uvicorn.access"):
+            logging.getLogger(ruido).setLevel(logging.WARNING)
+        log.info("=== OBSERVABILIDADE ATIVA === nivel=%s (logs vao para o stdout/Railway)", nivel)
+    except Exception as e:  # noqa: BLE001
+        try:
+            logging.basicConfig(level=logging.INFO)
+            logging.getLogger("precifica").warning("configurar_logs caiu no fallback: %s", e)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _resumo(obj, limite: int = 700) -> str:
@@ -118,15 +136,21 @@ def instrumentar() -> None:
 
         def _chamar_logado(user_id, path, extra=None, metodo="GET", timeout=25):
             t0 = time.time()
-            enviados = _contar_itens(extra)
+            # A chamada real roda ISOLADA — nenhuma falha de LOG pode quebrá-la.
             try:
                 r = _orig(user_id, path, extra=extra, metodo=metodo, timeout=timeout)
-                _log_chamada_externa("SHOPEE", metodo, path, int((time.time() - t0) * 1000), r, enviados)
-                return r
             except Exception as e:  # noqa: BLE001
-                log.warning("SHOPEE %s %s (%dms) FALHOU: %s: %s", metodo, path,
-                            int((time.time() - t0) * 1000), type(e).__name__, e)
+                try:
+                    log.warning("SHOPEE %s %s (%dms) FALHOU: %s: %s", metodo, path,
+                                int((time.time() - t0) * 1000), type(e).__name__, e)
+                except Exception:  # noqa: BLE001
+                    pass
                 raise
+            try:
+                _log_chamada_externa("SHOPEE", metodo, path, int((time.time() - t0) * 1000), r, _contar_itens(extra))
+            except Exception:  # noqa: BLE001
+                pass
+            return r
 
         _sh._chamar = _chamar_logado
         log.info("instrumentado: shopee._chamar")
@@ -140,24 +164,28 @@ def instrumentar() -> None:
 
         def _req_logado(metodo, path, user_id=None, params=None, json=None, headers=None, base=None, raw=False):
             t0 = time.time()
-            enviados = _contar_itens(json)
             kwargs = dict(user_id=user_id, params=params, json=json, headers=headers, raw=raw)
             if base is not None:
                 kwargs["base"] = base
             try:
                 r = _orig_ml(metodo, path, **kwargs)
-                corpo = None
+            except Exception as e:  # noqa: BLE001
+                try:
+                    log.warning("ML %s %s (%dms) FALHOU: %s: %s", metodo, path,
+                                int((time.time() - t0) * 1000), type(e).__name__, e)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            try:
                 if isinstance(r, dict):
-                    corpo = r
+                    _log_chamada_externa("ML", metodo, path, int((time.time() - t0) * 1000), r, _contar_itens(json))
                 elif hasattr(r, "status_code"):
                     log.info("ML %s %s (%dms) http=%s", metodo, path, int((time.time() - t0) * 1000), r.status_code)
-                    return r
-                _log_chamada_externa("ML", metodo, path, int((time.time() - t0) * 1000), corpo, enviados)
-                return r
-            except Exception as e:  # noqa: BLE001
-                log.warning("ML %s %s (%dms) FALHOU: %s: %s", metodo, path,
-                            int((time.time() - t0) * 1000), type(e).__name__, e)
-                raise
+                else:
+                    log.info("ML %s %s (%dms) ok", metodo, path, int((time.time() - t0) * 1000))
+            except Exception:  # noqa: BLE001
+                pass
+            return r
 
         _ml._req = _req_logado
         log.info("instrumentado: mercadolivre._req")
@@ -168,24 +196,29 @@ def instrumentar() -> None:
 
 
 async def middleware(request, call_next):
-    """Loga cada requisição HTTP: entrada, saída, status e tempo. Erros viram ERROR com traceback."""
+    """Loga cada requisição HTTP: entrada, saída, status e tempo. O log NUNCA quebra a resposta."""
+    caminho = getattr(request.url, "path", "?")
+    if caminho in ("/", "/health", "/favicon.ico"):
+        return await call_next(request)
     rid = uuid.uuid4().hex[:8]
     t0 = time.time()
     metodo = request.method
-    caminho = request.url.path
-    if caminho in ("/", "/health", "/favicon.ico"):
-        return await call_next(request)
     try:
         resp = await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            log.error("req[%s] %s %s -> EXCECAO (%dms): %s: %s\n%s", rid, metodo, caminho,
+                      int((time.time() - t0) * 1000), type(exc).__name__, exc, traceback.format_exc())
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    try:
         ms = int((time.time() - t0) * 1000)
         nivel = logging.WARNING if resp.status_code >= 400 else logging.INFO
         log.log(nivel, "req[%s] %s %s -> %s (%dms)", rid, metodo, caminho, resp.status_code, ms)
-        return resp
-    except Exception as exc:  # noqa: BLE001
-        ms = int((time.time() - t0) * 1000)
-        log.error("req[%s] %s %s -> EXCECAO (%dms): %s: %s\n%s", rid, metodo, caminho, ms,
-                  type(exc).__name__, exc, traceback.format_exc())
-        raise
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
 
 
 def log_excecao(request, exc: Exception) -> None:
