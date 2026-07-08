@@ -47,6 +47,19 @@ DIA = 86400
 HORA = 3600
 
 
+def slots_oficiais(user_id: int, dias: int = 14) -> dict:
+    """Aberturas (slots) oficiais de Flash Sale da loja. Usa a rota CORRETA da API
+    (/shop_flash_sale/get_time_slot_id) — a rota antiga no wrapper não existe e
+    devolvia vazio, por isso o painel nunca via os horários do Seller Center."""
+    agora = int(time.time())
+    r = shopee._chamar(user_id, "/api/v2/shop_flash_sale/get_time_slot_id",
+                       extra={"start_time": agora, "end_time": agora + max(1, dias) * DIA})
+    lista = (r.get("response") or []) if isinstance(r.get("response"), list) else \
+        ((r.get("response") or {}).get("time_slot_list") or (r.get("response") or {}).get("timeslot_list") or [])
+    log.info("CAMPANHA[flash] slots oficiais %dd: %d abertura(s)", dias, len(lista))
+    return {"response": {"timeslot_list": lista}, "request_id": r.get("request_id")}
+
+
 # ------------------------------------------------------------------ helpers --
 def _menor_preco_corrente(user_id: int, item_id: int) -> float:
     """Menor preço vigente do anúncio (entre as variações; ou o item-base)."""
@@ -376,10 +389,10 @@ def habilitar_flash_itens(user_id: int, flash_sale_id: int) -> dict:
                 if isinstance(f, dict):
                     falhas.append({"item_id": f.get("item_id"),
                                    "motivo": f.get("fail_message") or f.get("err_msg") or f.get("unqualified_condition") or "não habilitado"})
-            log.info("CAMPANHA[flash] id=%s habilitação de itens enviada (%d itens, %d falhas)",
-                     fid, len(itens_upd), len(fitems))
+            log.info("CAMPANHA[flash] id=%s habilitação de itens enviada (%d itens, %d falhas) | resp=%s",
+                     fid, len(itens_upd), len(fitems), str(rresp)[:400])
         except shopee.ShopeeError as e:
-            log.warning("CAMPANHA[flash] id=%s falha ao habilitar itens: %s", fid, e)
+            log.warning("CAMPANHA[flash] id=%s falha ao habilitar itens: %s | payload=%s", fid, e, str(itens_upd)[:400])
     # 3) ativar a oferta em si
     ativada = False
     try:

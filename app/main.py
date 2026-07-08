@@ -2050,7 +2050,7 @@ def shopee_encerrar_addon(addon_id: str, user: User = Depends(auth.get_current_u
 @app.get("/api/shopee/flash/slots")
 def shopee_flash_slots(dias: int = 14, user: User = Depends(auth.get_current_user)):
     try:
-        return shopee.flash_slots(user.id, dias=min(max(dias, 1), 30))
+        return shopee_campanhas.slots_oficiais(user.id, dias=min(max(dias, 1), 30))
     except shopee.ShopeeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
