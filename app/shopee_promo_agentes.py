@@ -31,6 +31,8 @@ from .shopee_promo_auto import obter_config, _registrar_log
 
 log = logging.getLogger("precifica.agentes")
 
+_ULTIMA_VERIFICACAO: dict = {}  # user_id -> epoch da última verificação de vendas
+
 DIA = 86400
 JANELA_DIAS = 45          # quanto de histórico de vendas estudar
 MIN_CESTAS = 5            # amostra mínima para agir
@@ -89,10 +91,10 @@ def _pares(cestas: list) -> list:
 
 
 # ------------------------------------------------------------------ guarda ---
-def _criou_recente(user_id: int, tipo: str) -> bool:
+def _criou_recente(user_id: int, tipo: str, freq_dias: int = COOLDOWN_DIAS) -> bool:
     db = SessionLocal()
     try:
-        corte = datetime.utcnow() - timedelta(days=COOLDOWN_DIAS)
+        corte = datetime.utcnow() - timedelta(days=max(1, int(freq_dias or COOLDOWN_DIAS)))
         q = (db.query(ShopeePromoLog)
              .filter(ShopeePromoLog.user_id == user_id,
                      ShopeePromoLog.tipo == tipo,
@@ -106,15 +108,16 @@ def _criou_recente(user_id: int, tipo: str) -> bool:
 
 # ------------------------------------------------------------------ agentes --
 def _agente_cupom(user_id: int, ex: dict, cestas: list) -> dict | None:
-    if _criou_recente(user_id, "cupom"):
+    if _criou_recente(user_id, "cupom", int(ex.get("cupom_freq") or 7)):
         return None
     pct = int(ex.get("cupom_desconto") or 10)
     quota = int(ex.get("cupom_quota") or 100)
     agora = int(time.time())
     codigo = "AUTO" + datetime.now().strftime("%d%m") + "".join(random.choices(string.ascii_uppercase, k=2))
     nome = f"Cupom Auto {datetime.now().strftime('%d/%m')}"
+    dur = int(ex.get("cupom_duracao") or 7)
     r = shopee_campanhas.criar_cupom_verificado(user_id, {
-        "nome": nome, "codigo": codigo, "inicio": agora + 900, "fim": agora + 7 * DIA,
+        "nome": nome, "codigo": codigo, "inicio": agora + 900, "fim": agora + 900 + dur * DIA,
         "tipo_desconto": 2, "valor": pct, "compra_minima": 0, "quantidade": quota, "escopo": 1,
     })
     _registrar_log(user_id, "cupom", r.get("voucher_id"), nome, quota, pct, "vendas")
@@ -123,7 +126,7 @@ def _agente_cupom(user_id: int, ex: dict, cestas: list) -> dict | None:
 
 
 def _agente_bundle(user_id: int, ex: dict, cestas: list) -> dict | None:
-    if _criou_recente(user_id, "bundle"):
+    if _criou_recente(user_id, "bundle", int(ex.get("bundle_freq") or 7)):
         return None
     pares = _pares(cestas)
     if not pares:
@@ -134,7 +137,7 @@ def _agente_bundle(user_id: int, ex: dict, cestas: list) -> dict | None:
     a, b = pares[0]
     nome = f"Leve+ Auto {datetime.now().strftime('%d/%m')}"
     r = shopee_campanhas.criar_bundle_verificado(user_id, {
-        "nome": nome, "inicio": agora + 3900, "fim": agora + 14 * DIA,
+        "nome": nome, "inicio": agora + 3900, "fim": agora + 3900 + int(ex.get("bundle_duracao") or 14) * DIA,
         "rule_type": 2, "valor": pct, "min_itens": 2, "item_ids": [a, b],
     })
     if (r.get("itens_adicionados") or 0) < 2:
@@ -145,7 +148,7 @@ def _agente_bundle(user_id: int, ex: dict, cestas: list) -> dict | None:
 
 
 def _agente_addon(user_id: int, ex: dict, cestas: list) -> dict | None:
-    if _criou_recente(user_id, "addon"):
+    if _criou_recente(user_id, "addon", int(ex.get("addon_freq") or 7)):
         return None
     tops = _top_vendidos(cestas)
     if not tops:
@@ -173,7 +176,7 @@ def _agente_addon(user_id: int, ex: dict, cestas: list) -> dict | None:
         return None
     nome = f"Add-on Auto {datetime.now().strftime('%d/%m')}"
     r = shopee_campanhas.criar_addon_verificado(user_id, {
-        "nome": nome, "inicio": agora + 3900, "fim": agora + 14 * DIA,
+        "nome": nome, "inicio": agora + 3900, "fim": agora + 3900 + int(ex.get("addon_duracao") or 14) * DIA,
         "promotion_type": 0, "principais": [principal], "adicionais": adicionais,
     })
     _registrar_log(user_id, "addon", r.get("add_on_deal_id"), nome,
@@ -191,6 +194,13 @@ def ciclo(user_id: int) -> dict:
     ativos = [t for t, k in (("cupom", "cupom_auto"), ("bundle", "bundle_auto"), ("addon", "addon_auto")) if ex.get(k)]
     if not cfg.get("ativo") or not ativos:
         return {"acao": "inativo"}
+    # radar configurável no painel: verificar as vendas a cada N horas (1~24)
+    horas = max(1, min(24, int(ex.get("verificacao_horas") or 6)))
+    ultima = _ULTIMA_VERIFICACAO.get(user_id, 0)
+    if time.time() - ultima < horas * 3600:
+        return {"acao": "aguardando_verificacao", "proxima_em_s": int(horas * 3600 - (time.time() - ultima))}
+    _ULTIMA_VERIFICACAO[user_id] = time.time()
+    log.info("AGENTES: verificação de vendas iniciada (radar a cada %dh, conforme o painel)", horas)
     cestas = _cestas(user_id)
     if len(cestas) < MIN_CESTAS:
         log.info("AGENTES: só %d cesta(s) na janela — amostra pequena, nada criado", len(cestas))

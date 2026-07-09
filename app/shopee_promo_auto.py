@@ -68,9 +68,11 @@ EXTRAS_PADRAO = {
     "flash_horario": "qualquer",  # qualquer | manha | tarde | noite
     "flash_dias": 7,           # procura aberturas até N dias à frente
     # agentes por vendas (estudam os pedidos reais da loja)
+    "verificacao_horas": 6,   # radar dos agentes: de quanto em quanto tempo verificam as vendas
     "cupom_auto": False, "cupom_desconto": 10, "cupom_quota": 100,
-    "bundle_auto": False, "bundle_desconto": 10,
-    "addon_auto": False, "addon_desconto": 15,
+    "cupom_duracao": 7, "cupom_freq": 7,
+    "bundle_auto": False, "bundle_desconto": 10, "bundle_duracao": 14, "bundle_freq": 7,
+    "addon_auto": False, "addon_desconto": 15, "addon_duracao": 14, "addon_freq": 7,
 }
 
 
@@ -116,6 +118,12 @@ def salvar_config(user_id: int, p: dict) -> dict:
             if "cupom_quota" in e: ex["cupom_quota"] = max(10, min(int(e["cupom_quota"]), 1000))
             if "bundle_desconto" in e: ex["bundle_desconto"] = max(1, min(int(e["bundle_desconto"]), 50))
             if "addon_desconto" in e: ex["addon_desconto"] = max(1, min(int(e["addon_desconto"]), 70))
+            if "cupom_duracao" in e: ex["cupom_duracao"] = max(3, min(int(e["cupom_duracao"]), 30))
+            if "bundle_duracao" in e: ex["bundle_duracao"] = max(7, min(int(e["bundle_duracao"]), 90))
+            if "addon_duracao" in e: ex["addon_duracao"] = max(7, min(int(e["addon_duracao"]), 90))
+            for fq in ("cupom_freq", "bundle_freq", "addon_freq"):
+                if fq in e: ex[fq] = max(1, min(int(e[fq]), 30))
+            if "verificacao_horas" in e: ex["verificacao_horas"] = max(1, min(int(e["verificacao_horas"]), 24))
             c.extras = json.dumps(ex, ensure_ascii=False)
         c.atualizado_em = datetime.utcnow()
         db.commit()
