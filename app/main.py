@@ -1568,6 +1568,15 @@ def shopee_promo_historico(user: User = Depends(auth.get_current_user)):
             "resumo": shopee_promo_auto.resumo(user.id)}
 
 
+@app.get("/api/shopee/pedidos/inteligencia")
+def shopee_pedidos_inteligencia(dias: int = 45, user: User = Depends(auth.get_current_user)):
+    """Ponte Pedidos → Campanhas: sugestões de Leve+/Add-on/Cupom a partir dos pedidos reais."""
+    try:
+        return shopee_promo_agentes.inteligencia_vendas(user.id, dias=min(max(dias, 7), 90))
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/api/shopee/promo/diag")
 def shopee_promo_diag(payload: dict = Body(...), user: User = Depends(auth.get_current_user)):
     """DIAGNÓSTICO TEMPORÁRIO multi-tipo (desconto|bundle|addon). Cria uma promoção de teste,

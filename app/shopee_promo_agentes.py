@@ -187,6 +187,89 @@ def _agente_addon(user_id: int, ex: dict, cestas: list) -> dict | None:
 
 
 # ------------------------------------------------------------------ ciclo ----
+def inteligencia_vendas(user_id: int, dias: int = JANELA_DIAS) -> dict:
+    """A ponte Pedidos → Campanhas. Estuda os pedidos reais e devolve SUGESTÕES prontas
+    (sem criar nada): par para Leve+, principal+adicionais para Add-on, e ticket/recompra
+    para Cupom. É o que a Central de Pedidos mostra na seção 'Inteligência de vendas'."""
+    cestas = _cestas(user_id, dias)
+    amostra = len(cestas)
+
+    # nomes/preços dos itens envolvidos (para exibição)
+    ids = set()
+    for c in cestas:
+        for iid, _ in c:
+            ids.add(iid)
+    nomes = {}
+    if ids:
+        try:
+            nomes = shopee.nomes_itens(user_id, list(ids)[:100]) or {}
+        except shopee.ShopeeError:
+            nomes = {}
+
+    def nome(iid):
+        return (nomes.get(iid, {}) or {}).get("nome") or f"#{iid}"
+
+    # 1) pares comprados juntos (Leve+)
+    from collections import Counter
+    par_ct = Counter()
+    for cesta in cestas:
+        u = sorted({iid for iid, _ in cesta})
+        for i in range(len(u)):
+            for j in range(i + 1, len(u)):
+                par_ct[(u[i], u[j])] += 1
+    pares = [{"item_a": a, "item_b": b, "nome_a": nome(a), "nome_b": nome(b), "vezes": n}
+             for (a, b), n in par_ct.most_common(5) if n >= 2]
+
+    # 2) campeão + companheiros (Add-on)
+    top = _top_vendidos(cestas)
+    addon = None
+    if top:
+        principal = top[0]
+        companheiros = []
+        total_princ = sum(1 for c in cestas if any(iid == principal for iid, _ in c))
+        casada = Counter()
+        for c in cestas:
+            ids_c = {iid for iid, _ in c}
+            if principal in ids_c:
+                for iid in ids_c:
+                    if iid != principal:
+                        casada[iid] += 1
+        for iid, n in casada.most_common(3):
+            companheiros.append({"item_id": iid, "nome": nome(iid), "vezes": n})
+        pct_casada = round((sum(c["vezes"] for c in companheiros) / total_princ * 100)) if total_princ else 0
+        addon = {"principal": principal, "nome_principal": nome(principal),
+                 "companheiros": companheiros, "pct_casada": pct_casada}
+
+    # 3) ticket médio + recompra (Cupom)
+    valores = []  # sem valor monetário nos itens aqui; estimamos por preço corrente
+    for c in cestas:
+        v = 0.0
+        for iid, q in c:
+            v += _preco_c(user_id, iid) * q
+        if v > 0:
+            valores.append(v)
+    ticket = round(sum(valores) / len(valores), 2) if valores else 0.0
+    cupom_min = round(ticket * 1.15, 2) if ticket else 0.0  # empurra o ticket ~15%
+
+    log.info("INTELIGENCIA vendas: %d cestas · %d pares · addon=%s · ticket R$%.2f",
+             amostra, len(pares), bool(addon), ticket)
+    return {
+        "amostra": amostra, "janela_dias": dias, "suficiente": amostra >= MIN_CESTAS,
+        "leve_mais": pares,
+        "add_on": addon,
+        "cupom": {"ticket_medio": ticket, "minimo_sugerido": cupom_min, "desconto_sugerido": 10},
+    }
+
+
+def _preco_c(user_id: int, item_id: int) -> float:
+    """Preço corrente (menor variação) com cache leve por chamada."""
+    from . import shopee_campanhas
+    try:
+        return shopee_campanhas._menor_preco_corrente(user_id, item_id)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def ciclo(user_id: int) -> dict:
     """Roda os agentes por vendas ativos (chamado pelo agendador, junto do motor)."""
     cfg = obter_config(user_id)
