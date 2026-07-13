@@ -3173,7 +3173,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     """Pedidos do ML cruzados com o Bling (preço/custo por SKU) e com o cache do
     anúncio (imagem/preço atual). A tarifa vem do próprio pedido (order_items.sale_fee),
     então não há chamada extra à API. Devolve pedidos + estatísticas agregadas."""
-    from .models import ProdutoCache, MLItemCache
+    from .models import ProdutoCache, MLItemCache, MLEnvioCache
     from sqlalchemy import or_ as _or
 
     # O ML corta /orders/search em 50 por chamada. Para o modelo de "janela inteira"
@@ -3209,6 +3209,29 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     if total is None:
         total = len(results)
     paging = {"total": total, "carregados": len(results)}
+
+    # ENVIOS: o /orders/search não devolve mais o estado do shipment — o cache local
+    # (webhooks + backfill) é a fonte de verdade de status/prazo/rastreio/destinatário.
+    envio_cache = {}
+    try:
+        _sids = []
+        for o in results:
+            _sid = (o.get("shipping") or {}).get("id")
+            if _sid:
+                _sids.append(str(_sid))
+        if _sids:
+            _dbe = SessionLocal()
+            try:
+                for i in range(0, len(_sids), 400):
+                    for e in _dbe.query(MLEnvioCache).filter(
+                        MLEnvioCache.user_id == user_id,
+                        MLEnvioCache.shipment_id.in_(_sids[i:i + 400]),
+                    ).all():
+                        envio_cache[str(e.shipment_id)] = e
+            finally:
+                _dbe.close()
+    except Exception:  # noqa: BLE001
+        envio_cache = {}
 
     skus, item_ids = set(), set()
     for o in results:
@@ -3321,7 +3344,19 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             "status": st,
             "buyer": {"nickname": buyer.get("nickname"), "id": buyer.get("id")},
             "shipping_id": ship.get("id"),
-            "envio_status": ship.get("status"),
+            "envio_status": (getattr(envio_cache.get(str(ship.get("id") or "")), "status", None)
+                             or ship.get("status")),
+            "envio_substatus": getattr(envio_cache.get(str(ship.get("id") or "")), "substatus", None),
+            "ship_by": (lambda _e: (_e.handling_limit.timestamp() if _e is not None and _e.handling_limit else None))(envio_cache.get(str(ship.get("id") or ""))),
+            "rastreio": getattr(envio_cache.get(str(ship.get("id") or "")), "tracking_number", None),
+            "uf": getattr(envio_cache.get(str(ship.get("id") or "")), "receiver_estado", None),
+            "cidade": getattr(envio_cache.get(str(ship.get("id") or "")), "receiver_cidade", None),
+            "cep": getattr(envio_cache.get(str(ship.get("id") or "")), "receiver_cep", None),
+            "cliente": getattr(envio_cache.get(str(ship.get("id") or "")), "receiver_nome", None),
+            "endereco": getattr(envio_cache.get(str(ship.get("id") or "")), "receiver_endereco", None),
+            "frete_vendedor": getattr(envio_cache.get(str(ship.get("id") or "")), "custo_vendedor", None),
+            "devolucao_envio": bool(getattr(envio_cache.get(str(ship.get("id") or "")), "devolucao", False)),
+            "tags": o.get("tags") or [],
             "logistic_type": logistic,
             "is_full": (logistic == "fulfillment"),
             "total": float(o.get("total_amount") or o_rec),
