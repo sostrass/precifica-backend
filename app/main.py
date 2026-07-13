@@ -3180,17 +3180,32 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     # (o front pede a janela toda de uma vez, ex.: limit=120), buscamos em blocos de 50
     # até completar `limit` (teto de segurança 150). `total` vem do paging da 1ª página.
     limit = max(1, min(int(limit or 30), 500))
-    results, total, got = [], None, 0
-    while got < limit:
-        bloco = min(50, limit - got)
-        raw = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, offset + got, bloco) or {}
-        pagina = raw.get("results") or []
-        if total is None:
-            total = (raw.get("paging") or {}).get("total")
-        results.extend(pagina)
-        got += len(pagina)
-        if len(pagina) < bloco:  # acabaram os pedidos da janela
-            break
+    # 1ª página (traz o total) + demais páginas em PARALELO no servidor:
+    # 400 pedidos = 8 buscas de 50 simultâneas — uma chamada do painel resolve a janela toda.
+    raw0 = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, offset, min(50, limit)) or {}
+    results = list(raw0.get("results") or [])
+    total = (raw0.get("paging") or {}).get("total")
+    alvo = min(limit, (total - offset) if isinstance(total, int) else limit)
+    if len(results) < alvo and len(results) == min(50, limit):
+        offsets = list(range(offset + 50, offset + alvo, 50))
+        if offsets:
+            from concurrent.futures import ThreadPoolExecutor
+            def _pagina(off):
+                try:
+                    r = ml.listar_pedidos(user_id, status or None, desde or None, ate or None,
+                                          off, min(50, offset + alvo - off)) or {}
+                    return off, (r.get("results") or [])
+                except Exception:  # noqa: BLE001
+                    try:  # uma segunda chance por página
+                        r = ml.listar_pedidos(user_id, status or None, desde or None, ate or None,
+                                              off, min(50, offset + alvo - off)) or {}
+                        return off, (r.get("results") or [])
+                    except Exception:  # noqa: BLE001
+                        return off, []
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                paginas = list(ex.map(_pagina, offsets))
+            for _off, pagina in sorted(paginas, key=lambda x: x[0]):
+                results.extend(pagina)
     if total is None:
         total = len(results)
     paging = {"total": total, "carregados": len(results)}
