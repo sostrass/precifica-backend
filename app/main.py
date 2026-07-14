@@ -3169,6 +3169,69 @@ def _balde_pedido(order_status, env, hoje_fim):
     return "hoje"
 
 
+# ── Disciplina de tráfego ML: cache de janela (45s) + semáforo global ──
+# Toda chamada do painel (1ª leva, Plano A, blocos do Plano B, poll) reutiliza a
+# MESMA janela bruta de pedidos, estendendo-a incrementalmente. O semáforo impede
+# que rajadas paralelas saturem a API do ML (rate limit era a causa dos minutos
+# de espera: dezenas de buscas simultâneas -> 429 -> retries -> fila infinita).
+import threading as _thr
+import time as _time
+_ML_SEM = _thr.BoundedSemaphore(6)
+_JANELAS = {}
+_JANELAS_LOCK = _thr.Lock()
+_JANELA_TTL = 45.0
+
+def _janela_ml(ml, user_id, status, desde, ate, precisa_ate):
+    """Garante uma janela bruta de pedidos [0..precisa_ate) fresca, estendendo a
+    existente em blocos de 50 paralelos (máx 5 por vez, sob semáforo)."""
+    chave = (user_id, status or '', desde or '', ate or '')
+    with _JANELAS_LOCK:
+        j = _JANELAS.get(chave)
+        if j and (_time.time() - j['ts'] > _JANELA_TTL):
+            j = None
+        if j is None:
+            j = {'ts': _time.time(), 'results': [], 'total': None, 'fim': False, 'lock': _thr.Lock()}
+            _JANELAS[chave] = j
+    with j['lock']:  # uma extensão por vez; as demais chamadas esperam e reutilizam
+        if j['total'] is not None:
+            precisa_ate = min(precisa_ate, j['total'])
+        while len(j['results']) < precisa_ate and not j['fim']:
+            base = len(j['results'])
+            falta = precisa_ate - base
+            offsets = list(range(base, base + falta, 50))[:5]
+            def _pg(off):
+                for _ in range(2):
+                    try:
+                        with _ML_SEM:
+                            r = ml.listar_pedidos(user_id, status or None, desde or None, ate or None,
+                                                  off, min(50, precisa_ate - off)) or {}
+                        return off, (r.get('results') or []), (r.get('paging') or {}).get('total')
+                    except Exception:  # noqa: BLE001
+                        _time.sleep(0.6)
+                return off, [], None
+            if len(offsets) == 1:
+                paginas = [_pg(offsets[0])]
+            else:
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+                with _TPE(max_workers=len(offsets)) as _ex:
+                    paginas = list(_ex.map(_pg, offsets))
+            avancou = False
+            for _off, res, tot in sorted(paginas, key=lambda x: x[0]):
+                if tot is not None and j['total'] is None:
+                    j['total'] = int(tot)
+                    precisa_ate = min(precisa_ate, j['total'])
+                if _off == len(j['results']) and res:
+                    j['results'].extend(res)
+                    avancou = True
+                elif _off == len(j['results']) and not res:
+                    j['fim'] = True
+            if not avancou:
+                break
+        j['ts'] = _time.time()
+        total = j['total'] if j['total'] is not None else len(j['results'])
+        return list(j['results']), total
+
+
 def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate=None):
     """Pedidos do ML cruzados com o Bling (preço/custo por SKU) e com o cache do
     anúncio (imagem/preço atual). A tarifa vem do próprio pedido (order_items.sale_fee),
@@ -3180,34 +3243,9 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     # (o front pede a janela toda de uma vez, ex.: limit=120), buscamos em blocos de 50
     # até completar `limit` (teto de segurança 150). `total` vem do paging da 1ª página.
     limit = max(1, min(int(limit or 30), 500))
-    # 1ª página (traz o total) + demais páginas em PARALELO no servidor:
-    # 400 pedidos = 8 buscas de 50 simultâneas — uma chamada do painel resolve a janela toda.
-    raw0 = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, offset, min(50, limit)) or {}
-    results = list(raw0.get("results") or [])
-    total = (raw0.get("paging") or {}).get("total")
-    alvo = min(limit, (total - offset) if isinstance(total, int) else limit)
-    if len(results) < alvo and len(results) == min(50, limit):
-        offsets = list(range(offset + 50, offset + alvo, 50))
-        if offsets:
-            from concurrent.futures import ThreadPoolExecutor
-            def _pagina(off):
-                try:
-                    r = ml.listar_pedidos(user_id, status or None, desde or None, ate or None,
-                                          off, min(50, offset + alvo - off)) or {}
-                    return off, (r.get("results") or [])
-                except Exception:  # noqa: BLE001
-                    try:  # uma segunda chance por página
-                        r = ml.listar_pedidos(user_id, status or None, desde or None, ate or None,
-                                              off, min(50, offset + alvo - off)) or {}
-                        return off, (r.get("results") or [])
-                    except Exception:  # noqa: BLE001
-                        return off, []
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                paginas = list(ex.map(_pagina, offsets))
-            for _off, pagina in sorted(paginas, key=lambda x: x[0]):
-                results.extend(pagina)
-    if total is None:
-        total = len(results)
+    offset = max(0, int(offset or 0))
+    janela, total = _janela_ml(ml, user_id, status, desde, ate, offset + limit)
+    results = janela[offset:offset + limit]
     paging = {"total": total, "carregados": len(results)}
 
     # ENVIOS: o /orders/search não devolve mais o estado do shipment — o cache local
@@ -3464,7 +3502,10 @@ def ml_pedidos_enriquecido(status: str = "paid", offset: int = 0, limit: int = 3
 # --- Envios / etiqueta real ---
 @app.get("/api/mercadolivre/envio/{shipment_id}")
 def ml_envio(shipment_id: str, user: User = Depends(auth.get_current_user)):
-    return _ml_run(lambda ml: ml.envio_do_pedido(shipment_id, user.id))
+    def _com_disciplina(ml):
+        with _ML_SEM:
+            return ml.envio_do_pedido(shipment_id, user.id)
+    return _ml_run(_com_disciplina)
 
 
 @app.post("/api/mercadolivre/envios/sincronizar")
