@@ -689,6 +689,7 @@ class MLPedidoCache(Base):
     currency_id = Column(String, nullable=True)
     unidades = Column(Integer, default=0)
     itens = Column(JSON, nullable=True)                      # [{item_id,sku,titulo,quantidade,unit_price,sale_fee}]
+    raw = Column(JSON, nullable=True)                        # payload cru do /orders/search — fonte do painel de pedidos
     atualizado_em = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("user_id", "order_id", name="uq_mlpedido_user_order"),)
@@ -746,24 +747,3 @@ class AgenteExecucao(Base):
     falhas = Column(Integer, default=0)
     detalhe = Column(JSON, nullable=True)                # [{item_id, titulo, agente, desconto_pct, preco, status}]
 
-
-class MLPedidoCache(Base):
-    """Cache local dos PEDIDOS do Mercado Livre — a fonte que o painel lê.
-
-    O painel nunca mais espera a API: lê daqui em milissegundos. Um sincronizador
-    de fundo varre o /orders/search em páginas de 50, com cadência segura
-    (respiro entre páginas + backoff em 429), gravando/atualizando cada pedido.
-    O payload cru fica em `raw` para o enriquecimento reaproveitar tudo.
-    """
-
-    __tablename__ = "ml_pedido_cache"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    order_id = Column(String, nullable=False, index=True)
-    date_created = Column(DateTime, index=True)
-    status = Column(String, nullable=True)
-    raw = Column(JSON, nullable=True)
-    atualizado_em = Column(DateTime, nullable=True)
-
-    __table_args__ = (UniqueConstraint("user_id", "order_id", name="uq_ml_pedido_user_order"),)

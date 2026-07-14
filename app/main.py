@@ -159,6 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
+    print("[precifica] backend v3.5.1 — boot iniciado (fusão ml_pedido_cache ativa)", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -166,6 +167,14 @@ async def lifespan(app: FastAPI):
     try:
         from . import models as _modelos  # noqa: F401 — registra todos os modelos no metadata
         Base.metadata.create_all(bind=engine)
+    except Exception:  # noqa: BLE001
+        pass
+    # coluna aditiva: raw no ml_pedido_cache (fusão com o cache de análise de vendas)
+    try:
+        from sqlalchemy import text as _sqltext
+        with engine.connect() as _cx:
+            _cx.execute(_sqltext("ALTER TABLE ml_pedido_cache ADD COLUMN IF NOT EXISTS raw JSON"))
+            _cx.commit()
     except Exception:  # noqa: BLE001
         pass
     # Rede de segurança: cada tabela nova em seu próprio try — uma falha não trava as outras.
@@ -3235,9 +3244,21 @@ def _varrer_pedidos_ml(ml, user_id, desde, ate, alvo_max=600):
                         db.add(row)
                     row.raw = o
                     row.status = str(o.get('status') or '')
+                    row.pack_id = str(o.get('pack_id') or '') or None
+                    row.total_amount = float(o.get('total_amount') or 0)
+                    row.paid_amount = float(o.get('paid_amount') or 0)
+                    row.currency_id = str(o.get('currency_id') or '') or None
+                    _its = o.get('order_items') or []
+                    row.unidades = sum(int(i.get('quantity') or 0) for i in _its)
+                    row.itens = [{'item_id': (i.get('item') or {}).get('id'), 'sku': (i.get('item') or {}).get('seller_sku'),
+                                  'titulo': (i.get('item') or {}).get('title'), 'quantidade': i.get('quantity'),
+                                  'unit_price': i.get('unit_price'), 'sale_fee': i.get('sale_fee')} for i in _its]
                     dcv = _iso_para_dt(o.get('date_created'))
                     if dcv:
                         row.date_created = dcv
+                    dfc = _iso_para_dt(o.get('date_closed'))
+                    if dfc:
+                        row.date_closed = dfc
                     row.atualizado_em = _dt.datetime.utcnow()
                 db.commit()
             finally:
@@ -3348,7 +3369,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     dbp = SessionLocal()
     try:
         from .models import MLPedidoCache as _MPC
-        q = dbp.query(_MPC).filter(_MPC.user_id == user_id)
+        q = dbp.query(_MPC).filter(_MPC.user_id == user_id, _MPC.raw.isnot(None))
         _dd = _iso_para_dt(desde) if desde else None
         _da = _iso_para_dt(ate) if ate else None
         if _dd is not None:
