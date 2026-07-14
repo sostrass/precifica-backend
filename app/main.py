@@ -3179,7 +3179,90 @@ import time as _time
 _ML_SEM = _thr.BoundedSemaphore(6)
 _JANELAS = {}
 _JANELAS_LOCK = _thr.Lock()
-_JANELA_TTL = 45.0
+_JANELA_TTL = 600.0      # a janela vive 10 min — jamais descartada no meio de uma carga
+_JANELA_FRESCOR = 45.0   # após 45s, a página 0 é re-checada p/ pedidos novos (sem destruir nada)
+_PCFG_CACHE = {}
+
+_SYNC_PED = {}
+_SYNC_PED_LOCK = _thr.Lock()
+
+
+def _iso_para_dt(v):
+    """ISO (com Z ou offset) -> datetime UTC naive, para comparação estável no banco."""
+    import datetime as _dt
+    try:
+        d = _dt.datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        if d.tzinfo is not None:
+            d = d.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        return d
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _varrer_pedidos_ml(ml, user_id, desde, ate, alvo_max=600):
+    """Varre o /orders/search em páginas de 50 e grava cada pedido no MLPedidoCache.
+    Cadência deliberadamente folgada (0.35s entre páginas + backoff 429 do _req):
+    a API nunca é saturada e o painel nunca depende dela ao vivo."""
+    from .models import MLPedidoCache
+    import datetime as _dt
+    st = _SYNC_PED.setdefault(user_id, {})
+    try:
+        offset, total = 0, None
+        while offset < (min(total, alvo_max) if total is not None else alvo_max):
+            r = None
+            for _tent in range(2):
+                try:
+                    with _ML_SEM:
+                        r = ml.listar_pedidos(user_id, None, desde or None, ate or None, offset, 50) or {}
+                    break
+                except Exception:  # noqa: BLE001
+                    _time.sleep(2.0)
+            if r is None:
+                break
+            res = r.get('results') or []
+            if total is None:
+                total = int((r.get('paging') or {}).get('total') or len(res))
+                st['total'] = min(total, alvo_max)
+            if not res:
+                break
+            db = SessionLocal()
+            try:
+                for o in res:
+                    oid = str(o.get('id'))
+                    row = db.query(MLPedidoCache).filter_by(user_id=user_id, order_id=oid).first()
+                    if not row:
+                        row = MLPedidoCache(user_id=user_id, order_id=oid)
+                        db.add(row)
+                    row.raw = o
+                    row.status = str(o.get('status') or '')
+                    dcv = _iso_para_dt(o.get('date_created'))
+                    if dcv:
+                        row.date_created = dcv
+                    row.atualizado_em = _dt.datetime.utcnow()
+                db.commit()
+            finally:
+                db.close()
+            offset += len(res)
+            st['progresso'] = offset
+            _time.sleep(0.35)  # folga: muito abaixo do limite da API do ML
+    finally:
+        st['rodando'] = False
+        st['ts'] = _time.time()
+
+
+def _garantir_sync_pedidos(ml, user_id, desde, ate):
+    """Dispara UMA varredura de fundo se o banco estiver dessincronizado há 60s+."""
+    st = _SYNC_PED.setdefault(user_id, {})
+    with _SYNC_PED_LOCK:
+        if st.get('rodando'):
+            return st
+        if _time.time() - (st.get('ts') or 0) < 60:
+            return st
+        st['rodando'] = True
+        st['progresso'] = 0
+    _thr.Thread(target=_varrer_pedidos_ml, args=(ml, user_id, desde, ate), daemon=True).start()
+    return st
+
 
 def _janela_ml(ml, user_id, status, desde, ate, precisa_ate):
     """Garante uma janela bruta de pedidos [0..precisa_ate) fresca, estendendo a
@@ -3193,6 +3276,21 @@ def _janela_ml(ml, user_id, status, desde, ate, precisa_ate):
             j = {'ts': _time.time(), 'results': [], 'total': None, 'fim': False, 'lock': _thr.Lock()}
             _JANELAS[chave] = j
     with j['lock']:  # uma extensão por vez; as demais chamadas esperam e reutilizam
+        # frescor: pedidos novos entram pelo topo — re-checa a página 0 sem descartar o acumulado
+        if j['results'] and (_time.time() - j['ts'] > _JANELA_FRESCOR):
+            try:
+                with _ML_SEM:
+                    r0 = ml.listar_pedidos(user_id, status or None, desde or None, ate or None, 0, 50) or {}
+                tot0 = (r0.get('paging') or {}).get('total')
+                if tot0 is not None:
+                    j['total'] = int(tot0)
+                vistos = {str(o.get('id')) for o in j['results']}
+                frescos = [o for o in (r0.get('results') or []) if str(o.get('id')) not in vistos]
+                if frescos:
+                    j['results'] = frescos + j['results']
+            except Exception:  # noqa: BLE001
+                pass
+            j['ts'] = _time.time()
         if j['total'] is not None:
             precisa_ate = min(precisa_ate, j['total'])
         while len(j['results']) < precisa_ate and not j['fim']:
@@ -3242,11 +3340,33 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     # O ML corta /orders/search em 50 por chamada. Para o modelo de "janela inteira"
     # (o front pede a janela toda de uma vez, ex.: limit=120), buscamos em blocos de 50
     # até completar `limit` (teto de segurança 150). `total` vem do paging da 1ª página.
+    _t0 = _time.time()
     limit = max(1, min(int(limit or 30), 500))
     offset = max(0, int(offset or 0))
-    janela, total = _janela_ml(ml, user_id, status, desde, ate, offset + limit)
-    results = janela[offset:offset + limit]
-    paging = {"total": total, "carregados": len(results)}
+    # O painel lê do BANCO em milissegundos; a varredura de fundo mantém o banco vivo.
+    st = _garantir_sync_pedidos(ml, user_id, desde, ate)
+    dbp = SessionLocal()
+    try:
+        from .models import MLPedidoCache as _MPC
+        q = dbp.query(_MPC).filter(_MPC.user_id == user_id)
+        _dd = _iso_para_dt(desde) if desde else None
+        _da = _iso_para_dt(ate) if ate else None
+        if _dd is not None:
+            q = q.filter(_MPC.date_created >= _dd)
+        if _da is not None:
+            q = q.filter(_MPC.date_created <= _da)
+        if status:
+            q = q.filter(_MPC.status == status)
+        q = q.order_by(_MPC.date_created.desc())
+        total = q.count()
+        results = [r.raw or {} for r in q.offset(offset).limit(limit).all()]
+    finally:
+        dbp.close()
+    paging = {"total": total, "carregados": len(results),
+              "sync": {"rodando": bool(st.get('rodando')), "progresso": int(st.get('progresso') or 0),
+                       "alvo": int(st.get('total') or 0), "ultima": st.get('ts') or 0}}
+    if _time.time() - _t0 > 5:
+        print(f"[pedidos_ml] lento: {_time.time()-_t0:.1f}s offset={offset} limit={limit} janela={len(janela)}", flush=True)
 
     # ENVIOS: o /orders/search não devolve mais o estado do shipment — o cache local
     # (webhooks + backfill) é a fonte de verdade de status/prazo/rastreio/destinatário.
@@ -3306,7 +3426,12 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     pedidos = []
     t_rec = t_fee = t_cost = t_liq = 0.0
     t_unid = 0
-    _pcfg = precificacao.obter_config(user_id)  # taxas/faixas da tela de Configurações
+    _pc = _PCFG_CACHE.get(user_id)
+    if _pc and (_time.time() - _pc[0] < 60):
+        _pcfg = _pc[1]
+    else:
+        _pcfg = precificacao.obter_config(user_id)  # taxas/faixas da tela de Configurações
+        _PCFG_CACHE[user_id] = (_time.time(), _pcfg)
     por_status, por_dia = {}, {}
     for o in results:
         itens = []

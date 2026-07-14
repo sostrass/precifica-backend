@@ -189,18 +189,27 @@ def conta_do_token(access_token: str) -> dict:
     return r.json()
 
 
+_REFRESH_CACHE = {}
+
+
 def _access_token(user_id=None) -> str:
     """Renova (ou reusa) o access_token via refresh_token. Persiste no DB p/ tenant real."""
     if not app_configurado():
         raise MLNaoConfigurado("defina ML_CLIENT_ID e ML_CLIENT_SECRET")
-    db = SessionLocal()
-    try:
-        c = _conta(db, user_id)
-        if not c or not c.refresh_token:
-            raise MLNaoConfigurado("conta Mercado Livre não conectada (refresh_token ausente)")
-        refresh = c.refresh_token
-    finally:
-        db.close()
+    # memória de 60s do refresh_token: evita 1 ida ao banco por chamada à API
+    _rc = _REFRESH_CACHE.get(user_id)
+    if _rc and (time.time() - _rc[0] < 60):
+        refresh = _rc[1]
+    else:
+        db = SessionLocal()
+        try:
+            c = _conta(db, user_id)
+            if not c or not c.refresh_token:
+                raise MLNaoConfigurado("conta Mercado Livre não conectada (refresh_token ausente)")
+            refresh = c.refresh_token
+        finally:
+            db.close()
+        _REFRESH_CACHE[user_id] = (time.time(), refresh)
     chave = refresh[:12]
     cached = _TOKENS.get(chave)
     if cached and time.time() < cached[0] - 60:
@@ -219,6 +228,7 @@ def _access_token(user_id=None) -> str:
     _TOKENS[chave] = (expira, tok)
     if novo_refresh != refresh:
         _TOKENS[novo_refresh[:12]] = (expira, tok)
+        _REFRESH_CACHE.pop(user_id, None)
     if user_id is not None:
         _salvar_token(user_id, tok, novo_refresh, d.get("expires_in") or 21600)
     return tok
