@@ -3387,7 +3387,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
               "sync": {"rodando": bool(st.get('rodando')), "progresso": int(st.get('progresso') or 0),
                        "alvo": int(st.get('total') or 0), "ultima": st.get('ts') or 0}}
     if _time.time() - _t0 > 5:
-        print(f"[pedidos_ml] lento: {_time.time()-_t0:.1f}s offset={offset} limit={limit} janela={len(janela)}", flush=True)
+        print(f"[pedidos_ml] lento: {_time.time()-_t0:.1f}s offset={offset} limit={limit} lidos={len(results)} total={total}", flush=True)
 
     # ENVIOS: o /orders/search não devolve mais o estado do shipment — o cache local
     # (webhooks + backfill) é a fonte de verdade de status/prazo/rastreio/destinatário.
@@ -3634,6 +3634,9 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
         "sincronizando": n_sync,
         "receita_por_dia": [{"dia": k, "receita": round(v, 2)} for k, v in sorted(por_dia.items())],
     }
+    _dur = _time.time() - _t0
+    if _dur > 3:
+        print(f"[pedidos_ml] enriquecimento {_dur:.1f}s · {len(pedidos)} pedidos · envios={len(envio_cache)} skus={len(skus)} · sync_rodando={bool(st.get('rodando'))}", flush=True)
     return {"pedidos": pedidos, "paging": paging, "stats": stats}
 
 
