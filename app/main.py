@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v3.8 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v3.9 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3229,10 +3229,13 @@ def _varrer_pedidos_ml(ml, user_id, desde, ate, alvo_max=600):
             if r is None:
                 break
             res = r.get('results') or []
+            _pg_total = (r.get('paging') or {}).get('total')
+            print(f"[varredura] user={user_id} offset={offset} recebidos={len(res)} total_ml={_pg_total} desde={desde} ate={ate}", flush=True)
             if total is None:
-                total = int((r.get('paging') or {}).get('total') or len(res))
+                total = int(_pg_total or len(res))
                 st['total'] = min(total, alvo_max)
             if not res:
+                print(f"[varredura] user={user_id} PAGINA VAZIA em offset={offset} — encerrando", flush=True)
                 break
             db = SessionLocal()
             try:
@@ -3269,6 +3272,14 @@ def _varrer_pedidos_ml(ml, user_id, desde, ate, alvo_max=600):
     finally:
         st['rodando'] = False
         st['ts'] = _time.time()
+        try:
+            from .models import MLPedidoCache as _MP
+            _db = SessionLocal()
+            _n = _db.query(_MP).filter(_MP.user_id == user_id).count()
+            _db.close()
+            print(f"[varredura] user={user_id} FIM · gravados_total_no_banco={_n} · progresso={st.get('progresso')}", flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[varredura] user={user_id} FIM (erro ao contar: {_e})", flush=True)
 
 
 def _garantir_sync_pedidos(ml, user_id, desde, ate):
@@ -3369,7 +3380,12 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     dbp = SessionLocal()
     try:
         from .models import MLPedidoCache as _MPC
-        q = dbp.query(_MPC).filter(_MPC.user_id == user_id, _MPC.raw.isnot(None))
+        from sqlalchemy import cast as _cast, String as _String
+        q = dbp.query(_MPC).filter(
+            _MPC.user_id == user_id,
+            _MPC.raw.isnot(None),
+            _cast(_MPC.raw, _String) != 'null',   # JSON-null (linha só-webhook) NÃO conta como payload
+        )
         _dd = _iso_para_dt(desde) if desde else None
         _da = _iso_para_dt(ate) if ate else None
         if _dd is not None:
@@ -3640,10 +3656,57 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     return {"pedidos": pedidos, "paging": paging, "stats": stats}
 
 
+@app.get("/api/mercadolivre/_diag_pedidos")
+def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user)):
+    """Diagnóstico: roda UMA varredura síncrona e reporta o que o ML devolveu + o que há no banco.
+    Aberto ao usuário logado para depurar carga sem depender de logs."""
+    import datetime as _dt
+    desde = (_dt.datetime.utcnow() - _dt.timedelta(days=dias)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    passos = []
+
+    def _run(ml):
+        sid = None
+        try:
+            sid = ml._seller_id(user.id)
+        except Exception as e:  # noqa: BLE001
+            passos.append(f"seller_id ERRO: {e}")
+        passos.append(f"seller_id={sid}")
+        # 1 página direta do ML, sem cache
+        try:
+            with _ML_SEM:
+                r = ml.listar_pedidos(user.id, None, desde, None, 0, 50) or {}
+            res = r.get("results") or []
+            tot = (r.get("paging") or {}).get("total")
+            passos.append(f"orders/search: recebidos={len(res)} total_ml={tot}")
+            if res:
+                o0 = res[0]
+                passos.append(f"amostra: id={o0.get('id')} status={o0.get('status')} date_created={o0.get('date_created')}")
+        except Exception as e:  # noqa: BLE001
+            passos.append(f"orders/search ERRO: {type(e).__name__}: {str(e)[:180]}")
+        # estado do banco
+        try:
+            from .models import MLPedidoCache as _MP
+            _db = SessionLocal()
+            n_total = _db.query(_MP).filter(_MP.user_id == user.id).count()
+            n_raw = _db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None)).count()
+            _dd = _iso_para_dt(desde)
+            n_janela = _db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None), _MP.date_created >= _dd).count()
+            amostra = _db.query(_MP).filter(_MP.user_id == user.id).order_by(_MP.date_created.desc()).first()
+            _db.close()
+            passos.append(f"banco: total={n_total} com_raw={n_raw} na_janela(>={_dd.date()})={n_janela}")
+            if amostra:
+                passos.append(f"banco amostra: order_id={amostra.order_id} date_created={amostra.date_created} status={amostra.status}")
+        except Exception as e:  # noqa: BLE001
+            passos.append(f"banco ERRO: {e}")
+        return {"desde": desde, "passos": passos}
+
+    return _ml_run(_run)
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v3.8", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v3.9", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
