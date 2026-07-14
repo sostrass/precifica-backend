@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v3.6 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v3.7 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3643,7 +3643,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v3.6", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v3.7", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
