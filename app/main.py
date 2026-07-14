@@ -3504,7 +3504,19 @@ def ml_pedidos_enriquecido(status: str = "paid", offset: int = 0, limit: int = 3
 def ml_envio(shipment_id: str, user: User = Depends(auth.get_current_user)):
     def _com_disciplina(ml):
         with _ML_SEM:
-            return ml.envio_do_pedido(shipment_id, user.id)
+            raw = ml.envio_do_pedido(shipment_id, user.id)
+        # autocura: persiste no cache de envios — substatus/prazo passam a vir na própria lista
+        try:
+            from .mercadolivre import _upsert_envio_cache
+            _dbu = SessionLocal()
+            try:
+                _upsert_envio_cache(_dbu, user.id, shipment_id, raw)
+                _dbu.commit()
+            finally:
+                _dbu.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return raw
     return _ml_run(_com_disciplina)
 
 
