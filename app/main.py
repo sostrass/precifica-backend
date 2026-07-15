@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v4.1 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v4.2 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3191,6 +3191,7 @@ _JANELAS_LOCK = _thr.Lock()
 _JANELA_TTL = 600.0      # a janela vive 10 min — jamais descartada no meio de uma carga
 _JANELA_FRESCOR = 45.0   # após 45s, a página 0 é re-checada p/ pedidos novos (sem destruir nada)
 _PCFG_CACHE = {}
+_NFE_AQUECENDO = {}
 
 _SYNC_PED = {}
 _SYNC_PED_LOCK = _thr.Lock()
@@ -3588,12 +3589,32 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     fiscal_cand = [str(p.get("id")) for p in pedidos
                    if (envios_cache.get(str(p.get("shipping_id"))) or {}).get("fiscal_pendente")]
     if fiscal_cand:
+        # HOT-PATH: NUNCA chamar o Bling aqui. `nfe_por_pedidos` varre até 8 páginas + 120
+        # detalhes (dezenas de HTTP) e travava a resposta do painel quando havia muitos
+        # candidatos fiscais. Aqui só LEMOS o cache; o que faltar é aquecido em FUNDO e
+        # aparece na próxima leitura (o poll de 60s do painel já traz).
         try:
             from . import nfe as _nfe_mod
-            _mapa_nfe = _nfe_mod.nfe_por_pedidos(user_id, fiscal_cand)
-            for _oid, _info in (_mapa_nfe or {}).items():
-                if _nfe_mod.nota_autorizada((_info or {}).get("nfe_situacao")):
+            _ent = _nfe_mod._NFE_POR_PEDIDO_CACHE.get(user_id)
+            _cache_nfe = dict(_ent[1]) if (_ent and _time.time() - _ent[0] < _nfe_mod._NFE_POR_PEDIDO_TTL) else {}
+            _alvo = set(fiscal_cand)
+            for _oid, _info in _cache_nfe.items():
+                if str(_oid) in _alvo and _nfe_mod.nota_autorizada((_info or {}).get("nfe_situacao")):
                     nfe_ok_ids.add(str(_oid))
+            _faltam = [x for x in fiscal_cand if x not in _cache_nfe]
+            if _faltam and not _NFE_AQUECENDO.get(user_id):
+                _NFE_AQUECENDO[user_id] = True
+
+                def _aquecer_nfe(_uid=user_id, _ids=list(_faltam)):
+                    try:
+                        _nfe_mod.nfe_por_pedidos(_uid, _ids)
+                        print(f"[nfe] cache aquecido em fundo · user={_uid} pedidos={len(_ids)}", flush=True)
+                    except Exception as _e:  # noqa: BLE001
+                        print(f"[nfe] aquecimento falhou: {_e}", flush=True)
+                    finally:
+                        _NFE_AQUECENDO.pop(_uid, None)
+
+                _thr.Thread(target=_aquecer_nfe, daemon=True).start()
         except Exception:  # noqa: BLE001
             pass
     for p in pedidos:
@@ -3691,13 +3712,13 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
         except Exception as e:  # noqa: BLE001
             passos.append(f"banco ERRO: {type(e).__name__}: {str(e)[:200]}")
         # 4) TESTE DEFINITIVO: o caminho EXATO do painel, com enriquecimento
-        for _lim in (25, 400):
+        for _lim in (25,):
             try:
                 _t = _time.time()
                 _rr = _pedidos_ml_enriquecidos(ml, user.id, '', 0, _lim, desde, None)
                 _peds = _rr.get('pedidos') or []
                 passos.append(f"ENDPOINT DO PAINEL limit={_lim}: {len(_peds)} pedidos em {_time.time()-_t:.1f}s · paging={_rr.get('paging', {}).get('total')}")
-                if _peds and _lim == 400:
+                if _peds:
                     _p = _peds[0]
                     passos.append(f"amostra enriquecida: id={_p.get('id')} envio_status={_p.get('envio_status')} uf={_p.get('uf')} nfe={_p.get('nfe')} shipping_id={_p.get('shipping_id')}")
             except Exception as e:  # noqa: BLE001
@@ -3712,15 +3733,26 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v4.1", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v4.2", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
 def ml_pedidos_enriquecido(status: str = "paid", offset: int = 0, limit: int = 30,
                            desde: str = "", ate: str = "",
                            user: User = Depends(auth.get_current_user)):
-    return _ml_run(lambda ml: _pedidos_ml_enriquecidos(ml, user.id, status, offset, limit,
-                                                        desde or None, ate or None))
+    def _run(ml):
+        try:
+            return _pedidos_ml_enriquecidos(ml, user.id, status, offset, limit,
+                                            desde or None, ate or None)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+            _t = _tb.format_exc()
+            print(f"[pedidos_ml] ERRO FATAL limit={limit} desde={desde}: {type(e).__name__}: {e}\n{_t}", flush=True)
+            # devolve o motivo REAL para a tela (sem 500 mudo)
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:250]}")
+    return _ml_run(_run)
 
 
 # --- Envios / etiqueta real ---
