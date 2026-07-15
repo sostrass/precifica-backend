@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v4.2 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v4.4 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3377,7 +3377,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     limit = max(1, min(int(limit or 30), 500))
     offset = max(0, int(offset or 0))
     # O painel lê do BANCO em milissegundos; a varredura de fundo mantém o banco vivo.
-    st = _garantir_sync_pedidos(ml, user_id, desde, ate)
+    _sync_st = _garantir_sync_pedidos(ml, user_id, desde, ate)   # nome próprio: o laço abaixo usa `st` p/ status do pedido
     dbp = SessionLocal()
     try:
         from .models import MLPedidoCache as _MPC
@@ -3396,8 +3396,8 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     finally:
         dbp.close()
     paging = {"total": total, "carregados": len(results),
-              "sync": {"rodando": bool(st.get('rodando')), "progresso": int(st.get('progresso') or 0),
-                       "alvo": int(st.get('total') or 0), "ultima": st.get('ts') or 0}}
+              "sync": {"rodando": bool(_sync_st.get('rodando')), "progresso": int(_sync_st.get('progresso') or 0),
+                       "alvo": int(_sync_st.get('total') or 0), "ultima": _sync_st.get('ts') or 0}}
     if _time.time() - _t0 > 5:
         print(f"[pedidos_ml] lento: {_time.time()-_t0:.1f}s offset={offset} limit={limit} lidos={len(results)} total={total}", flush=True)
 
@@ -3668,7 +3668,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     }
     _dur = _time.time() - _t0
     if _dur > 3:
-        print(f"[pedidos_ml] enriquecimento {_dur:.1f}s · {len(pedidos)} pedidos · envios={len(envio_cache)} skus={len(skus)} · sync_rodando={bool(st.get('rodando'))}", flush=True)
+        print(f"[pedidos_ml] enriquecimento {_dur:.1f}s · {len(pedidos)} pedidos · envios={len(envio_cache)} skus={len(skus)} · sync_rodando={bool(_sync_st.get('rodando'))}", flush=True)
     return {"pedidos": pedidos, "paging": paging, "stats": stats}
 
 
@@ -3733,7 +3733,7 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v4.2", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v4.4", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
