@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v4.0 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v4.1 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3653,56 +3653,57 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
 
 @app.get("/api/mercadolivre/_diag_pedidos")
 def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user)):
-    """Diagnóstico: roda UMA varredura síncrona e reporta o que o ML devolveu + o que há no banco.
-    Aberto ao usuário logado para depurar carga sem depender de logs."""
+    """Diagnóstico completo: ML real -> banco -> endpoint do painel. Sem depender de logs."""
     import datetime as _dt
     desde = (_dt.datetime.utcnow() - _dt.timedelta(days=dias)).replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S.000-00:00')
     passos = []
 
     def _run(ml):
-        sid = None
+        # 1) conta ML
         try:
-            sid = ml._seller_id(user.id)
+            passos.append(f"seller_id={ml._seller_id(user.id)}")
         except Exception as e:  # noqa: BLE001
             passos.append(f"seller_id ERRO: {e}")
-        passos.append(f"seller_id={sid}")
-        # 1 página direta do ML, sem cache
+        # 2) ML real
         try:
             with _ML_SEM:
                 r = ml.listar_pedidos(user.id, None, desde, None, 0, 50) or {}
             res = r.get("results") or []
-            tot = (r.get("paging") or {}).get("total")
-            passos.append(f"orders/search: recebidos={len(res)} total_ml={tot}")
+            passos.append(f"orders/search: recebidos={len(res)} total_ml={(r.get('paging') or {}).get('total')}")
             if res:
-                o0 = res[0]
-                passos.append(f"amostra: id={o0.get('id')} status={o0.get('status')} date_created={o0.get('date_created')}")
+                passos.append(f"amostra ML: id={res[0].get('id')} status={res[0].get('status')} date_created={res[0].get('date_created')}")
         except Exception as e:  # noqa: BLE001
-            passos.append(f"orders/search ERRO: {type(e).__name__}: {str(e)[:180]}")
-        # estado do banco
+            passos.append(f"orders/search ERRO: {type(e).__name__}: {str(e)[:200]}")
+        # 3) banco
         try:
             from .models import MLPedidoCache as _MP
             _db = SessionLocal()
+            _dd = _iso_para_dt(desde)
             n_total = _db.query(_MP).filter(_MP.user_id == user.id).count()
             n_raw = _db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None)).count()
-            _dd = _iso_para_dt(desde)
-            n_janela = _db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None), _MP.date_created >= _dd).count()
-            amostra = _db.query(_MP).filter(_MP.user_id == user.id).order_by(_MP.date_created.desc()).first()
+            _qp = _db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None), _MP.date_created >= _dd)
+            n_painel = _qp.count()
+            am = _qp.first()
+            passos.append(f"banco: total={n_total} com_raw={n_raw} · FILTRO DO PAINEL retornaria={n_painel}")
+            if am:
+                passos.append(f"banco amostra: order_id={am.order_id} date_created={am.date_created} raw_valido={bool(am.raw)}")
             _db.close()
-            passos.append(f"banco: total={n_total} com_raw={n_raw} na_janela(>={_dd.date()})={n_janela}")
-            # conta EXATAMENTE como o painel conta (mesmo filtro do endpoint real)
-            _db2 = SessionLocal()
-            _qp = _db2.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None))
-            if _dd is not None:
-                _qp = _qp.filter(_MP.date_created >= _dd)
-            _n_painel = _qp.count()
-            _amostra_p = _qp.first()
-            _tem_raw_real = bool(_amostra_p.raw) if _amostra_p else None
-            _db2.close()
-            passos.append(f"FILTRO DO PAINEL: retornaria={_n_painel} pedidos · amostra_raw_valido={_tem_raw_real}")
-            if amostra:
-                passos.append(f"banco amostra: order_id={amostra.order_id} date_created={amostra.date_created} status={amostra.status}")
         except Exception as e:  # noqa: BLE001
-            passos.append(f"banco ERRO: {e}")
+            passos.append(f"banco ERRO: {type(e).__name__}: {str(e)[:200]}")
+        # 4) TESTE DEFINITIVO: o caminho EXATO do painel, com enriquecimento
+        for _lim in (25, 400):
+            try:
+                _t = _time.time()
+                _rr = _pedidos_ml_enriquecidos(ml, user.id, '', 0, _lim, desde, None)
+                _peds = _rr.get('pedidos') or []
+                passos.append(f"ENDPOINT DO PAINEL limit={_lim}: {len(_peds)} pedidos em {_time.time()-_t:.1f}s · paging={_rr.get('paging', {}).get('total')}")
+                if _peds and _lim == 400:
+                    _p = _peds[0]
+                    passos.append(f"amostra enriquecida: id={_p.get('id')} envio_status={_p.get('envio_status')} uf={_p.get('uf')} nfe={_p.get('nfe')} shipping_id={_p.get('shipping_id')}")
+            except Exception as e:  # noqa: BLE001
+                import traceback as _tb
+                passos.append(f"ENDPOINT DO PAINEL limit={_lim} ERRO: {type(e).__name__}: {str(e)[:250]}")
+                passos.append(f"trace: {_tb.format_exc()[-350:]}")
         return {"desde": desde, "passos": passos}
 
     return _ml_run(_run)
@@ -3711,7 +3712,7 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v4.0", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v4.1", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
