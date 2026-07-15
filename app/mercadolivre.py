@@ -759,15 +759,33 @@ def concorrentes(query: str, category_id=None, limit=20, user_id=None) -> dict:
 # =========================================================================== #
 # Domínio E — Pedidos
 # =========================================================================== #
+def _ml_data(v):
+    """O ML exige `order.date_created.from` no formato ISO COM offset: 2026-06-30T00:00:00.000-00:00.
+    Formatos sem fuso ('2026-06-30T00:00:00') ou com 'Z' são rejeitados com 400 invalid_date_format.
+    Normaliza qualquer entrada ISO para o formato aceito (granularidade de hora, conforme doc ML)."""
+    if not v:
+        return None
+    import datetime as _d
+    try:
+        t = str(v).strip().replace('Z', '+00:00')
+        d = _d.datetime.fromisoformat(t)
+        if d.tzinfo is not None:
+            d = d.astimezone(_d.timezone.utc).replace(tzinfo=None)
+        return d.strftime('%Y-%m-%dT%H:%M:%S.000-00:00')
+    except Exception:  # noqa: BLE001
+        return str(v)
+
+
 def listar_pedidos(user_id=None, status="paid", desde=None, ate=None, offset=0, limit=50) -> dict:
     sid = _seller_id(user_id)
     params = {"seller": sid, "sort": "date_desc", "offset": offset, "limit": limit}
     if status:
         params["order.status"] = status
-    if desde:
-        params["order.date_created.from"] = desde
-    if ate:
-        params["order.date_created.to"] = ate
+    _de, _ate = _ml_data(desde), _ml_data(ate)
+    if _de:
+        params["order.date_created.from"] = _de
+    if _ate:
+        params["order.date_created.to"] = _ate
     return _get("/orders/search", params=params, user_id=user_id)
 
 

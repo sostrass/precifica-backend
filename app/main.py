@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v3.9 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v4.0 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3380,12 +3380,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
     dbp = SessionLocal()
     try:
         from .models import MLPedidoCache as _MPC
-        from sqlalchemy import cast as _cast, String as _String
-        q = dbp.query(_MPC).filter(
-            _MPC.user_id == user_id,
-            _MPC.raw.isnot(None),
-            _cast(_MPC.raw, _String) != 'null',   # JSON-null (linha só-webhook) NÃO conta como payload
-        )
+        q = dbp.query(_MPC).filter(_MPC.user_id == user_id, _MPC.raw.isnot(None))
         _dd = _iso_para_dt(desde) if desde else None
         _da = _iso_para_dt(ate) if ate else None
         if _dd is not None:
@@ -3396,7 +3391,7 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             q = q.filter(_MPC.status == status)
         q = q.order_by(_MPC.date_created.desc())
         total = q.count()
-        results = [r.raw or {} for r in q.offset(offset).limit(limit).all()]
+        results = [r.raw for r in q.offset(offset).limit(limit).all() if r.raw]  # payload vazio: fora
     finally:
         dbp.close()
     paging = {"total": total, "carregados": len(results),
@@ -3661,7 +3656,7 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
     """Diagnóstico: roda UMA varredura síncrona e reporta o que o ML devolveu + o que há no banco.
     Aberto ao usuário logado para depurar carga sem depender de logs."""
     import datetime as _dt
-    desde = (_dt.datetime.utcnow() - _dt.timedelta(days=dias)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    desde = (_dt.datetime.utcnow() - _dt.timedelta(days=dias)).replace(hour=0, minute=0, second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S.000-00:00')
     passos = []
 
     def _run(ml):
@@ -3694,6 +3689,16 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
             amostra = _db.query(_MP).filter(_MP.user_id == user.id).order_by(_MP.date_created.desc()).first()
             _db.close()
             passos.append(f"banco: total={n_total} com_raw={n_raw} na_janela(>={_dd.date()})={n_janela}")
+            # conta EXATAMENTE como o painel conta (mesmo filtro do endpoint real)
+            _db2 = SessionLocal()
+            _qp = _db2.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None))
+            if _dd is not None:
+                _qp = _qp.filter(_MP.date_created >= _dd)
+            _n_painel = _qp.count()
+            _amostra_p = _qp.first()
+            _tem_raw_real = bool(_amostra_p.raw) if _amostra_p else None
+            _db2.close()
+            passos.append(f"FILTRO DO PAINEL: retornaria={_n_painel} pedidos · amostra_raw_valido={_tem_raw_real}")
             if amostra:
                 passos.append(f"banco amostra: order_id={amostra.order_id} date_created={amostra.date_created} status={amostra.status}")
         except Exception as e:  # noqa: BLE001
@@ -3706,7 +3711,7 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v3.9", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v4.0", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
