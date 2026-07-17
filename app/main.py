@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v4.4 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v4.6 — boot OK · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3730,10 +3730,64 @@ def diag_pedidos_ml(dias: int = 15, user: User = Depends(auth.get_current_user))
     return _ml_run(_run)
 
 
+@app.get("/api/mercadolivre/_diag_nfe")
+def diag_nfe_ml(user: User = Depends(auth.get_current_user)):
+    """Mostra o que o Bling grava em `pedido_loja` nas últimas notas e se casa com os
+    order_ids do ML. É aqui que se descobre por que a NF-e não aparece no painel."""
+    from . import bling, nfe as _nfe
+    from datetime import date, timedelta
+    out = {"amostra_notas_bling": [], "amostra_pedidos_ml": [], "diagnostico": ""}
+    # 1) últimos pedidos ML do banco
+    try:
+        from .models import MLPedidoCache as _MP
+        _db = SessionLocal()
+        rows = _db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None)).order_by(_MP.date_created.desc()).limit(8).all()
+        ml_ids, ml_packs = [], []
+        for r in rows:
+            ml_ids.append(str(r.order_id))
+            if (r.raw or {}).get("pack_id"):
+                ml_packs.append(str((r.raw or {}).get("pack_id")))
+        out["amostra_pedidos_ml"] = [{"order_id": i} for i in ml_ids]
+        out["packs_ml"] = ml_packs[:8]
+        _db.close()
+    except Exception as e:  # noqa: BLE001
+        out["erro_banco"] = str(e)[:200]
+        ml_ids = []
+    # 2) últimas notas do Bling com o campo de casamento
+    try:
+        fim = date.today(); ini = fim - timedelta(days=30)
+        raw = bling.listar_nfe(user.id, pagina=1, limite=20, data_ini=ini.isoformat(), data_fim=fim.isoformat())
+        linhas = _nfe.resumir_lista(raw) or []
+        out["notas_encontradas_bling"] = len(linhas)
+        for n in linhas[:8]:
+            nid = n.get("id")
+            item = {"id": nid, "numero": n.get("numero"), "tipo": n.get("tipo")}
+            try:
+                det = _nfe.detalhar_nfe(bling.obter_nfe(user.id, nid))
+                item["pedido_loja"] = det.get("pedido_loja")
+                item["numero_nf"] = det.get("numero")
+                item["situacao"] = det.get("situacao_label") or det.get("situacao")
+                item["destinatario"] = (det.get("destinatario") or {}).get("nome")
+            except Exception as e:  # noqa: BLE001
+                item["erro_detalhe"] = str(e)[:120]
+            out["amostra_notas_bling"].append(item)
+    except Exception as e:  # noqa: BLE001
+        out["erro_bling"] = f"{type(e).__name__}: {str(e)[:200]}"
+    # 3) veredito: os pedido_loja casam com os order_ids do ML?
+    try:
+        pl = {str(x.get("pedido_loja") or "") for x in out["amostra_notas_bling"] if x.get("pedido_loja")}
+        casam = pl & set(ml_ids)
+        out["diagnostico"] = (f"pedido_loja das notas: {sorted(pl)[:5]} · order_ids ML: {ml_ids[:5]} · "
+                              f"CASAM={sorted(casam)[:5] if casam else 'NENHUM — formato diferente!'}")
+    except Exception as e:  # noqa: BLE001
+        out["diagnostico"] = f"erro: {e}"
+    return out
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v4.4", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v4.6", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
