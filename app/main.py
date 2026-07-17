@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v4.6 — boot OK · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v4.7 — boot OK · desmascaramento Shopee · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3784,10 +3784,47 @@ def diag_nfe_ml(user: User = Depends(auth.get_current_user)):
     return out
 
 
+@app.post("/api/shopee/comprador")
+def shopee_comprador_ep(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Dados do comprador Shopee SEM máscara (READY_TO_SHIP / PROCESSED / TO_RETURN).
+    Usa `response_optional_fields` com recipient_address, phone, buyer_cpf_id e buyer_username."""
+    from . import shopee_comprador as _sc
+    sns = [str(x) for x in (payload.get("order_sns") or []) if x][:200]
+    if not sns:
+        return {"mapa": {}}
+    try:
+        return {"mapa": _sc.comprador(user.id, sns)}
+    except Exception as e:  # noqa: BLE001
+        return {"mapa": {}, "erro": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+@app.get("/api/shopee/_diag_comprador")
+def diag_comprador_shopee(user: User = Depends(auth.get_current_user)):
+    """Diagnóstico: pega pedidos A_ENVIAR e mostra o que a Shopee devolve desmascarado."""
+    from . import shopee as _sh, shopee_comprador as _sc
+    out = {"passos": []}
+    try:
+        pn = _sh.pedidos_painel(user.id, "A_ENVIAR", 15, page=1, page_size=5) or {}
+        peds = pn.get("pedidos") or []
+        sns = [str(p.get("order_sn") or p.get("id")) for p in peds][:5]
+        out["passos"].append(f"pedidos A_ENVIAR: {len(peds)} · sns={sns}")
+        if peds:
+            p0 = peds[0]
+            out["passos"].append(f"ANTES (shopee.py): cliente={p0.get('cliente')} cidade={p0.get('cidade')} endereco={str(p0.get('endereco'))[:120]}")
+        m = _sc.comprador(user.id, sns, forcar=True)
+        for sn, v in list(m.items())[:3]:
+            out["passos"].append(f"DEPOIS {sn}: desmascarado={v.get('desmascarado')} cliente={v.get('cliente')} cpf={v.get('cpf')} tel={v.get('telefone')} end={str((v.get('endereco') or {}).get('completo'))[:90]}")
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        out["passos"].append(f"ERRO: {type(e).__name__}: {str(e)[:200]}")
+        out["trace"] = traceback.format_exc()[-350:]
+    return out
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v4.6", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v4.7", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
