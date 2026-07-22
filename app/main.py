@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v4.9 — boot OK · geração NF-e (dry_run) · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v5.0 — boot OK · dados fiscais ML + geração NF-e · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3877,10 +3877,39 @@ def nfe_molde_diag(user: User = Depends(auth.get_current_user)):
             "campos_disponiveis": sorted(list(m.keys()))}
 
 
+@app.post("/api/mercadolivre/dados-fiscais")
+def ml_dados_fiscais_ep(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Nome + CPF/CNPJ + endereço fiscal do comprador ML (/orders/{id}/billing_info x-version:2).
+    É o que faltava para gerar a NF-e — o CPF do ML não vem no pedido, só neste recurso."""
+    from . import mercadolivre as ml
+    import threading as _t
+    ids = [str(x) for x in (payload.get("order_ids") or []) if x][:60]
+    if not ids:
+        return {"mapa": {}}
+    mapa, lock = {}, _t.Lock()
+    def _um(oid):
+        try:
+            d = ml.dados_fiscais_comprador(oid, user.id)
+        except Exception as e:  # noqa: BLE001
+            d = {"ok": False, "erro": str(e)[:150]}
+        with lock:
+            mapa[oid] = d
+    ths = []
+    for oid in ids:
+        with _ML_SEM:
+            pass
+        th = _t.Thread(target=_um, args=(oid,), daemon=True); th.start(); ths.append(th)
+        if len(ths) >= 6:
+            for t in ths: t.join(timeout=15)
+            ths = []
+    for t in ths: t.join(timeout=15)
+    return {"mapa": mapa}
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v4.9", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v5.0", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
