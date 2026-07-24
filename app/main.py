@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v5.0 — boot OK · dados fiscais ML + geração NF-e · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v5.1 — boot OK · dados fiscais ML (motivo) + geração NF-e · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3890,8 +3890,11 @@ def ml_dados_fiscais_ep(payload: dict = Body(default={}), user: User = Depends(a
     def _um(oid):
         try:
             d = ml.dados_fiscais_comprador(oid, user.id)
+            # se veio ok mas sem doc, marca o porquê (Full? comprador sem CPF cadastrado?)
+            if d.get("ok") and not d.get("doc_numero"):
+                d["motivo_sem_doc"] = "billing_info retornou sem identification.number (comprador PF sem CPF no ML, ou pedido Full)"
         except Exception as e:  # noqa: BLE001
-            d = {"ok": False, "erro": str(e)[:150]}
+            d = {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:150]}"}
         with lock:
             mapa[oid] = d
     ths = []
@@ -3909,7 +3912,7 @@ def ml_dados_fiscais_ep(payload: dict = Body(default={}), user: User = Depends(a
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v5.0", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v5.1", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
