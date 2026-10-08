@@ -8,6 +8,18 @@ url = settings.database_url or "sqlite:///./dev.db"
 if url.startswith("postgres://"):
     url = url.replace("postgres://", "postgresql://", 1)
 
+# Driver EXPLÍCITO. O SQLAlchemy 2.1 mudou o padrão de "postgresql://" para o psycopg v3,
+# que não está instalado (o requirements traz psycopg2-binary) -> o boot quebrava com
+# "No module named 'psycopg'". Fixar "+psycopg2" funciona em qualquer versão do SQLAlchemy.
+if url.startswith("postgresql://"):
+    url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+elif url.startswith("postgresql+psycopg://"):
+    # URL pedindo psycopg v3: só mantém se ele estiver instalado; senão usa o psycopg2.
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        url = url.replace("postgresql+psycopg://", "postgresql+psycopg2://", 1)
+
 connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
 
 if url.startswith("sqlite"):

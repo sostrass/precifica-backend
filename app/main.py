@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.7.5 — boot OK · boost: endpoint estender (+4h) · seletor cache-first · fix cache avaliacoes · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.7.8 — boot OK · fix driver Postgres (psycopg2 explícito, SQLAlchemy travado 2.0.x) · boost seletor fallback ao vivo · nfe 429 resiliente · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -631,6 +631,34 @@ def shopee_boost_produtos(q: str = "", ordem: str = "vendas", filtro: str = "tod
             vendas = {}
         vmap = {str(k): int(v) for k, v in (vendas or {}).items()}
         ql = (q or "").strip().lower()
+        # FALLBACK AO VIVO: se o cache local ainda não foi populado, serve direto da Shopee
+        # (comportamento original do seletor) — assim SEMPRE há produtos para adicionar, mesmo
+        # antes da 1ª sincronização de catálogo. Quando o cache existe, este bloco é ignorado.
+        if not cache:
+            try:
+                raw = shopee.listar_itens(user.id, offset=offset, limite=max(1, min(limite, 100)))
+                resp = raw.get("response", {}) if isinstance(raw, dict) else {}
+                itens_live = resp.get("item", []) or []
+            except Exception:  # noqa: BLE001
+                resp, itens_live = {}, []
+            linhas_live = []
+            for it in itens_live:
+                iid = str(it.get("item_id"))
+                nome = it.get("item_name") or f"#{iid}"
+                sku = it.get("item_sku") or ""
+                if ql and ql not in nome.lower() and ql not in sku.lower():
+                    continue
+                linhas_live.append({
+                    "item_id": iid, "nome": nome, "sku": it.get("item_sku"),
+                    "preco": it.get("price"), "em_promocao": False, "promo_nome": None,
+                    "imagem": it.get("image"), "status": it.get("item_status"),
+                    "vendas": vmap.get(iid, 0), "na_fila": iid in na_fila, "atualizado_em": "",
+                })
+            tem_mais_live = bool(resp.get("has_next_page")) if "has_next_page" in resp \
+                else (len(itens_live) >= limite)
+            return {"itens": linhas_live, "total": offset + len(linhas_live), "offset": offset,
+                    "tem_mais": tem_mais_live, "na_fila_total": len(na_fila),
+                    "catalogo_total": None, "cache_vazio": False, "fonte": "live"}
         linhas = []
         for it in cache:
             iid = str(it.item_id)
@@ -4658,7 +4686,7 @@ def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.7.5", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.7.8", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
@@ -8917,6 +8945,11 @@ def nfe_pendentes(pagina: int = 1, limite: int = 100,
         return {"notas": nfe.resumir_lista(raw), "situacao": sit}
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
+    except Exception as _e:  # noqa: BLE001 — 429/5xx do Bling não deve virar 500 cru
+        av = ("O Bling limitou as requisições (429). Tente novamente em instantes."
+              if ("429" in str(_e) or "Too Many Requests" in str(_e))
+              else "O Bling instabilizou a leitura agora.")
+        return {"notas": [], "situacao": sit, "parcial": True, "aviso": av}
 
 
 @app.get("/api/nfe/pendentes/todas")
@@ -8942,11 +8975,23 @@ def nfe_pendentes_todas(situacao: int | None = None, max_paginas: int = 80,
     sits = list(dict.fromkeys([s for s in sits if s is not None]))
 
     todas, vistos = [], set()
+    parcial, aviso = False, None
     try:
         for s in sits:
             pagina = 1
             while pagina <= max_paginas:
-                raw = bling.listar_nfe(user.id, pagina=pagina, limite=100, situacao=s)
+                try:
+                    raw = bling.listar_nfe(user.id, pagina=pagina, limite=100, situacao=s)
+                except bling.BlingAuthError:
+                    raise
+                except Exception as _e:  # noqa: BLE001 — 429/5xx do Bling: devolve o que já tem
+                    parcial = True
+                    if "429" in str(_e) or "Too Many Requests" in str(_e):
+                        aviso = ("O Bling limitou as requisições no momento (429). "
+                                 "Mostrando o que já foi carregado — tente novamente em instantes.")
+                    else:
+                        aviso = "O Bling instabilizou a leitura agora. Mostrando o resultado parcial."
+                    break
                 lote = nfe.resumir_lista(raw)
                 if not lote:
                     break
@@ -8958,8 +9003,11 @@ def nfe_pendentes_todas(situacao: int | None = None, max_paginas: int = 80,
                 if len(lote) < 100:
                     break
                 pagina += 1
-                _t.sleep(0.2)  # respeita o rate limit do Bling
-        return {"notas": todas, "situacao": situacao, "situacoes": sits, "total": len(todas)}
+                _t.sleep(0.35)  # mais folgado com o rate limit do Bling (~3 req/s)
+            if parcial:
+                break
+        return {"notas": todas, "situacao": situacao, "situacoes": sits,
+                "total": len(todas), "parcial": parcial, "aviso": aviso}
     except bling.BlingAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
